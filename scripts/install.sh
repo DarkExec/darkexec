@@ -10,4 +10,5 @@ ln -sfn "$install/current/share/workspace/AGENTS.md" "$workspace/AGENTS.md"; ln 
 ln -sfn "$install/current/share/harness-ops.md" "$workspace/harness-ops.md"
 mkdir -p "$(dirname "$bin_path")"; ln -sfn "$install/current/bin/darkexec" "$bin_path"
 doctrine_sha="$(sha256sum "$release/share/harness-ops.md" | awk '{print $1}')"
-printf '{"commit":"%s","workspace":"%s","binPath":"%s","doctrineSha256":"%s"}\n' "$commit" "$workspace" "$bin_path" "$doctrine_sha"
+printf '{"commit":"%s","workspace":"%s","binPath":"%s","doctrineSha256":"%s","nextAction":"Open %s in Codex App and send the outcome you want."}\n' \
+  "$commit" "$workspace" "$bin_path" "$doctrine_sha" "$workspace"
