@@ -61,6 +61,17 @@ def saved_project(path: Path) -> bool:
     return str(path) in (config.get("projects") or {})
 
 
+def saved_projects() -> list[str]:
+    try:
+        config = tomllib.loads(CONFIG.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SystemExit(f"cannot read saved Codex projects: {exc}") from exc
+    projects = config.get("projects") or {}
+    if not isinstance(projects, dict):
+        raise SystemExit("cannot read saved Codex projects: projects must be a table")
+    return sorted(path for path in projects if isinstance(path, str) and Path(path).is_absolute())
+
+
 def usage(raw: dict | None) -> dict:
     raw = raw or {}
     return {
@@ -539,6 +550,8 @@ def main() -> int:
     harness.add_argument("--read-only-harness", action="store_true")
     harness.add_argument("--standard-harness", action="store_true")
     run.add_argument("--json", action="store_true")
+    projects = sub.add_parser("projects")
+    projects.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
     identity = status.add_mutually_exclusive_group(required=True)
     identity.add_argument("--job-id")
@@ -549,6 +562,10 @@ def main() -> int:
         return dispatch(args)
     if args.command == "run":
         return run_target(args)
+    if args.command == "projects":
+        paths = saved_projects()
+        print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))
+        return 0
     receipt = find_receipt(args.job_id, args.thread)
     print(json.dumps(receipt) if args.json else render_status(receipt))
     return 0
