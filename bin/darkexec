@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse, base64, fcntl, hashlib, json
-import os, select, signal, socket, struct, sys
+import os, select, shutil, signal, socket, struct, subprocess, sys
 import tempfile, time, tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 STATE_ROOT = Path(os.environ.get("DARKEXEC_STATE_ROOT", "/var/lib/darkexec/jobs"))
+SESSION_ROOT = Path(os.environ.get("DARKEXEC_SESSION_ROOT", "/var/lib/darkexec/sessions"))
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
 CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
 DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
@@ -49,6 +50,9 @@ def atomic_write(path: Path, payload: dict) -> None:
 
 def receipt_path(job_id: str) -> Path:
     return STATE_ROOT / f"{hashlib.sha256(job_id.encode()).hexdigest()}.json"
+
+def session_path(thread_id: str) -> Path:
+    return SESSION_ROOT / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
 
 def load_receipt(path: Path) -> dict:
     return json.loads(path.read_text())
@@ -222,6 +226,13 @@ class AppServer:
         if not match:
             raise RuntimeError(f"Task {thread_id} was not listed by the running Codex App.")
         return match
+
+    def read_thread(self, thread_id: str) -> dict:
+        result = self._request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        if thread.get("id") != thread_id:
+            raise RuntimeError(f"App Server did not return target task {thread_id}")
+        return thread
 
     def run_turn(self, thread_id: str, prompt: str) -> dict:
         self.request_id += 1
@@ -508,6 +519,212 @@ def run_target(args) -> int:
     return 0 if result.get("status") == "completed" else 1
 
 
+def user_text(turn: dict) -> str:
+    chunks = []
+    for item in turn.get("items", []):
+        if item.get("type") != "userMessage":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "text" and content.get("text"):
+                chunks.append(str(content["text"]))
+    return "\n".join(chunks)
+
+
+def stop_timer(unit: str | None) -> None:
+    controller = os.environ.get("DARKEXEC_SYSTEMCTL") or shutil.which("systemctl")
+    if not unit or not controller:
+        return
+    subprocess.run(
+        [controller, "stop", f"{unit}.timer", f"{unit}.service"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+
+
+def schedule_timer(state: dict, executable: Path) -> tuple[bool, str]:
+    runner = os.environ.get("DARKEXEC_SYSTEMD_RUN") or shutil.which("systemd-run")
+    if not runner:
+        return False, "systemd-run is unavailable"
+    digest = hashlib.sha256(state["threadId"].encode()).hexdigest()[:12]
+    state["timerAttempt"] = int(state.get("timerAttempt") or 0) + 1
+    unit = f"darkexec-closeout-{digest}-g{state['generation']}-a{state['timerAttempt']}"
+    seconds = int(state["debounceSeconds"])
+    command = [
+        runner, f"--unit={unit}", f"--on-active={seconds}s", "--collect", "--quiet",
+        f"--setenv=DARKEXEC_SESSION_ROOT={SESSION_ROOT}",
+        f"--setenv=DARKEXEC_CONFIG={CONFIG}",
+        f"--setenv=DARKEXEC_APP_SERVER_SOCKET={APP_SERVER_SOCKET}",
+        f"--setenv=DARKEXEC_WORKSPACE={WORKSPACE}",
+        str(executable), "_debounce-fire", "--thread", state["threadId"],
+        "--generation", str(state["generation"]),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        return False, completed.stderr.strip() or completed.stdout.strip() or "systemd-run failed"
+    state["timerUnit"] = unit
+    return True, ""
+
+
+def inspect_closeout(thread: dict, product_turn_id: str) -> tuple[str, str]:
+    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+    index = next((i for i, turn in enumerate(turns) if turn.get("id") == product_turn_id), None)
+    if index is None:
+        return "failed", f"recorded product turn {product_turn_id} was not found"
+    product = turns[index]
+    if product.get("status") != "completed":
+        return "deferred", f"recorded product turn is {product.get('status') or 'unknown'}"
+    for turn in turns[index + 1:]:
+        prompt = user_text(turn)
+        lowered = prompt.lower()
+        if (
+            prompt in {HARNESS_PROMPT, READ_ONLY_HARNESS_PROMPT}
+            or ("harness pass" in lowered and "harness-ops" in lowered)
+            or "harness proof only" in lowered
+        ):
+            return "manual_harness_seen", f"harness turn {turn.get('id') or '-'} is {turn.get('status') or 'unknown'}"
+        if turn.get("status") not in {"completed", "failed", "interrupted", "cancelled"}:
+            return "deferred", f"newer turn {turn.get('id') or '-'} is active"
+        if prompt:
+            return "superseded", f"newer product turn {turn.get('id') or '-'} exists"
+    return "ready", ""
+
+
+def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
+    path = session_path(thread_id)
+    if not path.exists():
+        return {"status": "stale", "threadId": thread_id, "reason": "session state is absent"}
+    lock = path.with_suffix(".lock").open("a+")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    state = load_receipt(path)
+    if int(state.get("generation") or 0) != generation or state.get("status") != "pending":
+        return {"status": "stale", "threadId": thread_id, "generation": generation}
+    target = Path(state["targetPath"])
+    if not target.is_dir() or not saved_project(target):
+        state.update({
+            "status": "failed", "error": f"target is no longer an exact saved Codex project: {target}",
+            "updatedAt": now(), "timerUnit": None,
+        })
+        atomic_write(path, state)
+        return {"status": "failed", "threadId": thread_id, "error": state["error"]}
+    try:
+        with AppServer() as app:
+            app.require_listed_thread(thread_id, target)
+            thread = app.read_thread(thread_id)
+            status, reason = inspect_closeout(thread, state["productTurnId"])
+            if status == "deferred":
+                state["updatedAt"] = now()
+                state["dueAt"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=int(state["debounceSeconds"]))
+                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                scheduled, error = schedule_timer(state, executable)
+                state["timerUnit"] = state.get("timerUnit") if scheduled else None
+                state["error"] = None if scheduled else error
+                state["status"] = "pending" if scheduled else "failed"
+                atomic_write(path, state)
+                return {"status": state["status"], "threadId": thread_id, "reason": reason, "error": error or None}
+            if status != "ready":
+                state.update({"status": status, "reason": reason, "updatedAt": now(), "timerUnit": None})
+                atomic_write(path, state)
+                return {"status": status, "threadId": thread_id, "reason": reason}
+            result = app.run_turn(thread_id, state["harnessPrompt"])
+            state.update({
+                "status": "completed" if result.get("ok") else "failed",
+                "harnessTurnId": result.get("turnId"), "harnessResult": result.get("resultText"),
+                "error": result.get("error") or None, "updatedAt": now(), "timerUnit": None,
+            })
+            atomic_write(path, state)
+            return {
+                "status": state["status"], "threadId": thread_id,
+                "harnessTurnId": state.get("harnessTurnId"), "error": state.get("error"),
+            }
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+        state.update({"status": "failed", "error": f"debounced closeout failed: {exc}", "updatedAt": now()})
+        atomic_write(path, state)
+        return {"status": "failed", "threadId": thread_id, "error": state["error"]}
+
+
+def arm_debounce(args) -> int:
+    target = Path(args.target).resolve()
+    if not target.is_dir() or not saved_project(target):
+        raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    path = session_path(args.thread)
+    prior = load_receipt(path) if path.exists() else {}
+    if os.environ.get("DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT") != "1":
+        try:
+            with AppServer() as app:
+                app.require_listed_thread(args.thread, target)
+                thread = app.read_thread(args.thread)
+                preflight_status, reason = inspect_closeout(thread, args.turn)
+        except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot preflight debounced closeout: {exc}") from exc
+        if preflight_status != "ready":
+            if preflight_status in {"manual_harness_seen", "superseded"}:
+                stop_timer(prior.get("timerUnit"))
+            result = {"status": preflight_status, "threadId": args.thread, "reason": reason}
+            print(json.dumps(result) if args.json else f"{args.thread}: {preflight_status} ({reason})")
+            return 0 if preflight_status in {"manual_harness_seen", "superseded"} else 1
+    stop_timer(prior.get("timerUnit"))
+    generation = int(prior.get("generation") or 0) + 1
+    state = {
+        "schemaVersion": 1, "threadId": args.thread, "targetPath": str(target),
+        "productTurnId": args.turn, "generation": generation,
+        "debounceSeconds": args.seconds, "harnessMode": args.harness_mode,
+        "harnessPrompt": READ_ONLY_HARNESS_PROMPT if args.harness_mode == "read-only" else HARNESS_PROMPT,
+        "status": "pending", "createdAt": prior.get("createdAt") or now(),
+        "updatedAt": now(),
+        "dueAt": (datetime.now(timezone.utc) + timedelta(seconds=args.seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_write(path, state)
+    scheduled, error = schedule_timer(state, Path(sys.argv[0]).resolve())
+    if scheduled:
+        atomic_write(path, state)
+        result = {
+            "status": "pending", "threadId": args.thread, "productTurnId": args.turn,
+            "generation": generation, "dueAt": state["dueAt"], "timerUnit": state["timerUnit"],
+        }
+        print(json.dumps(result) if args.json else f"{args.thread}: harness pending until {state['dueAt']}")
+        return 0
+    state["scheduleError"] = error
+    atomic_write(path, state)
+    result = fire_debounce(args.thread, generation, Path(sys.argv[0]).resolve())
+    result["scheduleError"] = error
+    print(json.dumps(result) if args.json else f"{args.thread}: harness {result['status']} ({error})")
+    return 0 if result.get("status") in {"completed", "manual_harness_seen", "superseded"} else 1
+
+
+def cancel_debounce(args) -> int:
+    path = session_path(args.thread)
+    if not path.exists():
+        result = {"status": "absent", "threadId": args.thread}
+    else:
+        state = load_receipt(path)
+        stop_timer(state.get("timerUnit"))
+        state.update({"status": "cancelled", "timerUnit": None, "updatedAt": now()})
+        atomic_write(path, state)
+        result = {"status": "cancelled", "threadId": args.thread, "generation": state.get("generation")}
+    print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+    return 0
+
+
+def debounce_status(args) -> int:
+    path = session_path(args.thread)
+    if not path.exists():
+        result = {"status": "absent", "threadId": args.thread}
+    else:
+        state = load_receipt(path)
+        result = {
+            key: state.get(key) for key in (
+                "schemaVersion", "threadId", "targetPath", "productTurnId", "generation",
+                "status", "dueAt", "timerUnit", "harnessTurnId", "error", "updatedAt",
+            )
+        }
+    print(json.dumps(result) if args.json else (
+        f"{args.thread}: {result['status']} due={result.get('dueAt') or '-'} "
+        f"harness={result.get('harnessTurnId') or '-'}"
+    ))
+    return 0
+
+
 def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
     if job_id:
         path = receipt_path(job_id)
@@ -550,6 +767,22 @@ def main() -> int:
     harness.add_argument("--read-only-harness", action="store_true")
     harness.add_argument("--standard-harness", action="store_true")
     run.add_argument("--json", action="store_true")
+    debounce = sub.add_parser("debounce")
+    debounce.add_argument("--target", required=True)
+    debounce.add_argument("--thread", required=True)
+    debounce.add_argument("--turn", required=True)
+    debounce.add_argument("--seconds", type=int, default=1800)
+    debounce.add_argument("--harness-mode", choices=("read-only", "standard"), required=True)
+    debounce.add_argument("--json", action="store_true")
+    cancel = sub.add_parser("debounce-cancel")
+    cancel.add_argument("--thread", required=True)
+    cancel.add_argument("--json", action="store_true")
+    debounce_read = sub.add_parser("debounce-status")
+    debounce_read.add_argument("--thread", required=True)
+    debounce_read.add_argument("--json", action="store_true")
+    fire = sub.add_parser("_debounce-fire")
+    fire.add_argument("--thread", required=True)
+    fire.add_argument("--generation", type=int, required=True)
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
@@ -562,6 +795,18 @@ def main() -> int:
         return dispatch(args)
     if args.command == "run":
         return run_target(args)
+    if args.command == "debounce":
+        if args.seconds < 1:
+            raise SystemExit("debounce seconds must be positive")
+        return arm_debounce(args)
+    if args.command == "debounce-cancel":
+        return cancel_debounce(args)
+    if args.command == "debounce-status":
+        return debounce_status(args)
+    if args.command == "_debounce-fire":
+        result = fire_debounce(args.thread, args.generation, Path(sys.argv[0]).resolve())
+        print(json.dumps(result))
+        return 0 if result.get("status") in {"completed", "manual_harness_seen", "superseded", "stale", "pending"} else 1
     if args.command == "projects":
         paths = saved_projects()
         print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))

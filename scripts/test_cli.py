@@ -41,6 +41,7 @@ def fake_app_server(
     ready: threading.Event,
     visible: bool = True,
     stall_ready: threading.Event | None = None,
+    seeded_threads: dict[str, dict] | None = None,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -57,7 +58,11 @@ def fake_app_server(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
     ).encode())
-    threads, listed, turns = {}, {}, 0
+    threads, listed, histories, turns = {}, {}, {}, 0
+    for thread_id, seed in (seeded_threads or {}).items():
+        threads[thread_id] = 0
+        listed[thread_id] = {"id": thread_id, "source": "vscode", "cwd": seed["cwd"]}
+        histories[thread_id] = list(seed.get("turns") or [])
     while True:
         message = receive_frame(connection)
         if message is None:
@@ -70,22 +75,35 @@ def fake_app_server(
             thread = "00000000-0000-4000-8000-000000000001" if cwd.endswith("darkexec") else "00000000-0000-4000-8000-000000000002"
             threads[thread] = 0
             listed[thread] = {"id": thread, "source": "vscode", "cwd": cwd}
+            histories[thread] = []
             send_frame(connection, {"id": message["id"], "result": {"thread": {"id": thread, "source": "vscode", "cwd": cwd}}})
         elif method == "thread/list":
             cwd = message["params"]["cwd"]
             data = [thread for thread in listed.values() if visible and thread["cwd"] == cwd]
             send_frame(connection, {"id": message["id"], "result": {"data": data, "nextCursor": None}})
+        elif method == "thread/read":
+            thread = message["params"]["threadId"]
+            metadata = listed[thread]
+            send_frame(connection, {"id": message["id"], "result": {"thread": {
+                **metadata, "turns": histories[thread], "status": {"type": "idle"},
+            }}})
         elif method == "turn/start":
             turns += 1
             thread = message["params"]["threadId"]
             prompt = message["params"]["input"][0]["text"]
             turn = f"turn-{turns}"
             send_frame(connection, {"id": message["id"], "result": {"turn": {"id": turn}}})
+            history = {
+                "id": turn, "status": "inProgress",
+                "items": [{"id": f"user-{turn}", "type": "userMessage", "content": [{"type": "text", "text": prompt}]}],
+            }
+            histories[thread].append(history)
             if prompt == "WAIT_FOR_SIGNAL":
                 if stall_ready:
                     stall_ready.set()
                 continue
             text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
+            history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
             send_frame(connection, {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "text": text}}})
             threads[thread] += 12
             multiplier = threads[thread] // 12
@@ -97,6 +115,7 @@ def fake_app_server(
                 }},
             }})
             send_frame(connection, {"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": turn, "status": "completed", "error": None}}})
+            history["status"] = "completed"
         elif method == "turn/interrupt":
             send_frame(connection, {"id": message["id"], "result": {}})
     connection.close()
@@ -231,10 +250,118 @@ def main() -> None:
         assert interrupted["error"] == f"interrupted by signal {signal.SIGTERM}", interrupted
         signal_server.join(timeout=2)
         assert not signal_server.is_alive()
+        timer_thread = "00000000-0000-4000-8000-000000000002"
+        scheduler_log = root / "scheduler.log"
+        fake_systemd_run = root / "systemd-run"
+        fake_systemd_run.write_text(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >>\"$DARKEXEC_SCHEDULER_LOG\"\nexit \"${DARKEXEC_SCHEDULER_EXIT:-0}\"\n"
+        )
+        fake_systemctl = root / "systemctl"
+        fake_systemctl.write_text(
+            "#!/usr/bin/env bash\nprintf 'stop %s\\n' \"$*\" >>\"$DARKEXEC_SCHEDULER_LOG\"\n"
+        )
+        fake_systemd_run.chmod(0o755)
+        fake_systemctl.chmod(0o755)
+        timer_env = {
+            **env,
+            "DARKEXEC_SESSION_ROOT": str(root / "sessions"),
+            "DARKEXEC_SYSTEMD_RUN": str(fake_systemd_run),
+            "DARKEXEC_SYSTEMCTL": str(fake_systemctl),
+            "DARKEXEC_SCHEDULER_LOG": str(scheduler_log),
+            "DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT": "1",
+        }
+        arm = [
+            str(ROOT / "bin/darkexec"), "debounce", "--target", str(target),
+            "--thread", timer_thread, "--turn", "product-1", "--seconds", "1800",
+            "--harness-mode", "standard", "--json",
+        ]
+        armed = subprocess.run(arm, capture_output=True, text=True, env=timer_env, check=False)
+        armed_result = json.loads(armed.stdout)
+        assert armed.returncode == 0 and armed_result["status"] == "pending", armed_result
+        assert armed_result["generation"] == 1 and "-g1-a1" in armed_result["timerUnit"], armed_result
+        reset = [*arm]
+        reset[reset.index("product-1")] = "product-2"
+        reset_result = json.loads(subprocess.run(
+            reset, capture_output=True, text=True, env=timer_env, check=False,
+        ).stdout)
+        assert reset_result["generation"] == 2 and "-g2-a1" in reset_result["timerUnit"], reset_result
+        assert "stop darkexec-closeout-" in scheduler_log.read_text()
+        pending_status = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-status", "--thread", timer_thread, "--json"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        assert pending_status.returncode == 0
+        assert json.loads(pending_status.stdout)["status"] == "pending", pending_status.stdout
+        stale = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread", timer_thread, "--generation", "1"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        assert stale.returncode == 0 and json.loads(stale.stdout)["status"] == "stale", stale.stdout
+        manual_socket, manual_ready = root / "manual.sock", threading.Event()
+        manual_turns = [
+            {"id": "product-2", "status": "completed", "items": [
+                {"id": "u-product", "type": "userMessage", "content": [{"type": "text", "text": "Follow-up work"}]},
+            ]},
+            {"id": "manual-harness", "status": "completed", "items": [
+                {"id": "u-harness", "type": "userMessage", "content": [{"type": "text", "text": (
+                    "Let's do a harness pass where we take a look at this session and turn trial and error "
+                    "into fast, reliable, and durable execution. Make sure we are following "
+                    "/srv/darkexec/harness-ops.md doctrine."
+                )}]},
+            ]},
+        ]
+        manual_server = threading.Thread(
+            target=fake_app_server,
+            args=(manual_socket, manual_ready, True, None, {
+                timer_thread: {"cwd": str(target), "turns": manual_turns},
+            }),
+            daemon=True,
+        )
+        manual_server.start(); assert manual_ready.wait(timeout=2)
+        manual_env = {**timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(manual_socket)}
+        manual = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread", timer_thread, "--generation", "2"],
+            capture_output=True, text=True, env=manual_env, check=False,
+        )
+        assert manual.returncode == 0 and json.loads(manual.stdout)["status"] == "manual_harness_seen", manual.stdout
+        manual_server.join(timeout=2)
+        assert not manual_server.is_alive()
+        fallback_socket, fallback_ready = root / "fallback.sock", threading.Event()
+        fallback_turns = [{"id": "product-3", "status": "completed", "items": [
+            {"id": "u-product-3", "type": "userMessage", "content": [{"type": "text", "text": "More follow-up work"}]},
+        ]}]
+        fallback_server = threading.Thread(
+            target=fake_app_server,
+            args=(fallback_socket, fallback_ready, True, None, {
+                timer_thread: {"cwd": str(target), "turns": fallback_turns},
+            }),
+            daemon=True,
+        )
+        fallback_server.start(); assert fallback_ready.wait(timeout=2)
+        fallback_env = {
+            **timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(fallback_socket),
+            "DARKEXEC_SCHEDULER_EXIT": "1",
+        }
+        fallback_arm = [*arm]
+        fallback_arm[fallback_arm.index("product-1")] = "product-3"
+        fallback = subprocess.run(
+            fallback_arm, capture_output=True, text=True, env=fallback_env, check=False,
+        )
+        fallback_result = json.loads(fallback.stdout)
+        assert fallback.returncode == 0 and fallback_result["status"] == "completed", fallback_result
+        assert fallback_result["scheduleError"], fallback_result
+        fallback_server.join(timeout=2)
+        assert not fallback_server.is_alive()
+        cancelled = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-cancel", "--thread", timer_thread, "--json"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        assert cancelled.returncode == 0 and json.loads(cancelled.stdout)["status"] == "cancelled", cancelled.stdout
     print(json.dumps({"status": "passed", "contracts": [
         "saved-project-list", "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
-        "conflict-closed", "signal-terminalized",
+        "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
+        "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status", "debounce-cancel",
     ]}))
 
 
