@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Dispatch one visible target task through a visible DarkExec control task."""
+
+from __future__ import annotations
+
+import argparse, base64, fcntl, hashlib, json
+import os, select, signal, socket, struct, sys
+import tempfile, time, tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_ROOT = Path(os.environ.get("DARKEXEC_STATE_ROOT", "/var/lib/darkexec/jobs"))
+WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
+CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
+DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
+TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "630"))
+APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
+                                        "/root/.codex/app-server-control/app-server-control.sock"))
+HARNESS_PROMPT = (
+    "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
+    f"reliable, and durable execution. Make sure we are following {DOCTRINE} doctrine."
+)
+READ_ONLY_HARNESS_PROMPT = (
+    "FIRE DRILL harness proof only. Review this task's completed trajectory without using tools, inspecting "
+    "files, changing state, continuing product work, or contacting anyone. Briefly report whether the request "
+    "stayed read-only and whether any harness change is warranted; make no change."
+)
+def now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+class DispatchInterrupted(Exception):
+    def __init__(self, signum: int):
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+
+def atomic_write(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rendered = json.dumps(payload, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        handle.write(rendered)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def receipt_path(job_id: str) -> Path:
+    return STATE_ROOT / f"{hashlib.sha256(job_id.encode()).hexdigest()}.json"
+
+def load_receipt(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+def saved_project(path: Path) -> bool:
+    try:
+        config = tomllib.loads(CONFIG.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return str(path) in (config.get("projects") or {})
+
+
+def usage(raw: dict | None) -> dict:
+    raw = raw or {}
+    return {
+        "input": int(raw.get("inputTokens") or raw.get("input_tokens") or 0),
+        "cacheRead": int(raw.get("cachedInputTokens") or raw.get("cached_input_tokens") or 0),
+        "output": int(raw.get("outputTokens") or raw.get("output_tokens") or 0),
+        "reasoningOutput": int(raw.get("reasoningOutputTokens") or raw.get("reasoning_output_tokens") or 0),
+        "total": int(raw.get("totalTokens") or raw.get("total_tokens") or 0),
+    }
+
+
+def usage_delta(after: dict, before: dict) -> dict:
+    return {key: max(0, int(after.get(key) or 0) - int(before.get(key) or 0)) for key in after}
+
+class AppServer:
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(str(APP_SERVER_SOCKET))
+        self.buffer = b""
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode()
+        self.sock.sendall(request)
+        deadline = time.monotonic() + 5
+        while b"\r\n\r\n" not in self.buffer:
+            self.buffer += self._read_socket(deadline)
+        headers, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        if b" 101 " not in headers or b"sec-websocket-accept: " + expected.lower() not in headers.lower():
+            raise RuntimeError(f"App Server WebSocket upgrade failed: {headers[:500]!r}")
+        self.request_id = 0
+        self.thread_usage: dict[str, dict] = {}
+        self.active_turn: tuple[str, str] | None = None
+        self.signal_handlers = {
+            signum: signal.signal(signum, self._handle_signal)
+            for signum in (signal.SIGTERM, signal.SIGINT)
+        }
+        self._request("initialize", {
+            "clientInfo": {"name": "darkexec", "version": "1"},
+            "capabilities": {
+                "experimentalApi": True,
+                "optOutNotificationMethods": [
+                    "item/agentMessage/delta", "item/reasoning/textDelta",
+                    "item/reasoning/summaryTextDelta", "item/commandExecution/outputDelta",
+                ],
+            },
+        })
+        self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _handle_signal(self, signum, _frame) -> None:
+        self.interrupt_active()
+        raise DispatchInterrupted(signum)
+
+    def _send(self, payload: dict) -> None:
+        self._send_frame(json.dumps(payload).encode())
+
+    def _read_socket(self, deadline: float) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([self.sock], [], [], remaining)[0]:
+            raise TimeoutError("App Server response timeout")
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("App Server WebSocket closed unexpectedly")
+        return chunk
+
+    def _take(self, count: int, deadline: float) -> bytes:
+        while len(self.buffer) < count:
+            self.buffer += self._read_socket(deadline)
+        value, self.buffer = self.buffer[:count], self.buffer[count:]
+        return value
+
+    def _send_frame(self, payload: bytes, opcode: int = 1) -> None:
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytes([0x80 | opcode])
+        if length < 126:
+            header += bytes([0x80 | length])
+        elif length < 65536:
+            header += bytes([0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack("!Q", length)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def _next(self, deadline: float) -> dict:
+        fragments = bytearray()
+        while True:
+            first, second = self._take(2, deadline)
+            opcode, masked = first & 0x0F, bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._take(2, deadline))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._take(8, deadline))[0]
+            mask = self._take(4, deadline) if masked else b""
+            payload = self._take(length, deadline)
+            if masked:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            if opcode == 8:
+                raise RuntimeError("App Server WebSocket closed")
+            if opcode == 9:
+                self._send_frame(payload, opcode=10)
+                continue
+            if opcode not in {0, 1}:
+                continue
+            fragments.extend(payload)
+            if first & 0x80:
+                return json.loads(fragments.decode())
+
+    def _request(self, method: str, params: dict, timeout: int = 30) -> dict:
+        self.request_id += 1
+        request_id = self.request_id
+        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self._next(deadline)
+            if message.get("id") != request_id:
+                continue
+            if message.get("error"):
+                raise RuntimeError(str(message["error"]))
+            return message.get("result") or {}
+
+    def start_thread(self, cwd: Path) -> dict:
+        result = self._request("thread/start", {
+            "cwd": str(cwd), "approvalPolicy": "never", "sandbox": "danger-full-access",
+            "ephemeral": False, "threadSource": "darkexec",
+        })
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        if not thread.get("id"):
+            raise RuntimeError("App Server did not return a thread identity")
+        return thread
+
+    def require_listed_thread(self, thread_id: str, cwd: Path) -> dict:
+        listed = self._request("thread/list", {"cwd": str(cwd), "sourceKinds": ["vscode"], "limit": 100,
+                                                "sortKey": "created_at", "sortDirection": "desc",
+                                                "useStateDbOnly": True})
+        match = next((item for item in listed.get("data", []) if item.get("id") == thread_id
+                      and item.get("cwd") == str(cwd) and item.get("source") == "vscode"), None)
+        if not match:
+            raise RuntimeError(f"Task {thread_id} was not listed by the running Codex App.")
+        return match
+
+    def run_turn(self, thread_id: str, prompt: str) -> dict:
+        self.request_id += 1
+        request_id = self.request_id
+        self._send({
+            "jsonrpc": "2.0", "id": request_id, "method": "turn/start",
+            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},
+        })
+        deadline = time.monotonic() + TURN_TIMEOUT
+        turn_id = None
+        messages: list[str] = []
+        final_usage = None
+        model_calls = 0
+        try:
+            while True:
+                message = self._next(deadline)
+                if message.get("id") == request_id:
+                    if message.get("error"):
+                        raise RuntimeError(str(message["error"]))
+                    turn_id = ((message.get("result") or {}).get("turn") or {}).get("id")
+                    if turn_id:
+                        self.active_turn = (thread_id, turn_id)
+                    continue
+                method = message.get("method")
+                params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                if params.get("threadId") != thread_id:
+                    continue
+                if method == "item/completed":
+                    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                    if item.get("type") == "agentMessage" and item.get("text"):
+                        messages.append(str(item["text"]))
+                elif method == "thread/tokenUsage/updated" and (not turn_id or params.get("turnId") == turn_id):
+                    token_usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
+                    final_usage = usage(token_usage.get("total") if isinstance(token_usage.get("total"), dict) else {})
+                    model_calls += 1
+                elif method == "turn/completed":
+                    turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                    if not turn_id or turn.get("id") != turn_id:
+                        continue
+                    previous = self.thread_usage.get(thread_id, {key: 0 for key in usage({})})
+                    current = final_usage or previous
+                    self.thread_usage[thread_id] = current
+                    result_text = messages[-1] if messages else ""
+                    ok = turn.get("status") == "completed" and bool(result_text)
+                    self.active_turn = None
+                    return {
+                        "ok": ok, "timedOut": False, "exitCode": 0 if ok else 1,
+                        "threadId": thread_id, "turnId": turn_id,
+                        "resultText": result_text[:12000],
+                        "usage": usage_delta(current, previous),
+                        "modelCallCount": model_calls or None,
+                        "error": "" if ok else str(turn.get("error") or "App task failed without a final response"),
+                    }
+        except TimeoutError:
+            self.interrupt_active()
+            return {
+                "ok": False, "timedOut": True, "exitCode": None, "threadId": thread_id,
+                "error": f"Codex App turn exceeded {TURN_TIMEOUT} seconds.",
+            }
+
+    def interrupt_active(self) -> None:
+        if not self.active_turn:
+            return
+        thread_id, turn_id = self.active_turn
+        try:
+            self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=5)
+        except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError):
+            pass
+        self.active_turn = None
+
+    def stop(self) -> None:
+        try:
+            self._send_frame(b"", opcode=8)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self.stop()
+        self.sock.close()
+        for signum, handler in self.signal_handlers.items():
+            signal.signal(signum, handler)
+
+
+def add_usage(receipt: dict) -> None:
+    entries = [
+        (receipt.get("executive") or {}).get("initialUsage"),
+        (receipt.get("executive") or {}).get("closeoutUsage"),
+        (receipt.get("target") or {}).get("initialUsage"),
+        ((receipt.get("target") or {}).get("harness") or {}).get("usage"),
+    ]
+    totals = {key: 0 for key in ("input", "cacheRead", "output", "reasoningOutput", "total")}
+    for entry in entries:
+        if isinstance(entry, dict):
+            for key in totals:
+                totals[key] += int(entry.get(key) or 0)
+    receipt["cumulativeUsage"] = totals
+
+
+def save(path: Path, receipt: dict, status: str) -> None:
+    receipt["status"] = status
+    receipt["updatedAt"] = now()
+    add_usage(receipt)
+    atomic_write(path, receipt)
+
+
+def closeout_executive(receipt: dict, path: Path, app: AppServer) -> None:
+    thread_id = (receipt.get("executive") or {}).get("threadId")
+    if not thread_id:
+        return
+    target_id = (receipt.get("target") or {}).get("threadId") or "unavailable"
+    prompt = (
+        f"DarkExec job {receipt['jobId']} reached {receipt['status']}. Target task: {target_id}. "
+        f"Same-task harness: {((receipt.get('target') or {}).get('harness') or {}).get('status', 'not_started')}. "
+        "Do not inspect or change anything. Reply with those identities and statuses only."
+    )
+    result = app.run_turn(thread_id, prompt)
+    receipt["executive"]["closeoutUsage"] = result.get("usage")
+    receipt["executive"]["closeoutModelCallCount"] = result.get("modelCallCount")
+    receipt["executive"]["closeoutResult"] = result.get("resultText")
+    receipt["executive"]["closeoutStatus"] = "completed" if result.get("ok") else "failed"
+    save(path, receipt, receipt["status"])
+
+
+def dispatch(args) -> int:
+    target = Path(args.target).resolve()
+    if not target.is_dir():
+        raise SystemExit(f"target is not a directory: {target}")
+    if not saved_project(target):
+        raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        raise SystemExit("dispatch requires a non-empty prompt on stdin")
+    path = receipt_path(args.job_id)
+    request_sha = hashlib.sha256(prompt.encode()).hexdigest()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = path.with_suffix(".lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if path.exists():
+            current = load_receipt(path)
+            print(json.dumps(current) if args.json else render_status(current))
+        else:
+            print(json.dumps({"jobId": args.job_id, "status": "starting"}) if args.json else f"{args.job_id}: starting")
+        return 1
+    if path.exists():
+        prior = load_receipt(path)
+        if prior.get("requestSha256") != request_sha or prior.get("targetPath") != str(target):
+            raise SystemExit("job id already belongs to a different request or target")
+        print(json.dumps(prior) if args.json else render_status(prior))
+        return 0 if prior.get("status") == "completed" else 1
+
+    receipt = {
+        "schemaVersion": 1, "jobId": args.job_id, "requestSha256": request_sha,
+        "targetPath": str(target), "transport": "codex-app-server-control-socket",
+        "createdAt": now(), "executive": {}, "target": {},
+    }
+    save(path, receipt, "registering")
+    interrupted_exit = None
+    control_prompt = (
+        f"DARKEXEC CONTROL TASK. Register job {args.job_id} for exact saved project {target}. "
+        f"The target request SHA-256 is {request_sha}. Do not inspect files, use tools, or perform "
+        f"the target work. Reply only: DARKEXEC_DISPATCH_READY {args.job_id}"
+    )
+    try:
+        with AppServer() as app:
+            executive_thread = app.start_thread(WORKSPACE)
+            executive = app.run_turn(executive_thread["id"], control_prompt)
+            executive_thread = app.require_listed_thread(executive_thread["id"], WORKSPACE)
+            receipt["executive"] = {
+                "threadId": executive_thread["id"], "source": executive_thread.get("source"),
+                "appVisible": True, "listedCwd": executive_thread.get("cwd"),
+                "initialUsage": executive.get("usage"),
+                "initialModelCallCount": executive.get("modelCallCount"),
+                "initialResult": executive.get("resultText"),
+            }
+            if not executive.get("ok"):
+                receipt["error"] = executive.get("error") or "DarkExec control task did not complete."
+                save(path, receipt, "failed")
+                print(json.dumps(receipt) if args.json else render_status(receipt))
+                return 1
+
+            save(path, receipt, "target_running")
+            target_thread = app.start_thread(target)
+            target_result = app.run_turn(target_thread["id"], prompt)
+            target_thread = app.require_listed_thread(target_thread["id"], target)
+            receipt["target"] = {
+                "threadId": target_thread["id"], "source": target_thread.get("source"),
+                "appVisible": True, "listedCwd": target_thread.get("cwd"),
+                "initialUsage": target_result.get("usage"),
+                "modelCallCount": target_result.get("modelCallCount"),
+                "resultText": target_result.get("resultText"), "harness": {"status": "not_started"},
+            }
+            if not target_result.get("ok"):
+                receipt["error"] = target_result.get("error") or "Target task failed before a durable result."
+                save(path, receipt, "failed")
+                closeout_executive(receipt, path, app)
+                print(json.dumps(receipt) if args.json else render_status(receipt))
+                return 1
+
+            save(path, receipt, "harness_running")
+            harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
+            harness = app.run_turn(target_thread["id"], harness_prompt)
+            receipt["target"]["harness"] = {
+                "status": "completed" if harness.get("ok") else "failed",
+                "usage": harness.get("usage"), "modelCallCount": harness.get("modelCallCount"),
+                "resultText": harness.get("resultText"), "error": harness.get("error") or None,
+            }
+            if not harness.get("ok"):
+                receipt["error"] = harness.get("error") or "Same-task harness turn failed."
+                save(path, receipt, "failed")
+            else:
+                save(path, receipt, "completed")
+            closeout_executive(receipt, path, app)
+    except DispatchInterrupted as exc:
+        receipt["error"] = str(exc)
+        save(path, receipt, "interrupted")
+        interrupted_exit = 128 + exc.signum
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+        receipt["error"] = f"Native Codex App transport failed: {exc}"
+        save(path, receipt, "failed")
+    print(json.dumps(receipt) if args.json else render_status(receipt))
+    if interrupted_exit is not None:
+        return interrupted_exit
+    return 0 if receipt.get("status") == "completed" else 1
+
+
+def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
+    if job_id:
+        path = receipt_path(job_id)
+        if not path.exists():
+            raise SystemExit(f"unknown DarkExec job: {job_id}")
+        return load_receipt(path)
+    for path in sorted(STATE_ROOT.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        receipt = load_receipt(path)
+        ids = {
+            (receipt.get("executive") or {}).get("threadId"),
+            (receipt.get("target") or {}).get("threadId"),
+        }
+        if thread_id in ids:
+            return receipt
+    raise SystemExit(f"unknown DarkExec thread: {thread_id}")
+
+
+def render_status(receipt: dict) -> str:
+    return (
+        f"{receipt.get('jobId')}: {receipt.get('status')} "
+        f"executive={(receipt.get('executive') or {}).get('threadId') or '-'} "
+        f"target={(receipt.get('target') or {}).get('threadId') or '-'} "
+        f"harness={((receipt.get('target') or {}).get('harness') or {}).get('status', 'not_started')}"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="darkexec")
+    sub = parser.add_subparsers(dest="command", required=True)
+    launch = sub.add_parser("dispatch")
+    launch.add_argument("--target", required=True)
+    launch.add_argument("--job-id", required=True)
+    launch.add_argument("--prompt-stdin", action="store_true", required=True)
+    launch.add_argument("--read-only-harness", action="store_true")
+    launch.add_argument("--json", action="store_true")
+    status = sub.add_parser("status")
+    identity = status.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--job-id")
+    identity.add_argument("--thread")
+    status.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if args.command == "dispatch":
+        return dispatch(args)
+    receipt = find_receipt(args.job_id, args.thread)
+    print(json.dumps(receipt) if args.json else render_status(receipt))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
