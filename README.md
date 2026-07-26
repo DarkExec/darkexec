@@ -89,6 +89,8 @@ DarkExec owns the boundaries agents most often drop:
 - **Native visibility** — work stays visible in Codex App under the project that owns it.
 - **Whole-job accountability** — a completed implementation turn is not the end of the lifecycle.
 - **Same-task learning** — Harness Ops reviews the trajectory without losing the task's context.
+- **Conversational continuity** — dependent interactive follow-ups stay in the established target
+  task instead of creating disconnected replacements.
 - **Terminal proof** — task IDs, roots, status, timestamps, and model usage remain inspectable.
 
 ## Two ways to run
@@ -100,6 +102,15 @@ executive selects the native task controls already available. If the complete na
 not exposed, it uses the synchronous `darkexec run` bridge without rediscovering private protocol.
 When a request does not name one exact saved project, `darkexec projects --json` provides the
 read-only project list used to resolve the target once or fail closed.
+
+The first interactive result receives an immediate same-task harness pass. Clearly dependent
+follow-ups in the same DarkExec conversation and saved project continue that target. Each completed
+follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
+`darkexec debounce`; after the conversation becomes idle, it rereads the target and sends one
+trailing harness unless a manual or automatic harness already closed the latest product turn.
+Dependent cross-task work and consequential phase changes flush a pending closeout first. If the
+timer cannot be scheduled, closeout runs immediately. Background and direct CLI runs always harness
+immediately.
 
 For direct callers, choose exactly one harness mode:
 
@@ -142,6 +153,14 @@ sudo darkexec status --job-id example-read-only-1 --json
 The job ID is idempotent only for the same target and exact request. Conflicting reuse fails closed.
 Receipts default to `/var/lib/darkexec/jobs` with private permissions.
 
+Interactive trailing-closeout state defaults to `/var/lib/darkexec/sessions`. Inspect or cancel an
+armed closeout by exact target task ID:
+
+```bash
+darkexec debounce-status --thread TARGET_TASK_ID --json
+darkexec debounce-cancel --thread TARGET_TASK_ID --json
+```
+
 ## What you can prove
 
 DarkExec exposes the evidence needed to distinguish “an agent said it finished” from “the requested
@@ -173,6 +192,7 @@ DarkExec currently assumes:
 
 - Python 3.11 or newer;
 - Git;
+- systemd for delayed interactive closeout (scheduling failure falls back to immediate closeout);
 - Codex CLI and Codex App configured for the same Linux host;
 - a running Codex App control socket;
 - exact target directories saved in Codex configuration; and
@@ -203,7 +223,7 @@ only the documented DarkExec-managed symlinks and release paths.
 
 | Path | Owns |
 | --- | --- |
-| `bin/darkexec` | Dispatch, interactive run, and status CLI |
+| `bin/darkexec` | Dispatch, interactive run, debounce, and status CLI |
 | `share/workspace/` | Installed Codex App executive project |
 | `share/harness-ops.md` | Pinned operating doctrine |
 | `scripts/install.sh` | Commit-addressed installation |
