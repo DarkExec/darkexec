@@ -162,6 +162,16 @@ def main() -> None:
         assert "not listed by the running Codex App" in hidden_result["error"], hidden_result
         hidden_server.join(timeout=2)
         assert not hidden_server.is_alive()
+        missing_mode = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "run", "--target", str(target),
+                "--prompt-stdin", "--json",
+            ],
+            input="Must not create a target task.", capture_output=True, text=True,
+            env=env, check=False,
+        )
+        assert missing_mode.returncode != 0, missing_mode
+        assert "one of the arguments --read-only-harness --standard-harness is required" in missing_mode.stderr, missing_mode.stderr
         run_socket, run_ready = root / "run.sock", threading.Event()
         run_server = threading.Thread(target=fake_app_server, args=(run_socket, run_ready), daemon=True)
         run_server.start(); assert run_ready.wait(timeout=2)
@@ -214,7 +224,7 @@ def main() -> None:
         assert not signal_server.is_alive()
     print(json.dumps({"status": "passed", "contracts": [
         "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
-        "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
+        "interactive-harness-mode-required", "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
         "conflict-closed", "signal-terminalized",
     ]}))
 

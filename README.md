@@ -38,11 +38,16 @@ want.
 
 If that task does not expose native task-management tools, the installed workspace uses the same
 control socket through the synchronous `darkexec run` fallback. It creates only the target task,
-preserves the request as its first turn, and waits for the same-task harness:
+preserves the request byte-for-byte as its first turn, and waits for the same-task harness.
+The caller must explicitly select exactly one harness mode; omission fails before a target task is
+created:
 
 ```bash
 printf '%s' 'Inspect the target and report its current test status. Make no changes.' |
   darkexec run --target /absolute/saved/project --prompt-stdin --read-only-harness --json
+
+printf '%s' 'Implement the requested target-owned repair and verify it.' |
+  darkexec run --target /absolute/saved/project --prompt-stdin --standard-harness --json
 ```
 
 The installed executive selects this path from the task controls already available. It does not
