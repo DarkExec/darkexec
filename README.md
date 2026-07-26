@@ -98,6 +98,8 @@ DarkExec owns the boundaries agents most often drop:
 Open `/srv/darkexec` as a saved Codex App project and send a natural request. The installed
 executive selects the native task controls already available. If the complete native control set is
 not exposed, it uses the synchronous `darkexec run` bridge without rediscovering private protocol.
+When a request does not name one exact saved project, `darkexec projects --json` provides the
+read-only project list used to resolve the target once or fail closed.
 
 For direct callers, choose exactly one harness mode:
 

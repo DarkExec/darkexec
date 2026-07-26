@@ -121,6 +121,15 @@ def main() -> None:
             "DARKEXEC_WORKSPACE": str(workspace), "DARKEXEC_CONFIG": str(config),
             "DARKEXEC_APP_SERVER_SOCKET": str(socket_path),
         }
+        projects = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "projects", "--json"],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        assert projects.returncode == 0, projects.stderr
+        assert json.loads(projects.stdout) == {
+            "schemaVersion": 1,
+            "projects": [str(target)],
+        }, projects.stdout
         command = [
             str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
             "--job-id", "incident-1", "--prompt-stdin", "--read-only-harness", "--json",
@@ -223,7 +232,7 @@ def main() -> None:
         signal_server.join(timeout=2)
         assert not signal_server.is_alive()
     print(json.dumps({"status": "passed", "contracts": [
-        "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
+        "saved-project-list", "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
         "conflict-closed", "signal-terminalized",
     ]}))
