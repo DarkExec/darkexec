@@ -162,6 +162,25 @@ def main() -> None:
         assert "not listed by the running Codex App" in hidden_result["error"], hidden_result
         hidden_server.join(timeout=2)
         assert not hidden_server.is_alive()
+        run_socket, run_ready = root / "run.sock", threading.Event()
+        run_server = threading.Thread(target=fake_app_server, args=(run_socket, run_ready), daemon=True)
+        run_server.start(); assert run_ready.wait(timeout=2)
+        run_env = {**env, "DARKEXEC_APP_SERVER_SOCKET": str(run_socket)}
+        run_command = [
+            str(ROOT / "bin/darkexec"), "run", "--target", str(target),
+            "--prompt-stdin", "--read-only-harness", "--json",
+        ]
+        interactive = subprocess.run(
+            run_command, input="Exact response request.", capture_output=True, text=True,
+            env=run_env, check=False,
+        )
+        interactive_result = json.loads(interactive.stdout)
+        assert interactive.returncode == 0 and interactive_result["status"] == "completed", interactive_result
+        assert interactive_result["target"]["resultText"] == "TARGET_OK:Exact response request.", interactive_result
+        assert interactive_result["target"]["appVisible"] is True, interactive_result
+        assert interactive_result["harness"]["status"] == "completed", interactive_result
+        run_server.join(timeout=2)
+        assert not run_server.is_alive()
         signal_socket, signal_server_ready, stalled = root / "signal.sock", threading.Event(), threading.Event()
         signal_server = threading.Thread(
             target=fake_app_server,
@@ -195,7 +214,8 @@ def main() -> None:
         assert not signal_server.is_alive()
     print(json.dumps({"status": "passed", "contracts": [
         "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
-        "separate-usage", "idempotent-job", "thread-status", "conflict-closed", "signal-terminalized",
+        "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
+        "conflict-closed", "signal-terminalized",
     ]}))
 
 

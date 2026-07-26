@@ -36,6 +36,15 @@ sudo ./scripts/install.sh
 Add `/srv/darkexec` as a saved Codex App project. Open it as a normal task and state the outcome you
 want.
 
+If that task does not expose native task-management tools, the installed workspace uses the same
+control socket through the synchronous `darkexec run` fallback. It creates only the target task,
+preserves the request as its first turn, and waits for the same-task harness:
+
+```bash
+printf '%s' 'Inspect the target and report its current test status. Make no changes.' |
+  darkexec run --target /absolute/saved/project --prompt-stdin --read-only-harness --json
+```
+
 For a background caller:
 
 ```bash

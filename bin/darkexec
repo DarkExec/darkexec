@@ -438,6 +438,65 @@ def dispatch(args) -> int:
     return 0 if receipt.get("status") == "completed" else 1
 
 
+def run_target(args) -> int:
+    target = Path(args.target).resolve()
+    if not target.is_dir():
+        raise SystemExit(f"target is not a directory: {target}")
+    if not saved_project(target):
+        raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        raise SystemExit("run requires a non-empty prompt on stdin")
+    result = {
+        "schemaVersion": 1, "targetPath": str(target),
+        "transport": "codex-app-server-control-socket", "createdAt": now(),
+    }
+    interrupted_exit = None
+    try:
+        with AppServer() as app:
+            thread = app.start_thread(target)
+            target_result = app.run_turn(thread["id"], prompt)
+            thread = app.require_listed_thread(thread["id"], target)
+            result["target"] = {
+                "threadId": thread["id"], "source": thread.get("source"),
+                "appVisible": True, "listedCwd": thread.get("cwd"),
+                "resultText": target_result.get("resultText"),
+                "usage": target_result.get("usage"),
+                "modelCallCount": target_result.get("modelCallCount"),
+            }
+            if not target_result.get("ok"):
+                result["status"] = "failed"
+                result["error"] = target_result.get("error") or "Target task failed."
+            else:
+                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
+                harness = app.run_turn(thread["id"], harness_prompt)
+                result["harness"] = {
+                    "status": "completed" if harness.get("ok") else "failed",
+                    "resultText": harness.get("resultText"),
+                    "usage": harness.get("usage"),
+                    "modelCallCount": harness.get("modelCallCount"),
+                    "error": harness.get("error") or None,
+                }
+                result["status"] = "completed" if harness.get("ok") else "failed"
+                if not harness.get("ok"):
+                    result["error"] = harness.get("error") or "Same-task harness turn failed."
+    except DispatchInterrupted as exc:
+        result["status"] = "interrupted"
+        result["error"] = str(exc)
+        interrupted_exit = 128 + exc.signum
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+        result["status"] = "failed"
+        result["error"] = f"Native Codex App transport failed: {exc}"
+    result["updatedAt"] = now()
+    print(json.dumps(result) if args.json else (
+        f"{result['status']} target={(result.get('target') or {}).get('threadId') or '-'} "
+        f"harness={(result.get('harness') or {}).get('status', 'not_started')}"
+    ))
+    if interrupted_exit is not None:
+        return interrupted_exit
+    return 0 if result.get("status") == "completed" else 1
+
+
 def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
     if job_id:
         path = receipt_path(job_id)
@@ -473,6 +532,11 @@ def main() -> int:
     launch.add_argument("--prompt-stdin", action="store_true", required=True)
     launch.add_argument("--read-only-harness", action="store_true")
     launch.add_argument("--json", action="store_true")
+    run = sub.add_parser("run")
+    run.add_argument("--target", required=True)
+    run.add_argument("--prompt-stdin", action="store_true", required=True)
+    run.add_argument("--read-only-harness", action="store_true")
+    run.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
     identity = status.add_mutually_exclusive_group(required=True)
     identity.add_argument("--job-id")
@@ -481,6 +545,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "dispatch":
         return dispatch(args)
+    if args.command == "run":
+        return run_target(args)
     receipt = find_receipt(args.job_id, args.thread)
     print(json.dumps(receipt) if args.json else render_status(receipt))
     return 0
