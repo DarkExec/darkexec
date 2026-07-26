@@ -45,6 +45,10 @@ printf '%s' 'Inspect the target and report its current test status. Make no chan
   darkexec run --target /absolute/saved/project --prompt-stdin --read-only-harness --json
 ```
 
+The installed executive selects this path from the task controls already available. It does not
+probe App Server internals or rediscover protocol, and a complete terminal result needs no second
+status read.
+
 For a background caller:
 
 ```bash
@@ -89,7 +93,7 @@ you need.
 
 ## Repository map
 
-- `bin/darkexec` — dispatch and status CLI
+- `bin/darkexec` — dispatch, interactive run, and status CLI
 - `share/workspace/` — installed Codex App project
 - `share/harness-ops.md` — pinned operating doctrine
 - `scripts/install.sh` — commit-addressed installer
