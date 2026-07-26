@@ -52,7 +52,9 @@ printf '%s' 'Implement the requested target-owned repair and verify it.' |
 
 The installed executive selects this path from the task controls already available. It does not
 probe App Server internals or rediscover protocol, and a complete terminal result needs no second
-status read.
+status read. `darkexec run` is synchronous: keep its one caller process alive until terminal JSON
+arrives. A caller-side timeout is an interrupted run, not a polling mechanism or permission to
+reissue the request.
 
 For a background caller:
 
