@@ -217,6 +217,8 @@ sudo darkexec update
 release, and atomically switches `/opt/darkexec/current`. Reinstall a known checkout to roll back.
 Installation also exposes the pinned release doctrine at both `/srv/darkexec/harness-ops.md` and the
 conventional `/srv/harness-ops.md` host path when that host path has no existing doctrine owner.
+Readable existing bindings are preserved; missing or broken bindings are repaired to the pinned
+installed snapshot.
 
 The alpha does not yet provide an automated uninstaller. Preserve any receipts you need, then remove
 only the documented DarkExec-managed symlinks and release paths.

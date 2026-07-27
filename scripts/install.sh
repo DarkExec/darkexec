@@ -8,7 +8,7 @@ bin_path="${DARKEXEC_BIN_PATH:-/usr/local/bin/darkexec}"; host_doctrine="${DARKE
 ln -sfn "$release" "$install/.current"; mv -Tf "$install/.current" "$install/current"
 ln -sfn "$install/current/share/workspace/AGENTS.md" "$workspace/AGENTS.md"; ln -sfn "$install/current/share/workspace/README.md" "$workspace/README.md"
 ln -sfn "$install/current/share/harness-ops.md" "$workspace/harness-ops.md"
-[[ -e "$host_doctrine" || -L "$host_doctrine" ]] || ln -s "$workspace/harness-ops.md" "$host_doctrine"
+[[ -e "$host_doctrine" ]] || ln -sfn "$workspace/harness-ops.md" "$host_doctrine"
 mkdir -p "$(dirname "$bin_path")"; ln -sfn "$install/current/bin/darkexec" "$bin_path"
 doctrine_sha="$(sha256sum "$release/share/harness-ops.md" | awk '{print $1}')"
 printf '{"commit":"%s","workspace":"%s","binPath":"%s","doctrineSha256":"%s","nextAction":"Open %s in Codex App and send the outcome you want."}\n' \
