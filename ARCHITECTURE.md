@@ -39,7 +39,7 @@ active native turn.
 Each release contains `share/harness-ops.md` and `share/harness-ops.provenance.json`. The installed
 workspace exposes that exact doctrine. Runtime behavior never depends on a mutable Harness Ops
 checkout. The installer also binds `/srv/harness-ops.md` to that installed snapshot for target
-harnesses that use the conventional host path.
+harnesses that use the conventional host path, but preserves an existing host doctrine binding.
 
 ## Trust boundaries
 
