@@ -133,8 +133,10 @@ printf '%s' 'Implement the requested target-owned repair and verify it.' |
 ```
 
 `darkexec run` is synchronous. Keep that one caller process alive until terminal JSON arrives.
-A caller timeout is an interrupted run, not a polling strategy or permission to issue duplicate
-work.
+Target and harness turns have no runtime deadline by default, so regression watches and overnight
+experiments can remain active for hours. `DARKEXEC_TURN_TIMEOUT` may set an explicit positive limit
+for bounded callers. A caller timeout or signal is an interrupted run, not a polling strategy or
+permission to issue duplicate work.
 
 ### Background: durable dispatch
 
@@ -208,13 +210,13 @@ general sandbox. Callers retain authorization, scheduling, deduplication, and ex
 ## Validate, upgrade, and recover
 
 ```bash
-cd darkexec
-./scripts/validate.sh
-sudo ./scripts/install.sh
+sudo darkexec update
 ```
 
-Installation is commit-addressed and atomically switches `/opt/darkexec/current`. Reinstall a known
-checkout to roll back.
+`darkexec update` fetches public `main`, runs the release validator, creates a commit-addressed
+release, and atomically switches `/opt/darkexec/current`. Reinstall a known checkout to roll back.
+Installation also exposes the pinned release doctrine at both `/srv/darkexec/harness-ops.md` and the
+conventional `/srv/harness-ops.md` host path.
 
 The alpha does not yet provide an automated uninstaller. Preserve any receipts you need, then remove
 only the documented DarkExec-managed symlinks and release paths.

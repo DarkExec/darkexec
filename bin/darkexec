@@ -14,7 +14,9 @@ SESSION_ROOT = Path(os.environ.get("DARKEXEC_SESSION_ROOT", "/var/lib/darkexec/s
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
 CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
 DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
-TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "630"))
+TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "0"))
+UPDATE_REPOSITORY = os.environ.get("DARKEXEC_UPDATE_REPOSITORY", "https://github.com/DarkExec/darkexec")
+UPDATE_REF = os.environ.get("DARKEXEC_UPDATE_REF", "main")
 APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
                                         "/root/.codex/app-server-control/app-server-control.sock"))
 HARNESS_PROMPT = (
@@ -141,16 +143,18 @@ class AppServer:
     def _send(self, payload: dict) -> None:
         self._send_frame(json.dumps(payload).encode())
 
-    def _read_socket(self, deadline: float) -> bytes:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not select.select([self.sock], [], [], remaining)[0]:
+    def _read_socket(self, deadline: float | None) -> bytes:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("App Server response timeout")
+        if not select.select([self.sock], [], [], remaining)[0]:
             raise TimeoutError("App Server response timeout")
         chunk = self.sock.recv(65536)
         if not chunk:
             raise RuntimeError("App Server WebSocket closed unexpectedly")
         return chunk
 
-    def _take(self, count: int, deadline: float) -> bytes:
+    def _take(self, count: int, deadline: float | None) -> bytes:
         while len(self.buffer) < count:
             self.buffer += self._read_socket(deadline)
         value, self.buffer = self.buffer[:count], self.buffer[count:]
@@ -169,7 +173,7 @@ class AppServer:
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
         self.sock.sendall(header + mask + masked)
 
-    def _next(self, deadline: float) -> dict:
+    def _next(self, deadline: float | None) -> dict:
         fragments = bytearray()
         while True:
             first, second = self._take(2, deadline)
@@ -241,7 +245,7 @@ class AppServer:
             "jsonrpc": "2.0", "id": request_id, "method": "turn/start",
             "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},
         })
-        deadline = time.monotonic() + TURN_TIMEOUT
+        deadline = time.monotonic() + TURN_TIMEOUT if TURN_TIMEOUT > 0 else None
         turn_id = None
         messages: list[str] = []
         final_usage = None
@@ -725,6 +729,35 @@ def debounce_status(args) -> int:
     return 0
 
 
+def update_install(args) -> int:
+    with tempfile.TemporaryDirectory(prefix="darkexec-update-") as temporary:
+        checkout = Path(temporary) / "darkexec"
+        clone = ["git", "clone", "--quiet", "--depth", "1"]
+        if UPDATE_REF:
+            clone.extend(["--branch", UPDATE_REF])
+        clone.extend([UPDATE_REPOSITORY, str(checkout)])
+        fetched = subprocess.run(clone, capture_output=True, text=True, check=False)
+        if fetched.returncode:
+            raise SystemExit(f"cannot fetch DarkExec update: {fetched.stderr.strip() or fetched.stdout.strip()}")
+        installed = subprocess.run(
+            [str(checkout / "scripts/install.sh")],
+            capture_output=True, text=True, check=False,
+        )
+        if installed.returncode:
+            raise SystemExit(f"cannot install DarkExec update: {installed.stderr.strip() or installed.stdout.strip()}")
+        lines = [line for line in installed.stdout.splitlines() if line.strip()]
+        try:
+            receipt = json.loads(lines[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            raise SystemExit("DarkExec update installer returned no valid receipt") from exc
+    result = {"status": "updated", "repository": UPDATE_REPOSITORY, "ref": UPDATE_REF or None, **receipt}
+    print(json.dumps(result) if args.json else (
+        f"updated commit={result.get('commit')} workspace={result.get('workspace')} "
+        f"next={result.get('nextAction')}"
+    ))
+    return 0
+
+
 def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
     if job_id:
         path = receipt_path(job_id)
@@ -785,6 +818,8 @@ def main() -> int:
     fire.add_argument("--generation", type=int, required=True)
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
+    update = sub.add_parser("update")
+    update.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
     identity = status.add_mutually_exclusive_group(required=True)
     identity.add_argument("--job-id")
@@ -811,6 +846,8 @@ def main() -> int:
         paths = saved_projects()
         print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))
         return 0
+    if args.command == "update":
+        return update_install(args)
     receipt = find_receipt(args.job_id, args.thread)
     print(json.dumps(receipt) if args.json else render_status(receipt))
     return 0

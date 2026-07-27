@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline contract test for dispatch, status, idempotency, and same-task harness."""
 
-import base64, hashlib, json, os, signal, socket, struct, subprocess, tempfile, threading
+import base64, hashlib, json, os, signal, socket, struct, subprocess, tempfile, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +102,8 @@ def fake_app_server(
                 if stall_ready:
                     stall_ready.set()
                 continue
+            if prompt == "WAIT_THEN_COMPLETE":
+                time.sleep(1.2)
             text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
             history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
             send_frame(connection, {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "text": text}}})
@@ -219,6 +221,21 @@ def main() -> None:
         assert interactive_result["harness"]["status"] == "completed", interactive_result
         run_server.join(timeout=2)
         assert not run_server.is_alive()
+        long_socket, long_ready = root / "long.sock", threading.Event()
+        long_server = threading.Thread(target=fake_app_server, args=(long_socket, long_ready), daemon=True)
+        long_server.start(); assert long_ready.wait(timeout=2)
+        long_env = {
+            **env, "DARKEXEC_APP_SERVER_SOCKET": str(long_socket),
+            "DARKEXEC_TURN_TIMEOUT": "0",
+        }
+        long_result = subprocess.run(
+            run_command, input="WAIT_THEN_COMPLETE", capture_output=True, text=True,
+            env=long_env, check=False, timeout=5,
+        )
+        assert long_result.returncode == 0, long_result.stderr or long_result.stdout
+        assert json.loads(long_result.stdout)["status"] == "completed", long_result.stdout
+        long_server.join(timeout=2)
+        assert not long_server.is_alive()
         signal_socket, signal_server_ready, stalled = root / "signal.sock", threading.Event(), threading.Event()
         signal_server = threading.Thread(
             target=fake_app_server,
@@ -357,11 +374,37 @@ def main() -> None:
             capture_output=True, text=True, env=timer_env, check=False,
         )
         assert cancelled.returncode == 0 and json.loads(cancelled.stdout)["status"] == "cancelled", cancelled.stdout
+        update_source = root / "update-source"
+        (update_source / "scripts").mkdir(parents=True)
+        fake_install = update_source / "scripts" / "install.sh"
+        fake_install.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' '{\"commit\":\"update-test\",\"workspace\":\"/srv/darkexec\","
+            "\"nextAction\":\"Open /srv/darkexec in Codex App.\"}'\n"
+        )
+        fake_install.chmod(0o755)
+        subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=update_source, check=True)
+        subprocess.run(["git", "add", "scripts/install.sh"], cwd=update_source, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=DarkExec Test", "-c", "user.email=test@darkexec.invalid",
+             "commit", "--quiet", "-m", "fixture"],
+            cwd=update_source, check=True,
+        )
+        updated = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "update", "--json"],
+            capture_output=True, text=True,
+            env={**env, "DARKEXEC_UPDATE_REPOSITORY": str(update_source), "DARKEXEC_UPDATE_REF": "main"},
+            check=False,
+        )
+        updated_result = json.loads(updated.stdout)
+        assert updated.returncode == 0 and updated_result["status"] == "updated", updated.stderr or updated.stdout
+        assert updated_result["commit"] == "update-test", updated_result
     print(json.dumps({"status": "passed", "contracts": [
         "saved-project-list", "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status", "debounce-cancel",
+        "unbounded-turn-wait", "self-update",
     ]}))
 
 

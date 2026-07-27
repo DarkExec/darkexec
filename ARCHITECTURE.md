@@ -32,10 +32,14 @@ without duplicate work. Dependent cross-task work and consequential phase change
 closeout first. If the timer cannot be scheduled, closeout runs immediately.
 
 `darkexec run` and `darkexec dispatch` remain one-shot/background paths and harness immediately.
+Their target and harness turns wait without a runtime deadline by default; explicit positive
+`DARKEXEC_TURN_TIMEOUT` values retain bounded-caller behavior, and signals still interrupt the
+active native turn.
 
 Each release contains `share/harness-ops.md` and `share/harness-ops.provenance.json`. The installed
 workspace exposes that exact doctrine. Runtime behavior never depends on a mutable Harness Ops
-checkout.
+checkout. The installer also binds `/srv/harness-ops.md` to that installed snapshot for target
+harnesses that use the conventional host path.
 
 ## Trust boundaries
 
