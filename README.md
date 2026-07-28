@@ -99,13 +99,14 @@ DarkExec owns the boundaries agents most often drop:
 ### Interactive: just ask
 
 Open `/srv/darkexec` as a saved Codex App project and send a natural request. The installed
-executive selects the native task controls already available. If the complete native control set is
-not exposed, it uses the synchronous `darkexec run` bridge without rediscovering private protocol.
+executive uses the synchronous `darkexec run` lifecycle so target and active-turn identity are
+durable and stoppable from the executive conversation.
 When a request does not name one exact saved project, `darkexec projects --json` provides the
 read-only project list used to resolve the target once or fail closed.
 
 The first interactive result receives an immediate same-task harness pass. Clearly dependent
-follow-ups in the same DarkExec conversation and saved project continue that target. Each completed
+follow-ups in the same DarkExec conversation and saved project use `darkexec continue` on that
+target. Each completed
 follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
 `darkexec debounce`; after the conversation becomes idle, it rereads the target and sends one
 trailing harness unless a manual or automatic harness already closed the latest product turn.
@@ -138,6 +139,17 @@ Target and harness turns have no runtime deadline by default, so regression watc
 experiments can remain active for hours. `DARKEXEC_TURN_TIMEOUT` may set an explicit positive limit
 for bounded callers. A caller timeout or signal is an interrupted run, not a polling strategy or
 permission to issue duplicate work.
+
+Inside the installed executive conversation, exact standalone `STOP` requests an urgent clean stop.
+Exact `STOP HARD` sends the native target interruption immediately and escalates only against the
+verified owned runner after a short grace period. Both commands cancel pending closeout, are
+idempotent, never resume or replace the target, and leave the executive alive long enough to report
+the stop receipt. Active identity is stored privately under `/var/lib/darkexec/executives`.
+
+```bash
+darkexec stop --executive-thread "$CODEX_THREAD_ID" --json
+darkexec stop --executive-thread "$CODEX_THREAD_ID" --hard --json
+```
 
 ### Background: durable dispatch
 
@@ -228,7 +240,7 @@ only the documented DarkExec-managed symlinks and release paths.
 
 | Path | Owns |
 | --- | --- |
-| `bin/darkexec` | Dispatch, interactive run, debounce, and status CLI |
+| `bin/darkexec` | Dispatch, interactive run/continue/stop, debounce, and status CLI |
 | `share/workspace/` | Installed Codex App executive project |
 | `share/harness-ops.md` | Pinned operating doctrine |
 | `scripts/install.sh` | Commit-addressed installation with effective-default verification |

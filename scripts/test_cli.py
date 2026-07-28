@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Offline contract test for dispatch, status, idempotency, and same-task harness."""
 
-import base64, hashlib, json, os, signal, socket, struct, subprocess, tempfile, threading, time
+import base64, hashlib, json, os, signal, socket, struct, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def process_start_ticks(pid: int) -> int:
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    return int(raw[raw.rfind(")") + 2:].split()[19])
 
 def send_frame(connection, payload: dict) -> None:
     body = json.dumps(payload).encode()
@@ -119,6 +123,11 @@ def fake_app_server(
             send_frame(connection, {"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": turn, "status": "completed", "error": None}}})
             history["status"] = "completed"
         elif method == "turn/interrupt":
+            thread = message["params"]["threadId"]
+            turn = message["params"]["turnId"]
+            for history in histories.get(thread, []):
+                if history.get("id") == turn:
+                    history["status"] = "interrupted"
             send_frame(connection, {"id": message["id"], "result": {}})
     connection.close()
     server.close()
@@ -132,7 +141,10 @@ def main() -> None:
             capture_output=True, text=True, check=False,
         )
         assert install_contract.returncode == 0, install_contract.stderr
-        assert json.loads(install_contract.stdout)["turnTimeoutDefault"] == 0
+        install_result = json.loads(install_contract.stdout)
+        assert install_result["turnTimeoutDefault"] == 0
+        assert install_result["stopControl"] is True
+        assert install_result["executionRootDefault"] == "/var/lib/darkexec/executives"
         bounded_runtime = root / "bounded-darkexec"
         bounded_runtime.write_text(
             (ROOT / "bin/darkexec").read_text().replace(
@@ -159,6 +171,8 @@ def main() -> None:
         assert ready.wait(timeout=2)
         env = {
             **os.environ, "DARKEXEC_STATE_ROOT": str(root / "state"),
+            "DARKEXEC_EXECUTION_ROOT": str(root / "executions"),
+            "DARKEXEC_SESSION_ROOT": str(root / "sessions"),
             "DARKEXEC_WORKSPACE": str(workspace), "DARKEXEC_CONFIG": str(config),
             "DARKEXEC_APP_SERVER_SOCKET": str(socket_path),
         }
@@ -225,7 +239,11 @@ def main() -> None:
         run_socket, run_ready = root / "run.sock", threading.Event()
         run_server = threading.Thread(target=fake_app_server, args=(run_socket, run_ready), daemon=True)
         run_server.start(); assert run_ready.wait(timeout=2)
-        run_env = {**env, "DARKEXEC_APP_SERVER_SOCKET": str(run_socket)}
+        interactive_executive = "10000000-0000-4000-8000-000000000001"
+        run_env = {
+            **env, "DARKEXEC_APP_SERVER_SOCKET": str(run_socket),
+            "CODEX_THREAD_ID": interactive_executive,
+        }
         run_command = [
             str(ROOT / "bin/darkexec"), "run", "--target", str(target),
             "--prompt-stdin", "--read-only-harness", "--json",
@@ -239,8 +257,45 @@ def main() -> None:
         assert interactive_result["target"]["resultText"] == "TARGET_OK:Exact response request.", interactive_result
         assert interactive_result["target"]["appVisible"] is True, interactive_result
         assert interactive_result["harness"]["status"] == "completed", interactive_result
+        interactive_state = json.loads(
+            (root / "executions" / f"{hashlib.sha256(interactive_executive.encode()).hexdigest()}.json").read_text()
+        )
+        assert interactive_state["status"] == "completed", interactive_state
+        assert interactive_state["target"]["threadId"].endswith("2"), interactive_state
+        interactive_path = root / "executions" / f"{hashlib.sha256(interactive_executive.encode()).hexdigest()}.json"
+        assert interactive_path.stat().st_mode & 0o777 == 0o600
+        assert interactive_path.with_suffix(".lock").stat().st_mode & 0o777 == 0o600
+        assert (root / "executions").stat().st_mode & 0o777 == 0o700
         run_server.join(timeout=2)
         assert not run_server.is_alive()
+        continue_socket, continue_ready = root / "continue.sock", threading.Event()
+        continue_server = threading.Thread(
+            target=fake_app_server,
+            args=(continue_socket, continue_ready, True, None, {
+                interactive_state["target"]["threadId"]: {"cwd": str(target), "turns": []},
+            }),
+            daemon=True,
+        )
+        continue_server.start(); assert continue_ready.wait(timeout=2)
+        continued = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
+                "--thread", interactive_state["target"]["threadId"], "--prompt-stdin", "--json",
+            ],
+            input="Dependent follow-up.", capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(continue_socket)}, check=False,
+        )
+        continued_result = json.loads(continued.stdout)
+        assert continued.returncode == 0 and continued_result["status"] == "completed", continued_result
+        assert continued_result["target"]["resultText"] == "TARGET_OK:Dependent follow-up.", continued_result
+        continue_server.join(timeout=2)
+        assert not continue_server.is_alive()
+        replacement = subprocess.run(
+            run_command, input="Must not replace the bound target.",
+            capture_output=True, text=True, env=run_env, check=False,
+        )
+        assert replacement.returncode != 0
+        assert "is already bound to target" in replacement.stderr, replacement.stderr
         long_socket, long_ready = root / "long.sock", threading.Event()
         long_server = threading.Thread(target=fake_app_server, args=(long_socket, long_ready), daemon=True)
         long_server.start(); assert long_ready.wait(timeout=2)
@@ -264,11 +319,13 @@ def main() -> None:
         )
         signal_server.start()
         assert signal_server_ready.wait(timeout=2)
-        signal_env = {**env, "DARKEXEC_APP_SERVER_SOCKET": str(signal_socket)}
-        signal_command = [*command]
-        signal_command[5] = "incident-signal"
+        stop_executive = "10000000-0000-4000-8000-000000000002"
+        signal_env = {
+            **env, "DARKEXEC_APP_SERVER_SOCKET": str(signal_socket),
+            "CODEX_THREAD_ID": stop_executive,
+        }
         process = subprocess.Popen(
-            signal_command,
+            run_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -279,14 +336,140 @@ def main() -> None:
         process.stdin.write("WAIT_FOR_SIGNAL")
         process.stdin.close()
         assert stalled.wait(timeout=3)
-        process.send_signal(signal.SIGTERM)
+        stop_target = "00000000-0000-4000-8000-000000000002"
+        stop_session = root / "sessions" / f"{hashlib.sha256(stop_target.encode()).hexdigest()}.json"
+        stop_session.parent.mkdir(parents=True, exist_ok=True)
+        stop_session.write_text(json.dumps({
+            "schemaVersion": 1, "threadId": stop_target, "status": "pending",
+            "timerUnit": None, "generation": 1,
+        }))
+        stopped = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "stop",
+                "--executive-thread", stop_executive, "--json",
+            ],
+            capture_output=True, text=True, env=signal_env, check=False,
+        )
+        stopped_result = json.loads(stopped.stdout)
+        assert stopped.returncode == 0 and stopped_result["status"] == "stopped", stopped_result
+        assert stopped_result["targetState"] == "interrupt_acknowledged", stopped_result
+        assert stopped_result["termSent"] is True and stopped_result["killSent"] is False, stopped_result
+        assert stopped_result["closeout"]["status"] == "cancelled", stopped_result
+        stop_session.unlink()
         process.wait(timeout=5)
         assert process.returncode == 128 + signal.SIGTERM, process.returncode
-        interrupted = json.loads((root / "state" / f"{hashlib.sha256(b'incident-signal').hexdigest()}.json").read_text())
+        interrupted = json.loads(
+            (root / "executions" / f"{hashlib.sha256(stop_executive.encode()).hexdigest()}.json").read_text()
+        )
         assert interrupted["status"] == "interrupted", interrupted
         assert interrupted["error"] == f"interrupted by signal {signal.SIGTERM}", interrupted
+        repeated = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "stop",
+                "--executive-thread", stop_executive, "--json",
+            ],
+            capture_output=True, text=True, env=signal_env, check=False,
+        )
+        assert repeated.returncode == 0
+        assert json.loads(repeated.stdout)["status"] == "already_stopped", repeated.stdout
+        interrupted_continue = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
+                "--thread", stopped_result["targetThreadId"], "--prompt-stdin", "--json",
+            ],
+            input="Must not resume.", capture_output=True, text=True,
+            env=signal_env, check=False,
+        )
+        assert interrupted_continue.returncode != 0
+        assert "interrupted target lineage" in interrupted_continue.stderr, interrupted_continue.stderr
         signal_server.join(timeout=2)
         assert not signal_server.is_alive()
+        hard_executive = "10000000-0000-4000-8000-000000000003"
+        stubborn = subprocess.Popen([
+            sys.executable, "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, lambda *_: None); time.sleep(30)",
+        ])
+        time.sleep(0.1)
+        hard_path = root / "executions" / f"{hashlib.sha256(hard_executive.encode()).hexdigest()}.json"
+        hard_path.write_text(json.dumps({
+            "schemaVersion": 1, "executiveThreadId": hard_executive,
+            "targetPath": str(target), "mode": "initial", "status": "active",
+            "phase": "starting", "runner": {
+                "pid": stubborn.pid, "startTicks": process_start_ticks(stubborn.pid),
+            },
+            "target": {},
+        }))
+        hard = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "stop",
+                "--executive-thread", hard_executive, "--hard", "--json",
+            ],
+            capture_output=True, text=True, env=signal_env, check=False, timeout=8,
+        )
+        hard_result = json.loads(hard.stdout)
+        assert hard.returncode == 0 and hard_result["status"] == "stopped", hard_result
+        assert hard_result["killSent"] is True and hard_result["targetState"] == "not_created", hard_result
+        stubborn.wait(timeout=3)
+        assert stubborn.returncode == -signal.SIGKILL, stubborn.returncode
+        detached_executive = "10000000-0000-4000-8000-000000000004"
+        detached_thread = "20000000-0000-4000-8000-000000000001"
+        detached_path = root / "executions" / f"{hashlib.sha256(detached_executive.encode()).hexdigest()}.json"
+        detached_path.write_text(json.dumps({
+            "schemaVersion": 1, "executiveThreadId": detached_executive,
+            "targetPath": "/not/currently/saved", "mode": "continue", "status": "active",
+            "phase": "target_running", "runner": {"pid": None, "startTicks": None},
+            "target": {"threadId": detached_thread, "turnId": "detached-turn"},
+        }))
+        detached_socket, detached_ready = root / "detached.sock", threading.Event()
+        detached_server = threading.Thread(
+            target=fake_app_server,
+            args=(detached_socket, detached_ready, False, None, {
+                detached_thread: {"cwd": "/not/currently/saved", "turns": [{
+                    "id": "detached-turn", "status": "inProgress", "items": [],
+                }]},
+            }),
+            daemon=True,
+        )
+        detached_server.start(); assert detached_ready.wait(timeout=2)
+        detached = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "stop", "--executive-thread",
+                detached_executive, "--hard", "--json",
+            ],
+            capture_output=True, text=True,
+            env={**signal_env, "DARKEXEC_APP_SERVER_SOCKET": str(detached_socket)},
+            check=False, timeout=8,
+        )
+        detached_result = json.loads(detached.stdout)
+        assert detached.returncode == 0 and detached_result["status"] == "stopped", detached_result
+        assert detached_result["targetState"] == "interrupt_sent", detached_result
+        assert detached_result["targetThreadId"] == detached_thread, detached_result
+        detached_server.join(timeout=2)
+        assert not detached_server.is_alive()
+        stale_executive = "10000000-0000-4000-8000-000000000005"
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        stale_path = root / "executions" / f"{hashlib.sha256(stale_executive.encode()).hexdigest()}.json"
+        stale_path.write_text(json.dumps({
+            "schemaVersion": 1, "executiveThreadId": stale_executive,
+            "targetPath": str(target), "mode": "initial", "status": "active",
+            "phase": "starting", "runner": {
+                "pid": unrelated.pid, "startTicks": process_start_ticks(unrelated.pid) + 1,
+            },
+            "target": {},
+        }))
+        stale_stop = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "stop",
+                "--executive-thread", stale_executive, "--hard", "--json",
+            ],
+            capture_output=True, text=True, env=signal_env, check=False,
+        )
+        stale_result = json.loads(stale_stop.stdout)
+        assert stale_stop.returncode == 0 and stale_result["status"] == "stopped", stale_result
+        assert stale_result["termSent"] is False and stale_result["killSent"] is False, stale_result
+        assert unrelated.poll() is None
+        unrelated.terminate()
+        unrelated.wait(timeout=3)
         timer_thread = "00000000-0000-4000-8000-000000000002"
         scheduler_log = root / "scheduler.log"
         fake_systemd_run = root / "systemd-run"
@@ -421,7 +604,12 @@ def main() -> None:
         assert updated_result["commit"] == "update-test", updated_result
     print(json.dumps({"status": "passed", "contracts": [
         "saved-project-list", "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
-        "interactive-harness-mode-required", "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
+        "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
+        "runtime-owned-follow-up",
+        "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
+        "stop-cancels-closeout", "no-interrupted-resume",
+        "verified-hard-stop", "recorded-unsaved-target-stop", "stale-pid-safe",
+        "separate-usage", "idempotent-job", "thread-status",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status", "debounce-cancel",
         "unbounded-turn-wait", "install-default-verification", "self-update",
