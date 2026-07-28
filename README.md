@@ -86,7 +86,8 @@ flowchart LR
 DarkExec owns the boundaries agents most often drop:
 
 - **Right owner** — one exact saved Codex App project, or a fail-closed error.
-- **Prompt fidelity** — the target receives your request byte-for-byte as its first real turn.
+- **Input fidelity** — the target receives the complete user turn, including text, images, and
+  local-image references, as its first real turn.
 - **Native visibility** — work stays visible in Codex App under the project that owns it.
 - **Whole-job accountability** — a completed implementation turn is not the end of the lifecycle.
 - **Same-task learning** — Harness Ops reviews the trajectory without losing the task's context.
@@ -105,8 +106,10 @@ When a request does not name one exact saved project, `darkexec projects --json`
 read-only project list used to resolve the target once or fail closed.
 
 The first interactive result receives an immediate same-task harness pass. Clearly dependent
-follow-ups in the same DarkExec conversation and saved project use `darkexec continue` on that
-target. Each completed
+follow-ups can be queued in the same DarkExec conversation while it runs; they wait for that
+immediate harness, then use `darkexec continue` on the established target. DarkExec rereads each
+active executive turn so attachments are copied with its text instead of relying on the executive
+to reconstruct them. Each completed
 follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
 `darkexec debounce`; after the conversation becomes idle, it rereads the target and sends one
 trailing harness unless a manual or automatic harness already closed the latest product turn.
