@@ -537,10 +537,9 @@ def dispatch(args) -> int:
                 return 1
 
             target_thread = app.start_thread(target)
-            target_thread = app.require_listed_thread(target_thread["id"], target)
             receipt["target"] = {
                 "threadId": target_thread["id"], "source": target_thread.get("source"),
-                "appVisible": True, "listedCwd": target_thread.get("cwd"),
+                "appVisible": False, "listedCwd": None,
                 "harness": {"status": "not_started"},
             }
             save(path, receipt, "target_running")
@@ -548,7 +547,10 @@ def dispatch(args) -> int:
                 receipt["target"]["turnId"] = turn_id
                 save(path, receipt, "target_running")
             target_result = app.run_turn(target_thread["id"], prompt, on_started=target_started)
+            listed_target = app.require_listed_thread(target_thread["id"], target)
             receipt["target"].update({
+                "source": listed_target.get("source"), "appVisible": True,
+                "listedCwd": listed_target.get("cwd"),
                 "initialUsage": target_result.get("usage"),
                 "modelCallCount": target_result.get("modelCallCount"),
                 "resultText": target_result.get("resultText"),
@@ -615,17 +617,16 @@ def run_target(args) -> int:
     try:
         with AppServer() as app:
             thread = app.start_thread(target)
-            thread = app.require_listed_thread(thread["id"], target)
             result["target"] = {
                 "threadId": thread["id"], "source": thread.get("source"),
-                "appVisible": True, "listedCwd": thread.get("cwd"),
+                "appVisible": False, "listedCwd": None,
             }
             if executive_thread_id:
                 update_execution(executive_thread_id, {
                     "phase": "target_starting",
                     "target": {
                         "threadId": thread["id"], "source": thread.get("source"),
-                        "listedCwd": thread.get("cwd"),
+                        "listedCwd": None,
                     },
                 })
             def target_started(_thread_id: str, turn_id: str) -> None:
@@ -636,7 +637,10 @@ def run_target(args) -> int:
                         "target": {"threadId": thread["id"], "turnId": turn_id},
                     })
             target_result = app.run_turn(thread["id"], prompt, on_started=target_started)
+            listed_thread = app.require_listed_thread(thread["id"], target)
             result["target"].update({
+                "source": listed_thread.get("source"), "appVisible": True,
+                "listedCwd": listed_thread.get("cwd"),
                 "resultText": target_result.get("resultText"),
                 "usage": target_result.get("usage"),
                 "modelCallCount": target_result.get("modelCallCount"),

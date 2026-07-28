@@ -62,11 +62,12 @@ def fake_app_server(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
     ).encode())
-    threads, listed, histories, turns = {}, {}, {}, 0
+    threads, listed, histories, materialized, turns = {}, {}, {}, set(), 0
     for thread_id, seed in (seeded_threads or {}).items():
         threads[thread_id] = 0
         listed[thread_id] = {"id": thread_id, "source": "vscode", "cwd": seed["cwd"]}
         histories[thread_id] = list(seed.get("turns") or [])
+        materialized.add(thread_id)
     while True:
         message = receive_frame(connection)
         if message is None:
@@ -83,7 +84,10 @@ def fake_app_server(
             send_frame(connection, {"id": message["id"], "result": {"thread": {"id": thread, "source": "vscode", "cwd": cwd}}})
         elif method == "thread/list":
             cwd = message["params"]["cwd"]
-            data = [thread for thread in listed.values() if visible and thread["cwd"] == cwd]
+            data = [
+                thread for thread in listed.values()
+                if visible and thread["cwd"] == cwd and thread["id"] in materialized
+            ]
             send_frame(connection, {"id": message["id"], "result": {"data": data, "nextCursor": None}})
         elif method == "thread/read":
             thread = message["params"]["threadId"]
@@ -102,6 +106,7 @@ def fake_app_server(
                 "items": [{"id": f"user-{turn}", "type": "userMessage", "content": [{"type": "text", "text": prompt}]}],
             }
             histories[thread].append(history)
+            materialized.add(thread)
             if prompt == "WAIT_FOR_SIGNAL":
                 if stall_ready:
                     stall_ready.set()
@@ -603,7 +608,8 @@ def main() -> None:
         assert updated.returncode == 0 and updated_result["status"] == "updated", updated.stderr or updated.stdout
         assert updated_result["commit"] == "update-test", updated_result
     print(json.dumps({"status": "passed", "contracts": [
-        "saved-project-list", "saved-target", "running-app-list-proof", "one-executive", "one-target", "same-task-harness",
+        "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
+        "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
         "runtime-owned-follow-up",
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
