@@ -294,6 +294,30 @@ def main() -> None:
         assert interactive_path.stat().st_mode & 0o777 == 0o600
         assert interactive_path.with_suffix(".lock").stat().st_mode & 0o777 == 0o600
         assert (root / "executions").stat().st_mode & 0o777 == 0o700
+        completed_status = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "execution-status",
+                "--executive-thread", interactive_executive, "--json",
+            ],
+            capture_output=True, text=True, env=run_env, check=False,
+        )
+        completed_status_result = json.loads(completed_status.stdout)
+        assert completed_status.returncode == 0, completed_status.stderr
+        assert completed_status_result["status"] == "completed", completed_status_result
+        assert completed_status_result["phase"] == "idle", completed_status_result
+        assert completed_status_result["runnerActive"] is False, completed_status_result
+        assert completed_status_result["target"]["threadId"].endswith("2"), completed_status_result
+        unknown_status = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "execution-status",
+                "--executive-thread", "10000000-0000-4000-8000-000000000099", "--json",
+            ],
+            capture_output=True, text=True, env=run_env, check=False,
+        )
+        unknown_status_result = json.loads(unknown_status.stdout)
+        assert unknown_status.returncode == 1, unknown_status
+        assert unknown_status_result["status"] == "not_found", unknown_status_result
+        assert unknown_status_result["runnerActive"] is False, unknown_status_result
         run_server.join(timeout=2)
         assert not run_server.is_alive()
         continue_socket, continue_ready = root / "continue.sock", threading.Event()
@@ -378,6 +402,19 @@ def main() -> None:
         process.stdin.write("WAIT_FOR_SIGNAL")
         process.stdin.close()
         assert stalled.wait(timeout=3)
+        active_status = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "execution-status",
+                "--executive-thread", stop_executive, "--json",
+            ],
+            capture_output=True, text=True, env=signal_env, check=False,
+        )
+        active_status_result = json.loads(active_status.stdout)
+        assert active_status.returncode == 0, active_status.stderr
+        assert active_status_result["status"] == "active", active_status_result
+        assert active_status_result["phase"] == "target_running", active_status_result
+        assert active_status_result["runnerActive"] is True, active_status_result
+        assert active_status_result["target"]["turnId"], active_status_result
         stop_target = "00000000-0000-4000-8000-000000000002"
         stop_session = root / "sessions" / f"{hashlib.sha256(stop_target.encode()).hexdigest()}.json"
         stop_session.parent.mkdir(parents=True, exist_ok=True)
@@ -405,6 +442,18 @@ def main() -> None:
         )
         assert interrupted["status"] == "interrupted", interrupted
         assert interrupted["error"] == f"interrupted by signal {signal.SIGTERM}", interrupted
+        interrupted_status = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "execution-status",
+                "--executive-thread", stop_executive, "--json",
+            ],
+            capture_output=True, text=True, env=signal_env, check=False,
+        )
+        interrupted_status_result = json.loads(interrupted_status.stdout)
+        assert interrupted_status.returncode == 0, interrupted_status.stderr
+        assert interrupted_status_result["status"] == "interrupted", interrupted_status_result
+        assert interrupted_status_result["phase"] == "idle", interrupted_status_result
+        assert interrupted_status_result["runnerActive"] is False, interrupted_status_result
         repeated = subprocess.run(
             [
                 str(ROOT / "bin/darkexec"), "stop",
@@ -648,6 +697,7 @@ def main() -> None:
         "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
         "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
+        "interactive-execution-status",
         "runtime-owned-follow-up",
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
         "stop-cancels-closeout", "no-interrupted-resume",

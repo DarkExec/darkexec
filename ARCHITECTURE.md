@@ -35,6 +35,12 @@ manual harness, newer activity, an active turn, or an interrupted lineage makes 
 without duplicate work. Dependent cross-task work and consequential phase changes flush pending
 closeout first. If the timer cannot be scheduled, closeout runs immediately.
 
+The outer Codex caller keeps one orchestration tool call attached to the synchronous process.
+Deterministic progress reads use `darkexec execution-status` against the exact executive thread and
+may be projected through non-model UI notifications without settling that call. Ordinary waiting
+does not re-enter the executive model. This preserves the active executive turn and queued
+follow-ups while avoiding repeated full-context polling turns.
+
 `darkexec run` and `darkexec dispatch` remain one-shot/background paths and harness immediately.
 Their target and harness turns wait without a runtime deadline by default; explicit positive
 `DARKEXEC_TURN_TIMEOUT` values retain bounded-caller behavior, and signals still interrupt the

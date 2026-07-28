@@ -143,6 +143,17 @@ experiments can remain active for hours. `DARKEXEC_TURN_TIMEOUT` may set an expl
 for bounded callers. A caller timeout or signal is an interrupted run, not a polling strategy or
 permission to issue duplicate work.
 
+The installed Codex executive holds that process inside one long-lived orchestration call. Compact
+progress can be read without model re-entry:
+
+```bash
+darkexec execution-status --executive-thread "$CODEX_THREAD_ID" --json
+```
+
+Progress is a read-only projection of the exact active execution identity. It does not detach,
+resume, retry, or replace work. The full attached-call pattern is installed in
+`/srv/darkexec/README.md`.
+
 Inside the installed executive conversation, exact standalone `STOP` requests an urgent clean stop.
 Exact `STOP HARD` sends the native target interruption immediately and escalates only against the
 verified owned runner after a short grace period. Both commands cancel pending closeout, are

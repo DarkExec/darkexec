@@ -101,6 +101,45 @@ def update_execution(thread_id: str, changes: dict, create: bool = False) -> dic
     finally:
         lock.close()
 
+def read_execution(thread_id: str) -> dict:
+    path = execution_path(thread_id)
+    if not path.exists():
+        return {
+            "schemaVersion": 1,
+            "executiveThreadId": thread_id,
+            "status": "not_found",
+            "phase": "idle",
+            "runnerActive": False,
+            "target": {},
+        }
+    lock_path = path.with_suffix(".lock")
+    lock = lock_path.open("a+")
+    os.chmod(lock_path, 0o600)
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        state = load_receipt(path)
+    finally:
+        lock.close()
+    runner = state.get("runner") if isinstance(state.get("runner"), dict) else {}
+    pid = int(runner.get("pid") or 0)
+    return {
+        "schemaVersion": 1,
+        "executiveThreadId": thread_id,
+        "status": state.get("status") or "unknown",
+        "phase": state.get("phase") or "unknown",
+        "mode": state.get("mode"),
+        "targetPath": state.get("targetPath"),
+        "runnerActive": bool(pid and process_start_ticks(pid) == runner.get("startTicks")),
+        "target": {
+            key: value
+            for key, value in (state.get("target") or {}).items()
+            if key in {"threadId", "turnId"} and value
+        },
+        "error": state.get("error"),
+        "createdAt": state.get("createdAt"),
+        "updatedAt": state.get("updatedAt"),
+    }
+
 def begin_execution(
     thread_id: str | None,
     target: Path,
@@ -1201,6 +1240,22 @@ def stop_execution(args) -> int:
     return 0 if stopped else 1
 
 
+def execution_status(args) -> int:
+    executive_thread_id = requested_executive_thread(args)
+    if not executive_thread_id:
+        raise SystemExit("execution-status requires --executive-thread or CODEX_THREAD_ID")
+    result = read_execution(executive_thread_id)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(
+            f"{executive_thread_id}: {result['status']} phase={result['phase']} "
+            f"target={(result.get('target') or {}).get('threadId') or '-'} "
+            f"runner_active={str(result['runnerActive']).lower()}"
+        )
+    return 1 if result["status"] == "not_found" else 0
+
+
 def update_install(args) -> int:
     with tempfile.TemporaryDirectory(prefix="darkexec-update-") as temporary:
         checkout = Path(temporary) / "darkexec"
@@ -1285,6 +1340,9 @@ def main() -> int:
     stop.add_argument("--executive-thread")
     stop.add_argument("--hard", action="store_true")
     stop.add_argument("--json", action="store_true")
+    execution_read = sub.add_parser("execution-status")
+    execution_read.add_argument("--executive-thread")
+    execution_read.add_argument("--json", action="store_true")
     debounce = sub.add_parser("debounce")
     debounce.add_argument("--target", required=True)
     debounce.add_argument("--thread", required=True)
@@ -1319,6 +1377,8 @@ def main() -> int:
         return continue_target(args)
     if args.command == "stop":
         return stop_execution(args)
+    if args.command == "execution-status":
+        return execution_status(args)
     if args.command == "debounce":
         if args.seconds < 1:
             raise SystemExit("debounce seconds must be positive")
