@@ -348,12 +348,19 @@ class AppServer:
             raise RuntimeError(f"App Server did not return target task {thread_id}")
         return thread
 
-    def run_turn(self, thread_id: str, prompt: str, on_started=None) -> dict:
+    def run_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        on_started=None,
+        input_items: list[dict] | None = None,
+    ) -> dict:
+        turn_input = input_items if input_items is not None else [{"type": "text", "text": prompt}]
         self.request_id += 1
         request_id = self.request_id
         self._send({
             "jsonrpc": "2.0", "id": request_id, "method": "turn/start",
-            "params": {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},
+            "params": {"threadId": thread_id, "input": turn_input},
         })
         deadline = time.monotonic() + TURN_TIMEOUT if TURN_TIMEOUT > 0 else None
         turn_id = None
@@ -597,6 +604,45 @@ def dispatch(args) -> int:
 def requested_executive_thread(args) -> str | None:
     return getattr(args, "executive_thread", None) or os.environ.get("CODEX_THREAD_ID")
 
+def executive_turn_input(app: AppServer, thread_id: str, prompt: str) -> list[dict]:
+    thread = app.read_thread(thread_id)
+    active_turns = [turn for turn in thread.get("turns", []) if turn.get("status") == "inProgress"]
+    if len(active_turns) != 1:
+        raise RuntimeError(
+            f"Executive task {thread_id} must have exactly one active turn; found {len(active_turns)}."
+        )
+    content = [
+        entry
+        for item in active_turns[0].get("items", [])
+        if item.get("type") == "userMessage"
+        for entry in item.get("content", [])
+    ]
+    supported = {"text", "image", "localImage"}
+    unsupported = sorted({str(entry.get("type")) for entry in content if entry.get("type") not in supported})
+    if unsupported:
+        raise RuntimeError(
+            f"Executive turn contains unsupported input content: {', '.join(unsupported)}"
+        )
+    text = "\n".join(
+        str(entry.get("text") or "") for entry in content if entry.get("type") == "text"
+    )
+    if not content or prompt not in text:
+        raise RuntimeError("stdin prompt does not match the active executive user turn")
+    normalized = []
+    for entry in content:
+        if entry.get("type") == "text":
+            normalized.append({"type": "text", "text": str(entry.get("text") or "")})
+        elif entry.get("type") == "image" and entry.get("url"):
+            image = {"type": "image", "url": entry["url"]}
+            if entry.get("detail"):
+                image["detail"] = entry["detail"]
+            normalized.append(image)
+        elif entry.get("type") == "localImage" and entry.get("path"):
+            normalized.append({"type": "localImage", "path": entry["path"]})
+        else:
+            raise RuntimeError(f"Executive turn has an incomplete {entry.get('type')} input item")
+    return normalized
+
 def run_target(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir():
@@ -607,6 +653,8 @@ def run_target(args) -> int:
     if not prompt.strip():
         raise SystemExit("run requires a non-empty prompt on stdin")
     executive_thread_id = requested_executive_thread(args)
+    if args.source_executive_turn and not executive_thread_id:
+        raise SystemExit("--source-executive-turn requires --executive-thread or CODEX_THREAD_ID")
     begin_execution(executive_thread_id, target, "initial")
     result = {
         "schemaVersion": 1, "targetPath": str(target),
@@ -616,6 +664,11 @@ def run_target(args) -> int:
     interrupted_exit = None
     try:
         with AppServer() as app:
+            source_input = (
+                executive_turn_input(app, executive_thread_id, prompt)
+                if args.source_executive_turn and executive_thread_id
+                else None
+            )
             thread = app.start_thread(target)
             result["target"] = {
                 "threadId": thread["id"], "source": thread.get("source"),
@@ -636,7 +689,9 @@ def run_target(args) -> int:
                         "phase": "target_running",
                         "target": {"threadId": thread["id"], "turnId": turn_id},
                     })
-            target_result = app.run_turn(thread["id"], prompt, on_started=target_started)
+            target_result = app.run_turn(
+                thread["id"], prompt, on_started=target_started, input_items=source_input
+            )
             listed_thread = app.require_listed_thread(thread["id"], target)
             result["target"].update({
                 "source": listed_thread.get("source"), "appVisible": True,
@@ -724,6 +779,11 @@ def continue_target(args) -> int:
     interrupted_exit = None
     try:
         with AppServer() as app:
+            source_input = (
+                executive_turn_input(app, executive_thread_id, prompt)
+                if args.source_executive_turn
+                else None
+            )
             thread = app.require_listed_thread(args.thread, target)
             update_execution(executive_thread_id, {
                 "phase": "target_starting",
@@ -738,7 +798,9 @@ def continue_target(args) -> int:
                     "phase": "target_running",
                     "target": {"threadId": args.thread, "turnId": turn_id},
                 })
-            turn = app.run_turn(args.thread, prompt, on_started=turn_started)
+            turn = app.run_turn(
+                args.thread, prompt, on_started=turn_started, input_items=source_input
+            )
             result["target"].update({
                 "source": thread.get("source"), "appVisible": True,
                 "listedCwd": thread.get("cwd"), "resultText": turn.get("resultText"),
@@ -1206,6 +1268,7 @@ def main() -> int:
     run = sub.add_parser("run")
     run.add_argument("--target", required=True)
     run.add_argument("--executive-thread")
+    run.add_argument("--source-executive-turn", action="store_true")
     run.add_argument("--prompt-stdin", action="store_true", required=True)
     harness = run.add_mutually_exclusive_group(required=True)
     harness.add_argument("--read-only-harness", action="store_true")
@@ -1215,6 +1278,7 @@ def main() -> int:
     continuation.add_argument("--target", required=True)
     continuation.add_argument("--thread", required=True)
     continuation.add_argument("--executive-thread")
+    continuation.add_argument("--source-executive-turn", action="store_true")
     continuation.add_argument("--prompt-stdin", action="store_true", required=True)
     continuation.add_argument("--json", action="store_true")
     stop = sub.add_parser("stop")

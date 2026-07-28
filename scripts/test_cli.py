@@ -46,6 +46,7 @@ def fake_app_server(
     visible: bool = True,
     stall_ready: threading.Event | None = None,
     seeded_threads: dict[str, dict] | None = None,
+    observed_inputs: list[list[dict]] | None = None,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -98,12 +99,18 @@ def fake_app_server(
         elif method == "turn/start":
             turns += 1
             thread = message["params"]["threadId"]
-            prompt = message["params"]["input"][0]["text"]
+            turn_input = message["params"]["input"]
+            if observed_inputs is not None:
+                observed_inputs.append(turn_input)
+            prompt = next(
+                item["text"] for item in turn_input
+                if item.get("type") == "text" and item.get("text")
+            )
             turn = f"turn-{turns}"
             send_frame(connection, {"id": message["id"], "result": {"turn": {"id": turn}}})
             history = {
                 "id": turn, "status": "inProgress",
-                "items": [{"id": f"user-{turn}", "type": "userMessage", "content": [{"type": "text", "text": prompt}]}],
+                "items": [{"id": f"user-{turn}", "type": "userMessage", "content": turn_input}],
             }
             histories[thread].append(history)
             materialized.add(thread)
@@ -241,10 +248,24 @@ def main() -> None:
         )
         assert missing_mode.returncode != 0, missing_mode
         assert "one of the arguments --read-only-harness --standard-harness is required" in missing_mode.stderr, missing_mode.stderr
-        run_socket, run_ready = root / "run.sock", threading.Event()
-        run_server = threading.Thread(target=fake_app_server, args=(run_socket, run_ready), daemon=True)
-        run_server.start(); assert run_ready.wait(timeout=2)
         interactive_executive = "10000000-0000-4000-8000-000000000001"
+        executive_input = [
+            {"type": "text", "text": "Exact response request."},
+            {"type": "image", "url": "data:image/png;base64,ZmFrZQ=="},
+        ]
+        executive_turn = {
+            "id": "executive-turn-1", "status": "inProgress",
+            "items": [{"id": "executive-user-1", "type": "userMessage", "content": executive_input}],
+        }
+        run_socket, run_ready, run_inputs = root / "run.sock", threading.Event(), []
+        run_server = threading.Thread(
+            target=fake_app_server,
+            args=(run_socket, run_ready, True, None, {
+                interactive_executive: {"cwd": str(workspace), "turns": [executive_turn]},
+            }, run_inputs),
+            daemon=True,
+        )
+        run_server.start(); assert run_ready.wait(timeout=2)
         run_env = {
             **env, "DARKEXEC_APP_SERVER_SOCKET": str(run_socket),
             "CODEX_THREAD_ID": interactive_executive,
@@ -253,8 +274,9 @@ def main() -> None:
             str(ROOT / "bin/darkexec"), "run", "--target", str(target),
             "--prompt-stdin", "--read-only-harness", "--json",
         ]
+        sourced_run_command = [*run_command[:5], "--source-executive-turn", *run_command[5:]]
         interactive = subprocess.run(
-            run_command, input="Exact response request.", capture_output=True, text=True,
+            sourced_run_command, input="Exact response request.", capture_output=True, text=True,
             env=run_env, check=False,
         )
         interactive_result = json.loads(interactive.stdout)
@@ -262,6 +284,7 @@ def main() -> None:
         assert interactive_result["target"]["resultText"] == "TARGET_OK:Exact response request.", interactive_result
         assert interactive_result["target"]["appVisible"] is True, interactive_result
         assert interactive_result["harness"]["status"] == "completed", interactive_result
+        assert run_inputs[0] == executive_input, run_inputs[0]
         interactive_state = json.loads(
             (root / "executions" / f"{hashlib.sha256(interactive_executive.encode()).hexdigest()}.json").read_text()
         )
@@ -274,18 +297,31 @@ def main() -> None:
         run_server.join(timeout=2)
         assert not run_server.is_alive()
         continue_socket, continue_ready = root / "continue.sock", threading.Event()
+        follow_up_input = [
+            {"type": "text", "text": "Dependent follow-up."},
+            {"type": "localImage", "path": "/tmp/follow-up.png"},
+        ]
+        continue_inputs = []
         continue_server = threading.Thread(
             target=fake_app_server,
             args=(continue_socket, continue_ready, True, None, {
+                interactive_executive: {"cwd": str(workspace), "turns": [{
+                    "id": "executive-turn-2", "status": "inProgress",
+                    "items": [{
+                        "id": "executive-user-2", "type": "userMessage",
+                        "content": follow_up_input,
+                    }],
+                }]},
                 interactive_state["target"]["threadId"]: {"cwd": str(target), "turns": []},
-            }),
+            }, continue_inputs),
             daemon=True,
         )
         continue_server.start(); assert continue_ready.wait(timeout=2)
         continued = subprocess.run(
             [
                 str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
-                "--thread", interactive_state["target"]["threadId"], "--prompt-stdin", "--json",
+                "--thread", interactive_state["target"]["threadId"], "--prompt-stdin",
+                "--source-executive-turn", "--json",
             ],
             input="Dependent follow-up.", capture_output=True, text=True,
             env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(continue_socket)}, check=False,
@@ -293,6 +329,7 @@ def main() -> None:
         continued_result = json.loads(continued.stdout)
         assert continued.returncode == 0 and continued_result["status"] == "completed", continued_result
         assert continued_result["target"]["resultText"] == "TARGET_OK:Dependent follow-up.", continued_result
+        assert continue_inputs[0] == follow_up_input, continue_inputs[0]
         continue_server.join(timeout=2)
         assert not continue_server.is_alive()
         replacement = subprocess.run(

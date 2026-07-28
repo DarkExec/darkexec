@@ -24,8 +24,11 @@ closeout, and receipt terminalization.
 
 Interactive routing uses runtime-owned `run` and `continue` commands so each executive, runner,
 target task, and active turn is durably bound before waiting. The first target result is harnessed
-immediately. A clearly dependent follow-up in the same executive conversation and saved project
-reuses that target and resets one 30-minute systemd timer through `darkexec debounce`.
+immediately. For delegated user turns, the runtime rereads the one active executive turn and clones
+its structured text, images, and local-image references into the target; stdin is only the routing
+assertion, so an executive cannot silently drop an attachment while reconstructing a prompt. A
+queued dependent message remains in the executive task until that immediate harness finishes, then
+reuses the established target and resets one 30-minute systemd timer through `darkexec debounce`.
 Generation-keyed state under `/var/lib/darkexec/sessions` makes stale timers harmless. At expiry the
 runtime rereads the target and sends at most one trailing harness after the latest product turn; a
 manual harness, newer activity, an active turn, or an interrupted lineage makes it stop or defer
