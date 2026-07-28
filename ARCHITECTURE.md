@@ -22,9 +22,10 @@ Codex App owns task history and interaction. Callers own detection, authorizatio
 scheduling, and external messaging. DarkExec owns execution identity, App visibility, same-task
 closeout, and receipt terminalization.
 
-Interactive native routing uses a leading-and-trailing closeout policy. The first target result is
-harnessed immediately. A clearly dependent follow-up in the same executive conversation and saved
-project reuses that target and resets one 30-minute systemd timer through `darkexec debounce`.
+Interactive routing uses runtime-owned `run` and `continue` commands so each executive, runner,
+target task, and active turn is durably bound before waiting. The first target result is harnessed
+immediately. A clearly dependent follow-up in the same executive conversation and saved project
+reuses that target and resets one 30-minute systemd timer through `darkexec debounce`.
 Generation-keyed state under `/var/lib/darkexec/sessions` makes stale timers harmless. At expiry the
 runtime rereads the target and sends at most one trailing harness after the latest product turn; a
 manual harness, newer activity, an active turn, or an interrupted lineage makes it stop or defer
@@ -38,6 +39,14 @@ active native turn. Installation verifies that effective unset default from the 
 before switching the current symlink, so a bounded-default regression cannot reach a fresh install
 or update.
 
+Executive lifecycle state is stored with private permissions under `DARKEXEC_EXECUTION_ROOT`, keyed
+by the exact Codex executive thread ID. `STOP` signals only the recorded runner and relies on its
+native `turn/interrupt` acknowledgement. `STOP HARD` first interrupts the recorded target turn
+through App Server, then may force-kill only a runner whose PID and Linux process-start identity
+still match. Stop-time control uses recorded task identity rather than saved-project or visibility
+rediscovery, so a previously accepted target remains stoppable when unloaded or inaccessible.
+Absent, terminal, stale, and partial states fail narrowly and never select another task.
+
 Each release contains `share/harness-ops.md` and `share/harness-ops.provenance.json`. The installed
 workspace exposes that exact doctrine. Runtime behavior never depends on a mutable Harness Ops
 checkout. The installer also binds `/srv/harness-ops.md` to that installed snapshot for target
@@ -49,6 +58,7 @@ and repairs a missing or broken binding.
 - the authenticated running Codex App and its control socket;
 - exact saved-project roots;
 - durable local receipt state;
+- executive-scoped active-run identity and verified process ownership;
 - signal and timeout terminalization;
 - release and doctrine identity; and
 - the caller's authority and prompt.
