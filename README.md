@@ -52,7 +52,8 @@ projects you already trust.
 git clone https://github.com/DarkExec/darkexec && sudo darkexec/scripts/install.sh
 ```
 
-The installer validates the checkout, creates a commit-addressed release, and prints the one next
+The installer validates the checkout, creates a commit-addressed release, rejects any release whose
+effective default turn timeout is not unbounded, and prints `turnTimeoutDefault: 0` with the one next
 action:
 
 > Open `/srv/darkexec` in Codex App and send the outcome you want.
@@ -230,7 +231,7 @@ only the documented DarkExec-managed symlinks and release paths.
 | `bin/darkexec` | Dispatch, interactive run, debounce, and status CLI |
 | `share/workspace/` | Installed Codex App executive project |
 | `share/harness-ops.md` | Pinned operating doctrine |
-| `scripts/install.sh` | Commit-addressed installation |
+| `scripts/install.sh` | Commit-addressed installation with effective-default verification |
 | `scripts/test_cli.py` | Deterministic fake-App lifecycle tests |
 | `scripts/validate.sh` | Release and doctrine validation |
 
