@@ -182,6 +182,12 @@ sudo darkexec status --job-id example-read-only-1 --json
 The job ID is idempotent only for the same target and exact request. Conflicting reuse fails closed.
 Receipts default to `/var/lib/darkexec/jobs` with private permissions.
 
+The visible Background control task remains idle while its target runs, so waiting consumes no
+executive model turns. If a dependent user follow-up is posted there, the installed executive
+resolves that control task's immutable receipt and attaches once with `darkexec status --wait`.
+Completion reuses only the receipt's exact target task; failed, interrupted, stale-abandoned, or
+mismatched receipts fail closed. Automatic control-task closeout yields to an active real user turn.
+
 Interactive trailing-closeout state defaults to `/var/lib/darkexec/sessions`. Inspect or cancel an
 armed closeout by exact target task ID:
 

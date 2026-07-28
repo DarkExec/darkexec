@@ -208,6 +208,37 @@ def begin_execution(
 def load_receipt(path: Path) -> dict:
     return json.loads(path.read_text())
 
+def receipt_runner_active(path: Path) -> bool:
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        lock.close()
+
+def wait_for_receipt(path: Path) -> dict:
+    terminal = {"completed", "failed", "interrupted"}
+    while True:
+        receipt = load_receipt(path)
+        if receipt.get("status") in terminal:
+            return receipt
+        if not receipt_runner_active(path):
+            receipt = load_receipt(path)
+            if receipt.get("status") in terminal:
+                return receipt
+            abandoned = dict(receipt)
+            abandoned["receiptStatus"] = receipt.get("status")
+            abandoned["status"] = "abandoned"
+            abandoned["error"] = "nonterminal receipt has no active dispatch owner"
+            return abandoned
+        time.sleep(0.25)
+
 def saved_project(path: Path) -> bool:
     try:
         config = tomllib.loads(CONFIG.read_text())
@@ -509,13 +540,33 @@ def closeout_executive(receipt: dict, path: Path, app: AppServer) -> None:
     thread_id = (receipt.get("executive") or {}).get("threadId")
     if not thread_id:
         return
+    thread = app.read_thread(thread_id)
+    existing_turn_ids = {
+        turn.get("id") for turn in thread.get("turns", []) if turn.get("id")
+    }
+    if active_turn_id(thread):
+        receipt["executive"]["closeoutStatus"] = "suppressed_active_user_turn"
+        save(path, receipt, receipt["status"])
+        return
     target_id = (receipt.get("target") or {}).get("threadId") or "unavailable"
     prompt = (
         f"DarkExec job {receipt['jobId']} reached {receipt['status']}. Target task: {target_id}. "
         f"Same-task harness: {((receipt.get('target') or {}).get('harness') or {}).get('status', 'not_started')}. "
         "Do not inspect or change anything. Reply with those identities and statuses only."
     )
-    result = app.run_turn(thread_id, prompt)
+    try:
+        result = app.run_turn(thread_id, prompt)
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError):
+        latest = app.read_thread(thread_id)
+        new_turns = [
+            turn for turn in latest.get("turns", [])
+            if turn.get("id") and turn.get("id") not in existing_turn_ids
+        ]
+        if new_turns:
+            receipt["executive"]["closeoutStatus"] = "suppressed_user_activity"
+            save(path, receipt, receipt["status"])
+            return
+        raise
     receipt["executive"]["closeoutUsage"] = result.get("usage")
     receipt["executive"]["closeoutModelCallCount"] = result.get("modelCallCount")
     receipt["executive"]["closeoutResult"] = result.get("resultText")
@@ -1144,12 +1195,62 @@ def interrupt_recorded_target(state: dict) -> dict:
             "threadId": thread_id, "turnId": turn_id, "error": str(exc),
         }
 
+def background_stop(executive_thread_id: str, path: Path, args) -> int:
+    receipt = load_receipt(path)
+    target_thread_id = (receipt.get("target") or {}).get("threadId")
+    closeout = cancel_debounce_thread(target_thread_id) if target_thread_id else {
+        "status": "absent", "threadId": None,
+    }
+    live = receipt_runner_active(path)
+    if receipt.get("status") in {"completed", "failed", "interrupted"} or not live:
+        result = {
+            "schemaVersion": 1, "source": "background_job",
+            "jobId": receipt.get("jobId"), "executiveThreadId": executive_thread_id,
+            "targetThreadId": target_thread_id, "status": "already_stopped",
+            "priorStatus": receipt.get("status") if not live else None,
+            "mode": "hard" if args.hard else "clean", "closeout": closeout,
+        }
+        print(json.dumps(result) if args.json else (
+            f"{executive_thread_id}: already stopped target={target_thread_id or '-'}"
+        ))
+        return 0
+    interrupt = interrupt_recorded_target(receipt)
+    deadline = time.monotonic() + (2 if args.hard else 10)
+    while receipt_runner_active(path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    latest = load_receipt(path)
+    live = receipt_runner_active(path)
+    terminal = latest.get("status") in {"completed", "failed", "interrupted"}
+    stopped = not live and terminal
+    result = {
+        "schemaVersion": 1, "source": "background_job",
+        "jobId": latest.get("jobId"), "executiveThreadId": executive_thread_id,
+        "targetThreadId": (latest.get("target") or {}).get("threadId") or target_thread_id,
+        "status": "stopped" if stopped else "partial",
+        "receiptStatus": latest.get("status"),
+        "mode": "hard" if args.hard else "clean",
+        "targetState": interrupt.get("status"),
+        "termSent": False, "killSent": False,
+        "interrupt": interrupt, "closeout": closeout,
+    }
+    print(json.dumps(result) if args.json else (
+        f"{executive_thread_id}: {result['status']} "
+        f"target={result['targetThreadId'] or '-'} target_state={result['targetState']}"
+    ))
+    return 0 if stopped else 1
+
 def stop_execution(args) -> int:
     executive_thread_id = requested_executive_thread(args)
     if not executive_thread_id:
         raise SystemExit("stop requires --executive-thread or CODEX_THREAD_ID")
     path = execution_path(executive_thread_id)
     if not path.exists():
+        try:
+            background_path = find_receipt_path(None, executive_thread_id)
+        except SystemExit:
+            background_path = None
+        if background_path:
+            return background_stop(executive_thread_id, background_path, args)
         result = {
             "schemaVersion": 1, "executiveThreadId": executive_thread_id,
             "status": "no_active_run", "mode": "hard" if args.hard else "clean",
@@ -1285,12 +1386,12 @@ def update_install(args) -> int:
     return 0
 
 
-def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
+def find_receipt_path(job_id: str | None, thread_id: str | None) -> Path:
     if job_id:
         path = receipt_path(job_id)
         if not path.exists():
             raise SystemExit(f"unknown DarkExec job: {job_id}")
-        return load_receipt(path)
+        return path
     for path in sorted(STATE_ROOT.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         receipt = load_receipt(path)
         ids = {
@@ -1298,9 +1399,8 @@ def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
             (receipt.get("target") or {}).get("threadId"),
         }
         if thread_id in ids:
-            return receipt
+            return path
     raise SystemExit(f"unknown DarkExec thread: {thread_id}")
-
 
 def render_status(receipt: dict) -> str:
     return (
@@ -1367,6 +1467,7 @@ def main() -> int:
     identity = status.add_mutually_exclusive_group(required=True)
     identity.add_argument("--job-id")
     identity.add_argument("--thread")
+    status.add_argument("--wait", action="store_true")
     status.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.command == "dispatch":
@@ -1397,9 +1498,10 @@ def main() -> int:
         return 0
     if args.command == "update":
         return update_install(args)
-    receipt = find_receipt(args.job_id, args.thread)
+    path = find_receipt_path(args.job_id, args.thread)
+    receipt = wait_for_receipt(path) if args.wait else load_receipt(path)
     print(json.dumps(receipt) if args.json else render_status(receipt))
-    return 0
+    return 0 if not args.wait or receipt.get("status") == "completed" else 1
 
 
 if __name__ == "__main__":

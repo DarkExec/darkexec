@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline contract test for dispatch, status, idempotency, and same-task harness."""
 
-import base64, hashlib, json, os, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import base64, fcntl, hashlib, json, os, signal, socket, struct, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,6 +120,14 @@ def fake_app_server(
                 continue
             if prompt == "WAIT_THEN_COMPLETE":
                 time.sleep(1.2)
+            if prompt == "WAIT_WITH_CONTROL_FOLLOWUP":
+                control = next(item for item in histories if item.endswith("1"))
+                histories[control].append({
+                    "id": "queued-user-follow-up", "status": "inProgress",
+                    "items": [{"id": "queued-user", "type": "userMessage", "content": [
+                        {"type": "text", "text": "Dependent follow-up while Background is running."},
+                    ]}],
+                })
             text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
             history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
             send_frame(connection, {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "text": text}}})
@@ -223,6 +231,76 @@ def main() -> None:
         )
         assert status.returncode == 0
         assert json.loads(status.stdout)["jobId"] == "incident-1"
+        waited_status = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "status", "--thread",
+                result["executive"]["threadId"], "--wait", "--json",
+            ],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        assert waited_status.returncode == 0
+        assert json.loads(waited_status.stdout)["status"] == "completed", waited_status.stdout
+        abandoned_job = "incident-abandoned"
+        abandoned_path = root / "state" / f"{hashlib.sha256(abandoned_job.encode()).hexdigest()}.json"
+        abandoned_path.write_text(json.dumps({
+            "schemaVersion": 1, "jobId": abandoned_job, "targetPath": str(target),
+            "status": "target_running",
+            "executive": {"threadId": "abandoned-executive"},
+            "target": {"threadId": "abandoned-target"},
+        }))
+        abandoned = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "status", "--job-id",
+                abandoned_job, "--wait", "--json",
+            ],
+            capture_output=True, text=True, env=env, check=False, timeout=2,
+        )
+        abandoned_result = json.loads(abandoned.stdout)
+        assert abandoned.returncode == 1, abandoned_result
+        assert abandoned_result["status"] == "abandoned", abandoned_result
+        assert abandoned_result["receiptStatus"] == "target_running", abandoned_result
+        live_job = "incident-live-wait"
+        live_path = root / "state" / f"{hashlib.sha256(live_job.encode()).hexdigest()}.json"
+        live_receipt = {
+            "schemaVersion": 1, "jobId": live_job, "targetPath": str(target),
+            "status": "target_running",
+            "executive": {"threadId": "live-wait-executive"},
+            "target": {"threadId": "live-wait-target"},
+        }
+        live_path.write_text(json.dumps(live_receipt))
+        live_lock = live_path.with_suffix(".lock").open("a+")
+        fcntl.flock(live_lock.fileno(), fcntl.LOCK_EX)
+        def finish_live_receipt() -> None:
+            time.sleep(0.3)
+            completed_receipt = {**live_receipt, "status": "completed"}
+            temporary = live_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(completed_receipt))
+            os.replace(temporary, live_path)
+            fcntl.flock(live_lock.fileno(), fcntl.LOCK_UN)
+            live_lock.close()
+        finisher = threading.Thread(target=finish_live_receipt, daemon=True)
+        finisher.start()
+        live_wait = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "status", "--thread",
+                "live-wait-executive", "--wait", "--json",
+            ],
+            capture_output=True, text=True, env=env, check=False, timeout=2,
+        )
+        finisher.join(timeout=1)
+        assert live_wait.returncode == 0, live_wait.stderr or live_wait.stdout
+        assert json.loads(live_wait.stdout)["status"] == "completed", live_wait.stdout
+        abandoned_stop = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "stop", "--executive-thread",
+                "abandoned-executive", "--json",
+            ],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        abandoned_stop_result = json.loads(abandoned_stop.stdout)
+        assert abandoned_stop.returncode == 0, abandoned_stop_result
+        assert abandoned_stop_result["source"] == "background_job", abandoned_stop_result
+        assert abandoned_stop_result["status"] == "already_stopped", abandoned_stop_result
         conflict = subprocess.run(command, input="Different request.", capture_output=True, text=True, env=env, check=False)
         assert conflict.returncode != 0
         server.join(timeout=2)
@@ -238,6 +316,23 @@ def main() -> None:
         assert "not listed by the running Codex App" in hidden_result["error"], hidden_result
         hidden_server.join(timeout=2)
         assert not hidden_server.is_alive()
+        queued_socket, queued_ready = root / "queued.sock", threading.Event()
+        queued_server = threading.Thread(
+            target=fake_app_server, args=(queued_socket, queued_ready), daemon=True,
+        )
+        queued_server.start(); assert queued_ready.wait(timeout=2)
+        queued_command = [*command]
+        queued_command[queued_command.index("incident-1")] = "incident-queued-follow-up"
+        queued = subprocess.run(
+            queued_command, input="WAIT_WITH_CONTROL_FOLLOWUP",
+            capture_output=True, text=True,
+            env={**env, "DARKEXEC_APP_SERVER_SOCKET": str(queued_socket)}, check=False,
+        )
+        queued_result = json.loads(queued.stdout)
+        assert queued.returncode == 0 and queued_result["status"] == "completed", queued_result
+        assert queued_result["executive"]["closeoutStatus"] == "suppressed_active_user_turn", queued_result
+        queued_server.join(timeout=2)
+        assert not queued_server.is_alive()
         missing_mode = subprocess.run(
             [
                 str(ROOT / "bin/darkexec"), "run", "--target", str(target),
@@ -702,7 +797,9 @@ def main() -> None:
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
         "stop-cancels-closeout", "no-interrupted-resume",
         "verified-hard-stop", "recorded-unsaved-target-stop", "stale-pid-safe",
-        "separate-usage", "idempotent-job", "thread-status",
+        "separate-usage", "idempotent-job", "thread-status", "receipt-attached-wait",
+        "abandoned-receipt-fail-closed", "background-stop-receipt-resolution",
+        "background-closeout-user-turn-suppression",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status", "debounce-cancel",
         "unbounded-turn-wait", "install-default-verification", "self-update",
