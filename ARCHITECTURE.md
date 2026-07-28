@@ -34,7 +34,9 @@ closeout first. If the timer cannot be scheduled, closeout runs immediately.
 `darkexec run` and `darkexec dispatch` remain one-shot/background paths and harness immediately.
 Their target and harness turns wait without a runtime deadline by default; explicit positive
 `DARKEXEC_TURN_TIMEOUT` values retain bounded-caller behavior, and signals still interrupt the
-active native turn.
+active native turn. Installation verifies that effective unset default from the release artifact
+before switching the current symlink, so a bounded-default regression cannot reach a fresh install
+or update.
 
 Each release contains `share/harness-ops.md` and `share/harness-ops.provenance.json`. The installed
 workspace exposes that exact doctrine. Runtime behavior never depends on a mutable Harness Ops

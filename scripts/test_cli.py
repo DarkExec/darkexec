@@ -127,6 +127,26 @@ def fake_app_server(
 def main() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
+        install_contract = subprocess.run(
+            [str(ROOT / "scripts/verify_install_contract.py"), str(ROOT / "bin/darkexec")],
+            capture_output=True, text=True, check=False,
+        )
+        assert install_contract.returncode == 0, install_contract.stderr
+        assert json.loads(install_contract.stdout)["turnTimeoutDefault"] == 0
+        bounded_runtime = root / "bounded-darkexec"
+        bounded_runtime.write_text(
+            (ROOT / "bin/darkexec").read_text().replace(
+                'DARKEXEC_TURN_TIMEOUT", "0"',
+                'DARKEXEC_TURN_TIMEOUT", "630"',
+                1,
+            )
+        )
+        rejected_contract = subprocess.run(
+            [str(ROOT / "scripts/verify_install_contract.py"), str(bounded_runtime)],
+            capture_output=True, text=True, check=False,
+        )
+        assert rejected_contract.returncode == 1
+        assert 'expected 0' in rejected_contract.stderr
         target, workspace = root / "target", root / "darkexec"
         target.mkdir()
         workspace.mkdir()
@@ -404,7 +424,7 @@ def main() -> None:
         "interactive-harness-mode-required", "interactive-target-run", "separate-usage", "idempotent-job", "thread-status",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status", "debounce-cancel",
-        "unbounded-turn-wait", "self-update",
+        "unbounded-turn-wait", "install-default-verification", "self-update",
     ]}))
 
 
