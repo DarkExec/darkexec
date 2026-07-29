@@ -109,7 +109,9 @@ The first interactive result receives an immediate same-task harness pass. Clear
 follow-ups can be queued in the same DarkExec conversation while it runs; they wait for that
 immediate harness, then use `darkexec continue` on the established target. DarkExec rereads each
 active executive turn so attachments are copied with its text instead of relying on the executive
-to reconstruct them. Each completed
+to reconstruct them. Trusted direct callers can supply the same typed `text`, `image`, and
+`localImage` input array through a private `--input-json` manifest; stdin remains the exact text
+assertion and local images are verified before native delivery. Each completed
 follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
 `darkexec debounce`; after the conversation becomes idle, it rereads the target and sends one
 trailing harness unless a manual or automatic harness already closed the latest product turn.
@@ -205,13 +207,21 @@ resolves that control task's immutable receipt and attaches once with `darkexec 
 Completion reuses only the receipt's exact target task; failed, interrupted, stale-abandoned, or
 mismatched receipts fail closed. Automatic control-task closeout yields to an active real user turn.
 
-Interactive trailing-closeout state defaults to `/var/lib/darkexec/sessions`. Inspect or cancel an
+Interactive trailing-closeout state defaults to `/var/lib/darkexec/sessions`. Inspect or control an
 armed closeout by exact target task ID:
 
 ```bash
 darkexec debounce-status --thread TARGET_TASK_ID --json
+darkexec debounce-pause --thread TARGET_TASK_ID --json
+darkexec debounce-resume --thread TARGET_TASK_ID --json
 darkexec debounce-cancel --thread TARGET_TASK_ID --json
+darkexec debounce-now --thread TARGET_TASK_ID --json
 ```
+
+Pause stops the timer and survives later follow-ups; each follow-up refreshes its paused remaining
+window. Resume continues the saved window. Cancel removes the current closeout but deliberately
+does not disable future closeout, so the next completed follow-up arms a new timer. Closeout-now
+stops the timer and runs that generation's exact harness pass immediately.
 
 ## What you can prove
 

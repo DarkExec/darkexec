@@ -341,6 +341,39 @@ def main() -> None:
         assert conflict.returncode != 0
         server.join(timeout=2)
         assert not server.is_alive()
+        dispatch_image = root / "dispatch-image.png"
+        dispatch_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        dispatch_input = [
+            {"type": "text", "text": "Attachment dispatch.\n\nAttached image: logo.png"},
+            {"type": "localImage", "path": str(dispatch_image)},
+        ]
+        dispatch_manifest = root / "dispatch-input.json"
+        dispatch_manifest.write_text(json.dumps({
+            "schemaVersion": 1, "input": dispatch_input,
+        }))
+        attachment_socket, attachment_ready, attachment_inputs = (
+            root / "attachment-dispatch.sock", threading.Event(), []
+        )
+        attachment_server = threading.Thread(
+            target=fake_app_server,
+            args=(attachment_socket, attachment_ready, True, None, {}, attachment_inputs),
+            daemon=True,
+        )
+        attachment_server.start(); assert attachment_ready.wait(timeout=2)
+        attachment_command = [
+            str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
+            "--job-id", "incident-attachment", "--prompt-stdin",
+            "--input-json", str(dispatch_manifest), "--read-only-harness", "--json",
+        ]
+        attachment_dispatch = subprocess.run(
+            attachment_command, input="Attachment dispatch.", capture_output=True, text=True,
+            env={**env, "DARKEXEC_APP_SERVER_SOCKET": str(attachment_socket)}, check=False,
+        )
+        attachment_result = json.loads(attachment_dispatch.stdout)
+        assert attachment_dispatch.returncode == 0 and attachment_result["status"] == "completed", attachment_result
+        assert dispatch_input in attachment_inputs, attachment_inputs
+        attachment_server.join(timeout=2)
+        assert not attachment_server.is_alive()
         hidden_socket, hidden_ready = root / "hidden.sock", threading.Event()
         hidden_server = threading.Thread(target=fake_app_server, args=(hidden_socket, hidden_ready, False), daemon=True)
         hidden_server.start(); assert hidden_ready.wait(timeout=2)
@@ -451,6 +484,41 @@ def main() -> None:
         assert unknown_status_result["runnerActive"] is False, unknown_status_result
         run_server.join(timeout=2)
         assert not run_server.is_alive()
+        direct_image = root / "direct-image.png"
+        direct_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        direct_manifest = root / "direct-input.json"
+        direct_input = [
+            {"type": "text", "text": "Direct attachment request.\n\nAttached image: logo.png"},
+            {"type": "localImage", "path": str(direct_image)},
+        ]
+        direct_manifest.write_text(json.dumps({"schemaVersion": 1, "input": direct_input}))
+        direct_socket, direct_ready, direct_inputs = (
+            root / "direct-input.sock", threading.Event(), []
+        )
+        direct_server = threading.Thread(
+            target=fake_app_server,
+            args=(direct_socket, direct_ready, True, None, {}, direct_inputs),
+            daemon=True,
+        )
+        direct_server.start(); assert direct_ready.wait(timeout=2)
+        direct_env = {
+            key: value for key, value in run_env.items() if key != "CODEX_THREAD_ID"
+        }
+        direct_env["DARKEXEC_APP_SERVER_SOCKET"] = str(direct_socket)
+        direct = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "run", "--target", str(target),
+                "--prompt-stdin", "--input-json", str(direct_manifest),
+                "--read-only-harness", "--json",
+            ],
+            input="Direct attachment request.", capture_output=True, text=True,
+            env=direct_env, check=False,
+        )
+        direct_result = json.loads(direct.stdout)
+        assert direct.returncode == 0 and direct_result["status"] == "completed", direct_result
+        assert direct_inputs[0] == direct_input, direct_inputs[0]
+        direct_server.join(timeout=2)
+        assert not direct_server.is_alive()
         continue_socket, continue_ready = root / "continue.sock", threading.Event()
         follow_up_input = [
             {"type": "text", "text": "Dependent follow-up."},
@@ -869,6 +937,81 @@ def main() -> None:
             capture_output=True, text=True, env=timer_env, check=False,
         )
         assert cancelled.returncode == 0 and json.loads(cancelled.stdout)["status"] == "cancelled", cancelled.stdout
+        paused_thread = "00000000-0000-4000-8000-000000000003"
+        paused_arm = [*arm]
+        paused_arm[paused_arm.index(timer_thread)] = paused_thread
+        paused_arm[paused_arm.index("product-1")] = "paused-product-1"
+        paused_result = json.loads(subprocess.run(
+            paused_arm, capture_output=True, text=True, env=timer_env, check=False,
+        ).stdout)
+        assert paused_result["status"] == "pending", paused_result
+        paused = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-pause", "--thread", paused_thread, "--json"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        paused_status = json.loads(paused.stdout)
+        assert paused.returncode == 0 and paused_status["status"] == "paused", paused_status
+        assert 0 < paused_status["remainingSeconds"] <= 1800, paused_status
+        paused_reset = [*paused_arm]
+        paused_reset[paused_reset.index("paused-product-1")] = "paused-product-2"
+        paused_reset_status = json.loads(subprocess.run(
+            paused_reset, capture_output=True, text=True, env=timer_env, check=False,
+        ).stdout)
+        assert paused_reset_status["status"] == "paused", paused_reset_status
+        assert paused_reset_status["generation"] == 2, paused_reset_status
+        assert paused_reset_status["remainingSeconds"] == 1800, paused_reset_status
+        resumed = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-resume", "--thread", paused_thread, "--json"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        resumed_status = json.loads(resumed.stdout)
+        assert resumed.returncode == 0 and resumed_status["status"] == "pending", resumed_status
+        paused_cancelled = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-cancel", "--thread", paused_thread, "--json"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        assert json.loads(paused_cancelled.stdout)["status"] == "cancelled", paused_cancelled.stdout
+        restarted_status = json.loads(subprocess.run(
+            paused_reset, capture_output=True, text=True, env=timer_env, check=False,
+        ).stdout)
+        assert restarted_status["status"] == "pending", restarted_status
+        assert restarted_status["generation"] == 3, restarted_status
+        subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-cancel", "--thread", paused_thread, "--json"],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        now_thread = "00000000-0000-4000-8000-000000000004"
+        now_turn = "closeout-now-product"
+        now_arm = [*arm]
+        now_arm[now_arm.index(timer_thread)] = now_thread
+        now_arm[now_arm.index("product-1")] = now_turn
+        now_armed = json.loads(subprocess.run(
+            now_arm, capture_output=True, text=True, env=timer_env, check=False,
+        ).stdout)
+        assert now_armed["status"] == "pending", now_armed
+        now_socket, now_ready = root / "closeout-now.sock", threading.Event()
+        now_server = threading.Thread(
+            target=fake_app_server,
+            args=(now_socket, now_ready, True, None, {
+                now_thread: {"cwd": str(target), "turns": [{
+                    "id": now_turn, "status": "completed", "items": [{
+                        "id": "now-user", "type": "userMessage",
+                        "content": [{"type": "text", "text": "Latest product work"}],
+                    }],
+                }]},
+            }),
+            daemon=True,
+        )
+        now_server.start(); assert now_ready.wait(timeout=2)
+        now_result = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-now", "--thread", now_thread, "--json"],
+            capture_output=True, text=True,
+            env={**timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(now_socket)}, check=False,
+        )
+        now_status = json.loads(now_result.stdout)
+        assert now_result.returncode == 0 and now_status["status"] == "completed", now_status
+        now_server.join(timeout=2)
+        assert not now_server.is_alive()
         update_source = root / "update-source"
         (update_source / "scripts").mkdir(parents=True)
         fake_install = update_source / "scripts" / "install.sh"
@@ -898,7 +1041,7 @@ def main() -> None:
         "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
         "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
-        "interactive-execution-status",
+        "interactive-execution-status", "direct-structured-input",
         "attached-same-turn-steer",
         "runtime-owned-follow-up",
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
@@ -908,7 +1051,8 @@ def main() -> None:
         "abandoned-receipt-fail-closed", "background-stop-receipt-resolution",
         "background-closeout-user-turn-suppression",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
-        "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status", "debounce-cancel",
+        "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status",
+        "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "install-default-verification", "self-update",
     ]}))
 
