@@ -1192,8 +1192,9 @@ def schedule_timer(state: dict, executable: Path) -> tuple[bool, str]:
     digest = hashlib.sha256(state["threadId"].encode()).hexdigest()[:12]
     state["timerAttempt"] = int(state.get("timerAttempt") or 0) + 1
     unit = f"darkexec-closeout-{digest}-g{state['generation']}-a{state['timerAttempt']}"
+    calendar_due = str(state["dueAt"]).replace("T", " ").removesuffix("Z") + " UTC"
     command = [
-        runner, f"--unit={unit}", f"--on-calendar={state['dueAt']}", "--collect", "--quiet",
+        runner, f"--unit={unit}", f"--on-calendar={calendar_due}", "--collect", "--quiet",
         f"--setenv=DARKEXEC_SESSION_ROOT={SESSION_ROOT}",
         f"--setenv=DARKEXEC_CONFIG={CONFIG}",
         f"--setenv=DARKEXEC_APP_SERVER_SOCKET={APP_SERVER_SOCKET}",
