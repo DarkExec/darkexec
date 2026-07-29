@@ -118,6 +118,10 @@ def fake_app_server(
                 if stall_ready:
                     stall_ready.set()
                 continue
+            if prompt == "WAIT_FOR_STEER":
+                if stall_ready:
+                    stall_ready.set()
+                continue
             if prompt == "WAIT_THEN_COMPLETE":
                 time.sleep(1.2)
             if prompt == "WAIT_WITH_CONTROL_FOLLOWUP":
@@ -149,6 +153,37 @@ def fake_app_server(
                 if history.get("id") == turn:
                     history["status"] = "interrupted"
             send_frame(connection, {"id": message["id"], "result": {}})
+        elif method == "turn/steer":
+            thread = message["params"]["threadId"]
+            turn = message["params"]["expectedTurnId"]
+            active = next(
+                item for item in histories.get(thread, [])
+                if item.get("id") == turn and item.get("status") == "inProgress"
+            )
+            steer_input = message["params"]["input"]
+            steer_text = next(item["text"] for item in steer_input if item.get("type") == "text")
+            active["items"].append({
+                "id": f"steer-{turn}", "type": "userMessage", "content": steer_input,
+            })
+            text = f"TARGET_OK:WAIT_FOR_STEER:{steer_text}"
+            active["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
+            send_frame(connection, {"id": message["id"], "result": {"turnId": turn}})
+            send_frame(connection, {"method": "item/completed", "params": {
+                "threadId": thread, "turnId": turn,
+                "item": {"type": "agentMessage", "text": text},
+            }})
+            threads[thread] += 12
+            send_frame(connection, {"method": "thread/tokenUsage/updated", "params": {
+                "threadId": thread, "turnId": turn, "tokenUsage": {"total": {
+                    "inputTokens": 10, "cachedInputTokens": 4, "outputTokens": 2,
+                    "reasoningOutputTokens": 1, "totalTokens": threads[thread],
+                }},
+            }})
+            send_frame(connection, {"method": "turn/completed", "params": {
+                "threadId": thread,
+                "turn": {"id": turn, "status": "completed", "error": None},
+            }})
+            active["status"] = "completed"
     connection.close()
     server.close()
 
@@ -192,6 +227,7 @@ def main() -> None:
         env = {
             **os.environ, "DARKEXEC_STATE_ROOT": str(root / "state"),
             "DARKEXEC_EXECUTION_ROOT": str(root / "executions"),
+            "DARKEXEC_CONTROL_ROOT": str(root / "controls"),
             "DARKEXEC_SESSION_ROOT": str(root / "sessions"),
             "DARKEXEC_WORKSPACE": str(workspace), "DARKEXEC_CONFIG": str(config),
             "DARKEXEC_APP_SERVER_SOCKET": str(socket_path),
@@ -451,6 +487,76 @@ def main() -> None:
         assert continue_inputs[0] == follow_up_input, continue_inputs[0]
         continue_server.join(timeout=2)
         assert not continue_server.is_alive()
+        steer_socket, steer_ready, steer_turn_ready = (
+            root / "steer.sock", threading.Event(), threading.Event()
+        )
+        steer_server = threading.Thread(
+            target=fake_app_server,
+            args=(steer_socket, steer_ready, True, steer_turn_ready, {
+                interactive_state["target"]["threadId"]: {"cwd": str(target), "turns": []},
+            }),
+            daemon=True,
+        )
+        steer_server.start(); assert steer_ready.wait(timeout=2)
+        steer_env = {**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(steer_socket)}
+        steer_run = subprocess.Popen(
+            [
+                str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
+                "--thread", interactive_state["target"]["threadId"],
+                "--executive-thread", interactive_executive,
+                "--prompt-stdin", "--json",
+            ],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=steer_env,
+        )
+        assert steer_run.stdin is not None
+        steer_run.stdin.write("WAIT_FOR_STEER")
+        steer_run.stdin.close()
+        assert steer_turn_ready.wait(timeout=2)
+        execution_file = (
+            root / "executions" / f"{hashlib.sha256(interactive_executive.encode()).hexdigest()}.json"
+        )
+        for _ in range(40):
+            active_steer = json.loads(execution_file.read_text())
+            if (active_steer.get("target") or {}).get("turnId"):
+                break
+            time.sleep(0.05)
+        target_turn = active_steer["target"]["turnId"]
+        steered = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "steer",
+                "--executive-thread", interactive_executive,
+                "--thread", interactive_state["target"]["threadId"],
+                "--turn", target_turn, "--intent-id", "intent-steer-1",
+                "--prompt-stdin", "--json",
+            ],
+            input="STEER_OK", capture_output=True, text=True, env=steer_env, check=False,
+        )
+        steered_result = json.loads(steered.stdout)
+        assert steered.returncode == 0, steered.stderr
+        assert steered_result["status"] == "acknowledged", steered_result
+        assert steered_result["turnId"] == target_turn, steered_result
+        assert steer_run.stdout is not None and steer_run.stderr is not None
+        steer_stdout = steer_run.stdout.read()
+        steer_stderr = steer_run.stderr.read()
+        assert steer_run.wait(timeout=3) == 0, steer_stderr
+        steer_result = json.loads(steer_stdout)
+        assert steer_result["status"] == "completed", steer_result
+        assert steer_result["target"]["resultText"] == "TARGET_OK:WAIT_FOR_STEER:STEER_OK", steer_result
+        steer_server.join(timeout=2)
+        assert not steer_server.is_alive()
+        rejected_steer = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "steer",
+                "--executive-thread", interactive_executive,
+                "--thread", interactive_state["target"]["threadId"],
+                "--turn", target_turn, "--intent-id", "intent-steer-2",
+                "--prompt-stdin", "--json",
+            ],
+            input="TOO_LATE", capture_output=True, text=True, env=steer_env, check=False,
+        )
+        assert rejected_steer.returncode != 0
+        assert "not accepting same-turn steering" in rejected_steer.stderr
         replacement = subprocess.run(
             run_command, input="Must not replace the bound target.",
             capture_output=True, text=True, env=run_env, check=False,
@@ -793,6 +899,7 @@ def main() -> None:
         "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
         "interactive-execution-status",
+        "attached-same-turn-steer",
         "runtime-owned-follow-up",
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
         "stop-cancels-closeout", "no-interrupted-resume",

@@ -6,6 +6,7 @@ same saved project; it never discovers or resumes continuity across executive ta
 
 ```text
 interactive: installed workspace -> exact saved project -> verbatim target task
+                                                    -> attached same-turn steering
                                                     -> immediate initial harness
                                                     -> same-target follow-up burst
                                                     -> 30-minute trailing harness
@@ -41,6 +42,12 @@ may be projected through non-model UI notifications without settling that call. 
 does not re-enter the executive model. This preserves the active executive turn and queued
 follow-ups while avoiding repeated full-context polling turns.
 
+While a product turn is active, `darkexec steer` delivers one exact executive-scoped instruction
+through a mode-0600 local control socket. The attached runner sends native `turn/steer` on its
+existing App Server connection and returns the native acknowledgement. The socket exists only
+during product turns, requires the exact target and turn precondition, and is absent during harness
+or synthetic closeout turns.
+
 `darkexec run` and `darkexec dispatch` remain one-shot/background paths and harness immediately.
 Their target and harness turns wait without a runtime deadline by default; explicit positive
 `DARKEXEC_TURN_TIMEOUT` values retain bounded-caller behavior, and signals still interrupt the
@@ -68,6 +75,7 @@ and repairs a missing or broken binding.
 - exact saved-project roots;
 - durable local receipt state;
 - executive-scoped active-run identity and verified process ownership;
+- executive-scoped same-turn steering sockets;
 - signal and timeout terminalization;
 - release and doctrine identity; and
 - the caller's authority and prompt.

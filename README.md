@@ -154,6 +154,23 @@ Progress is a read-only projection of the exact active execution identity. It do
 resume, retry, or replace work. The full attached-call pattern is installed in
 `/srv/darkexec/README.md`.
 
+Typed control surfaces may deliver new context to an active product turn without waking or
+replacing the executive task:
+
+```bash
+printf '%s' 'Use the repaired database owner discovered by the other incident.' |
+  darkexec steer \
+    --executive-thread EXECUTIVE_TASK_ID \
+    --thread TARGET_TASK_ID \
+    --turn ACTIVE_TURN_ID \
+    --intent-id CALLER_INTENT_ID \
+    --prompt-stdin \
+    --json
+```
+
+The attached runner sends the steer on its existing App Server connection. Exact target/turn
+mismatch, an idle target, or a harness turn fails closed.
+
 Inside the installed executive conversation, exact standalone `STOP` requests an urgent clean stop.
 Exact `STOP HARD` sends the native target interruption immediately and escalates only against the
 verified owned runner after a short grace period. Both commands cancel pending closeout, are
@@ -260,7 +277,7 @@ only the documented DarkExec-managed symlinks and release paths.
 
 | Path | Owns |
 | --- | --- |
-| `bin/darkexec` | Dispatch, interactive run/continue/stop, debounce, and status CLI |
+| `bin/darkexec` | Dispatch, interactive run/continue/steer/stop, debounce, and status CLI |
 | `share/workspace/` | Installed Codex App executive project |
 | `share/harness-ops.md` | Pinned operating doctrine |
 | `scripts/install.sh` | Commit-addressed installation with effective-default verification |

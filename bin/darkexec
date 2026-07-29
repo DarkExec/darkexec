@@ -12,6 +12,7 @@ from pathlib import Path
 STATE_ROOT = Path(os.environ.get("DARKEXEC_STATE_ROOT", "/var/lib/darkexec/jobs"))
 SESSION_ROOT = Path(os.environ.get("DARKEXEC_SESSION_ROOT", "/var/lib/darkexec/sessions"))
 EXECUTION_ROOT = Path(os.environ.get("DARKEXEC_EXECUTION_ROOT", "/var/lib/darkexec/executives"))
+CONTROL_ROOT = Path(os.environ.get("DARKEXEC_CONTROL_ROOT", "/var/lib/darkexec/controls"))
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
 CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
 DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
@@ -60,6 +61,9 @@ def session_path(thread_id: str) -> Path:
 
 def execution_path(thread_id: str) -> Path:
     return EXECUTION_ROOT / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
+
+def control_path(thread_id: str) -> Path:
+    return CONTROL_ROOT / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.sock"
 
 def process_start_ticks(pid: int) -> int | None:
     try:
@@ -272,6 +276,64 @@ def usage(raw: dict | None) -> dict:
 def usage_delta(after: dict, before: dict) -> dict:
     return {key: max(0, int(after.get(key) or 0) - int(before.get(key) or 0)) for key in after}
 
+class SteerControl:
+    def __init__(self, executive_thread_id: str):
+        self.path = control_path(executive_thread_id)
+        self.listener: socket.socket | None = None
+
+    def open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        listener.listen(8)
+        listener.setblocking(False)
+        self.listener = listener
+
+    def accept(self) -> list[tuple[socket.socket, dict]]:
+        accepted = []
+        if not self.listener:
+            return accepted
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except BlockingIOError:
+                return accepted
+            try:
+                connection.settimeout(0.2)
+                raw = connection.recv(65537)
+                if len(raw) > 65536:
+                    raise ValueError("steer request is too large")
+                request = json.loads(raw)
+                if not isinstance(request, dict):
+                    raise ValueError("steer request must be an object")
+                accepted.append((connection, request))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self.respond(connection, {"status": "rejected", "error": str(exc)})
+
+    @staticmethod
+    def respond(connection: socket.socket, payload: dict) -> None:
+        try:
+            connection.sendall((json.dumps(payload) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+    def close(self) -> None:
+        if self.listener:
+            self.listener.close()
+            self.listener = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
 class AppServer:
     def __init__(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -424,6 +486,7 @@ class AppServer:
         prompt: str,
         on_started=None,
         input_items: list[dict] | None = None,
+        steer_key: str | None = None,
     ) -> dict:
         turn_input = input_items if input_items is not None else [{"type": "text", "text": prompt}]
         self.request_id += 1
@@ -437,9 +500,92 @@ class AppServer:
         messages: list[str] = []
         final_usage = None
         model_calls = 0
+        control = SteerControl(steer_key) if steer_key else None
+        pending_steers: dict[int, socket.socket] = {}
+        reconcile_request_id = None
+        reconcile_due = time.monotonic() + 2
+
+        def completed_result(turn: dict) -> dict:
+            previous = self.thread_usage.get(thread_id, {key: 0 for key in usage({})})
+            current = final_usage or previous
+            self.thread_usage[thread_id] = current
+            result_text = messages[-1] if messages else ""
+            ok = turn.get("status") == "completed" and bool(result_text)
+            self.active_turn = None
+            return {
+                "ok": ok, "timedOut": False, "exitCode": 0 if ok else 1,
+                "threadId": thread_id, "turnId": turn_id,
+                "resultText": result_text[:12000],
+                "usage": usage_delta(current, previous),
+                "modelCallCount": model_calls or None,
+                "error": "" if ok else str(
+                    turn.get("error") or "App task failed without a final response"
+                ),
+            }
+
         try:
+            if control:
+                control.open()
             while True:
-                message = self._next(deadline)
+                if control:
+                    if self.buffer:
+                        message = self._next(deadline)
+                    else:
+                        remaining = max(0, reconcile_due - time.monotonic())
+                        if deadline is not None:
+                            remaining = min(remaining, max(0, deadline - time.monotonic()))
+                        readable = select.select(
+                            [self.sock, control.listener], [], [], remaining
+                        )[0]
+                        if not readable:
+                            if deadline is not None and time.monotonic() >= deadline:
+                                raise TimeoutError("App Server response timeout")
+                            if reconcile_request_id is None and turn_id:
+                                self.request_id += 1
+                                reconcile_request_id = self.request_id
+                                self._send({
+                                    "jsonrpc": "2.0", "id": reconcile_request_id,
+                                    "method": "thread/read",
+                                    "params": {"threadId": thread_id, "includeTurns": True},
+                                })
+                            reconcile_due = time.monotonic() + 2
+                            continue
+                        if control.listener not in readable:
+                            message = self._next(deadline)
+                        else:
+                            message = None
+                    for connection, request in control.accept():
+                        if (
+                            request.get("threadId") != thread_id
+                            or request.get("expectedTurnId") != turn_id
+                            or not isinstance(request.get("body"), str)
+                            or not request["body"].strip()
+                            or len(request["body"]) > 20000
+                        ):
+                            control.respond(connection, {
+                                "status": "rejected",
+                                "error": "active target identity does not match the steer request",
+                            })
+                            continue
+                        self.request_id += 1
+                        steer_request_id = self.request_id
+                        pending_steers[steer_request_id] = connection
+                        self._send({
+                            "jsonrpc": "2.0", "id": steer_request_id, "method": "turn/steer",
+                            "params": {
+                                "threadId": thread_id,
+                                "expectedTurnId": turn_id,
+                                "input": [{"type": "text", "text": request["body"],
+                                           "text_elements": []}],
+                                "clientUserMessageId": request.get("intentId"),
+                            },
+                        })
+                    if message is None:
+                        continue
+                else:
+                    message = self._next(deadline)
+                if message is None:
+                    continue
                 if message.get("id") == request_id:
                     if message.get("error"):
                         raise RuntimeError(str(message["error"]))
@@ -448,6 +594,40 @@ class AppServer:
                         self.active_turn = (thread_id, turn_id)
                         if on_started:
                             on_started(thread_id, turn_id)
+                    continue
+                if message.get("id") in pending_steers:
+                    connection = pending_steers.pop(message["id"])
+                    if message.get("error"):
+                        control.respond(connection, {
+                            "status": "rejected", "error": str(message["error"]),
+                        })
+                    else:
+                        response_turn = (message.get("result") or {}).get("turnId")
+                        control.respond(connection, {
+                            "status": "acknowledged",
+                            "threadId": thread_id,
+                            "turnId": response_turn,
+                        })
+                    continue
+                if reconcile_request_id is not None and message.get("id") == reconcile_request_id:
+                    reconcile_request_id = None
+                    if not message.get("error"):
+                        thread = (message.get("result") or {}).get("thread") or {}
+                        turn = next(
+                            (
+                                candidate for candidate in thread.get("turns", [])
+                                if candidate.get("id") == turn_id
+                            ),
+                            None,
+                        )
+                        if turn and turn.get("status") != "inProgress":
+                            for item in turn.get("items", []):
+                                if item.get("type") == "agentMessage" and item.get("text"):
+                                    text = str(item["text"])
+                                    if not messages or messages[-1] != text:
+                                        messages.append(text)
+                            return completed_result(turn)
+                    reconcile_due = time.monotonic() + 2
                     continue
                 method = message.get("method")
                 params = message.get("params") if isinstance(message.get("params"), dict) else {}
@@ -465,26 +645,21 @@ class AppServer:
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                     if not turn_id or turn.get("id") != turn_id:
                         continue
-                    previous = self.thread_usage.get(thread_id, {key: 0 for key in usage({})})
-                    current = final_usage or previous
-                    self.thread_usage[thread_id] = current
-                    result_text = messages[-1] if messages else ""
-                    ok = turn.get("status") == "completed" and bool(result_text)
-                    self.active_turn = None
-                    return {
-                        "ok": ok, "timedOut": False, "exitCode": 0 if ok else 1,
-                        "threadId": thread_id, "turnId": turn_id,
-                        "resultText": result_text[:12000],
-                        "usage": usage_delta(current, previous),
-                        "modelCallCount": model_calls or None,
-                        "error": "" if ok else str(turn.get("error") or "App task failed without a final response"),
-                    }
+                    return completed_result(turn)
         except TimeoutError:
             self.interrupt_active()
             return {
                 "ok": False, "timedOut": True, "exitCode": None, "threadId": thread_id,
                 "error": f"Codex App turn exceeded {TURN_TIMEOUT} seconds.",
             }
+        finally:
+            for connection in pending_steers.values():
+                if control:
+                    control.respond(connection, {
+                        "status": "rejected", "error": "target turn ended before steer acknowledgement",
+                    })
+            if control:
+                control.close()
 
     def interrupt_active(self) -> bool:
         if not self.active_turn:
@@ -643,7 +818,10 @@ def dispatch(args) -> int:
             def target_started(_thread_id: str, turn_id: str) -> None:
                 receipt["target"]["turnId"] = turn_id
                 save(path, receipt, "target_running")
-            target_result = app.run_turn(target_thread["id"], prompt, on_started=target_started)
+            target_result = app.run_turn(
+                target_thread["id"], prompt, on_started=target_started,
+                steer_key=executive_thread["id"],
+            )
             listed_target = app.require_listed_thread(target_thread["id"], target)
             receipt["target"].update({
                 "source": listed_target.get("source"), "appVisible": True,
@@ -780,7 +958,8 @@ def run_target(args) -> int:
                         "target": {"threadId": thread["id"], "turnId": turn_id},
                     })
             target_result = app.run_turn(
-                thread["id"], prompt, on_started=target_started, input_items=source_input
+                thread["id"], prompt, on_started=target_started, input_items=source_input,
+                steer_key=executive_thread_id,
             )
             listed_thread = app.require_listed_thread(thread["id"], target)
             result["target"].update({
@@ -889,7 +1068,8 @@ def continue_target(args) -> int:
                     "target": {"threadId": args.thread, "turnId": turn_id},
                 })
             turn = app.run_turn(
-                args.thread, prompt, on_started=turn_started, input_items=source_input
+                args.thread, prompt, on_started=turn_started, input_items=source_input,
+                steer_key=executive_thread_id,
             )
             result["target"].update({
                 "source": thread.get("source"), "appVisible": True,
@@ -1357,6 +1537,52 @@ def execution_status(args) -> int:
     return 1 if result["status"] == "not_found" else 0
 
 
+def steer_target(args) -> int:
+    executive_thread_id = requested_executive_thread(args)
+    if not executive_thread_id:
+        raise SystemExit("steer requires --executive-thread or CODEX_THREAD_ID")
+    body = sys.stdin.read()
+    if not body.strip():
+        raise SystemExit("steer requires a non-empty prompt on stdin")
+    if len(body) > 20000:
+        raise SystemExit("steer prompt exceeds 20000 characters")
+    path = control_path(executive_thread_id)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(20)
+    try:
+        connection.connect(str(path))
+        connection.sendall((json.dumps({
+            "threadId": args.thread,
+            "expectedTurnId": args.turn,
+            "body": body,
+            "intentId": args.intent_id,
+        }) + "\n").encode())
+        connection.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(map(len, chunks)) > 65536:
+                raise RuntimeError("steer acknowledgement is too large")
+    except FileNotFoundError:
+        raise SystemExit("target is not accepting same-turn steering")
+    except (ConnectionRefusedError, socket.timeout, OSError) as exc:
+        raise SystemExit(f"cannot deliver same-turn steer: {exc}") from exc
+    finally:
+        connection.close()
+    try:
+        result = json.loads(b"".join(chunks))
+    except json.JSONDecodeError as exc:
+        raise SystemExit("target returned no valid steer acknowledgement") from exc
+    print(json.dumps(result) if args.json else (
+        f"{result.get('status')} target={result.get('threadId') or args.thread} "
+        f"turn={result.get('turnId') or args.turn}"
+    ))
+    return 0 if result.get("status") == "acknowledged" else 1
+
+
 def update_install(args) -> int:
     with tempfile.TemporaryDirectory(prefix="darkexec-update-") as temporary:
         checkout = Path(temporary) / "darkexec"
@@ -1443,6 +1669,13 @@ def main() -> int:
     execution_read = sub.add_parser("execution-status")
     execution_read.add_argument("--executive-thread")
     execution_read.add_argument("--json", action="store_true")
+    steer = sub.add_parser("steer")
+    steer.add_argument("--executive-thread")
+    steer.add_argument("--thread", required=True)
+    steer.add_argument("--turn", required=True)
+    steer.add_argument("--intent-id", required=True)
+    steer.add_argument("--prompt-stdin", action="store_true", required=True)
+    steer.add_argument("--json", action="store_true")
     debounce = sub.add_parser("debounce")
     debounce.add_argument("--target", required=True)
     debounce.add_argument("--thread", required=True)
@@ -1480,6 +1713,8 @@ def main() -> int:
         return stop_execution(args)
     if args.command == "execution-status":
         return execution_status(args)
+    if args.command == "steer":
+        return steer_target(args)
     if args.command == "debounce":
         if args.seconds < 1:
             raise SystemExit("debounce seconds must be positive")
