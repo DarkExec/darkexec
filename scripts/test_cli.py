@@ -859,6 +859,7 @@ def main() -> None:
         armed_result = json.loads(armed.stdout)
         assert armed.returncode == 0 and armed_result["status"] == "pending", armed_result
         assert armed_result["generation"] == 1 and "-g1-a1" in armed_result["timerUnit"], armed_result
+        assert "--on-calendar=" in scheduler_log.read_text(), scheduler_log.read_text()
         reset = [*arm]
         reset[reset.index("product-1")] = "product-2"
         reset_result = json.loads(subprocess.run(
