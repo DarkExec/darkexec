@@ -132,7 +132,17 @@ def fake_app_server(
                         {"type": "text", "text": "Dependent follow-up while Background is running."},
                     ]}],
                 })
-            text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
+            if prompt.startswith("DARKEXEC ROUTE TASK."):
+                allowed = json.loads(
+                    prompt.split("Allowed projects: ", 1)[1].split(
+                        ". Natural request:", 1
+                    )[0]
+                )
+                selected = next(path for path in allowed if not path.endswith("darkexec"))
+                job_id = prompt.split("owns job ", 1)[1].split(".", 1)[0]
+                text = f"DARKEXEC_ROUTE_READY {job_id} {selected}"
+            else:
+                text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
             history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
             history["status"] = "completed"
             if prompt == "COMPLETE_WITHOUT_NOTIFICATION":
@@ -383,6 +393,55 @@ def main() -> None:
         )
         assert mode_conflict.returncode != 0
         assert "different harness mode" in mode_conflict.stderr, mode_conflict.stderr
+        routed_config = root / "routed-config.toml"
+        routed_config.write_text(
+            f'[projects."{workspace}"]\ntrust_level = "trusted"\n'
+            f'[projects."{target}"]\ntrust_level = "trusted"\n'
+        )
+        routed_socket, routed_ready, routed_inputs = (
+            root / "routed.sock", threading.Event(), []
+        )
+        routed_server = threading.Thread(
+            target=fake_app_server,
+            args=(routed_socket, routed_ready, True, None, {}, routed_inputs),
+            daemon=True,
+        )
+        routed_server.start(); assert routed_ready.wait(timeout=2)
+        routed_command = [
+            str(ROOT / "bin/darkexec"), "dispatch", "--target", str(workspace),
+            "--job-id", "incident-routed-deferred", "--prompt-stdin",
+            "--read-only-harness", "--defer-initial-harness", "--resolve-target", "--json",
+        ]
+        routed = subprocess.run(
+            routed_command, input="Choose the owner and inspect it.",
+            capture_output=True, text=True,
+            env={
+                **env, "DARKEXEC_CONFIG": str(routed_config),
+                "DARKEXEC_APP_SERVER_SOCKET": str(routed_socket),
+            },
+            check=False,
+        )
+        routed_result = json.loads(routed.stdout)
+        assert routed.returncode == 0, routed.stderr or routed_result
+        assert routed_result["requestedTargetPath"] == str(workspace), routed_result
+        assert routed_result["targetResolution"] == "executive", routed_result
+        assert routed_result["targetPath"] == str(target), routed_result
+        assert routed_result["resolvedTargetPath"] == str(target), routed_result
+        assert routed_result["executive"]["listedCwd"] == str(workspace), routed_result
+        assert routed_result["target"]["listedCwd"] == str(target), routed_result
+        assert (
+            routed_result["target"]["resultText"]
+            == "TARGET_OK:Choose the owner and inspect it."
+        ), routed_result
+        assert routed_result["target"]["harness"]["status"] == "deferred", routed_result
+        assert len(routed_inputs) == 3, routed_inputs
+        assert routed_inputs[0][0]["text"].startswith("DARKEXEC ROUTE TASK."), routed_inputs
+        assert routed_inputs[1] == [
+            {"type": "text", "text": "Choose the owner and inspect it."}
+        ], routed_inputs
+        assert "Same-task harness: deferred" in routed_inputs[2][0]["text"], routed_inputs
+        routed_server.join(timeout=2)
+        assert not routed_server.is_alive()
         dispatch_image = root / "dispatch-image.png"
         dispatch_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         dispatch_input = [
@@ -1154,7 +1213,8 @@ def main() -> None:
         "abandoned-receipt-fail-closed", "background-stop-receipt-resolution",
         "background-closeout-user-turn-suppression",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
-        "deferred-initial-harness", "manual-harness-suppression",
+        "deferred-initial-harness", "executive-target-resolution",
+        "manual-harness-suppression",
         "schedule-failure-immediate-closeout", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",

@@ -121,6 +121,10 @@ immediately by default. A trusted conversational caller may add `--defer-initial
 `darkexec dispatch`; the receipt then returns the first target result with harness status
 `deferred`, and that caller must immediately arm `darkexec debounce` for the exact target turn.
 This opt-in does not change Background or ordinary dispatch behavior.
+When that caller needs DarkExec to choose the owner, it may combine `--resolve-target` with the
+exact saved DarkExec workspace. The executive resolver receives the natural request and
+attachments, selects one allowed saved project, and dispatches the product turn directly there;
+it never creates an intermediate `/srv/darkexec` target task.
 
 For direct callers, choose exactly one harness mode:
 
