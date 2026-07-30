@@ -63,12 +63,14 @@ def fake_app_server(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
     ).encode())
-    threads, listed, histories, materialized, turns = {}, {}, {}, set(), 0
+    threads, listed, histories, materialized, loaded, turns = {}, {}, {}, set(), set(), 0
     for thread_id, seed in (seeded_threads or {}).items():
         threads[thread_id] = 0
         listed[thread_id] = {"id": thread_id, "source": "vscode", "cwd": seed["cwd"]}
         histories[thread_id] = list(seed.get("turns") or [])
         materialized.add(thread_id)
+        if seed.get("loaded", True):
+            loaded.add(thread_id)
     while True:
         message = receive_frame(connection)
         if message is None:
@@ -82,6 +84,7 @@ def fake_app_server(
             threads[thread] = 0
             listed[thread] = {"id": thread, "source": "vscode", "cwd": cwd}
             histories[thread] = []
+            loaded.add(thread)
             send_frame(connection, {"id": message["id"], "result": {"thread": {"id": thread, "source": "vscode", "cwd": cwd}}})
         elif method == "thread/list":
             cwd = message["params"]["cwd"]
@@ -92,6 +95,19 @@ def fake_app_server(
             send_frame(connection, {"id": message["id"], "result": {"data": data, "nextCursor": None}})
         elif method == "thread/read":
             thread = message["params"]["threadId"]
+            if thread not in loaded:
+                send_frame(connection, {
+                    "id": message["id"],
+                    "error": {"code": -32600, "message": f"thread not found: {thread}"},
+                })
+                continue
+            metadata = listed[thread]
+            send_frame(connection, {"id": message["id"], "result": {"thread": {
+                **metadata, "turns": histories[thread], "status": {"type": "idle"},
+            }}})
+        elif method == "thread/resume":
+            thread = message["params"]["threadId"]
+            loaded.add(thread)
             metadata = listed[thread]
             send_frame(connection, {"id": message["id"], "result": {"thread": {
                 **metadata, "turns": histories[thread], "status": {"type": "idle"},
@@ -1024,7 +1040,7 @@ def main() -> None:
         manual_server = threading.Thread(
             target=fake_app_server,
             args=(manual_socket, manual_ready, True, None, {
-                timer_thread: {"cwd": str(target), "turns": manual_turns},
+                timer_thread: {"cwd": str(target), "turns": manual_turns, "loaded": False},
             }),
             daemon=True,
         )
@@ -1215,7 +1231,7 @@ def main() -> None:
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "deferred-initial-harness", "executive-target-resolution",
         "manual-harness-suppression",
-        "schedule-failure-immediate-closeout", "debounce-status",
+        "schedule-failure-immediate-closeout", "cold-task-resume", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",
         "install-default-verification", "self-update",

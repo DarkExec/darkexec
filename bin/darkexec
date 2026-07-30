@@ -480,6 +480,17 @@ class AppServer:
             raise RuntimeError(f"App Server did not return target task {thread_id}")
         return thread
 
+    def resume_thread(self, thread_id: str) -> dict:
+        result = self._request("thread/resume", {"threadId": thread_id})
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        if thread.get("id") != thread_id:
+            raise RuntimeError(f"App Server did not resume target task {thread_id}")
+        return thread
+
+    def require_resumed_thread(self, thread_id: str, cwd: Path) -> dict:
+        self.require_listed_thread(thread_id, cwd)
+        return self.resume_thread(thread_id)
+
     def run_turn(
         self,
         thread_id: str,
@@ -1174,7 +1185,7 @@ def continue_target(args) -> int:
     try:
         with AppServer() as app:
             source_input = requested_input(app, args, executive_thread_id, prompt)
-            thread = app.require_listed_thread(args.thread, target)
+            thread = app.require_resumed_thread(args.thread, target)
             update_execution(executive_thread_id, {
                 "phase": "target_starting",
                 "target": {
@@ -1335,8 +1346,7 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
         return {"status": "failed", "threadId": thread_id, "error": state["error"]}
     try:
         with AppServer() as app:
-            app.require_listed_thread(thread_id, target)
-            thread = app.read_thread(thread_id)
+            thread = app.require_resumed_thread(thread_id, target)
             status, reason, harness_turn_id, harness_result = inspect_closeout(
                 thread, state["productTurnId"]
             )
@@ -1389,8 +1399,7 @@ def arm_debounce(args) -> int:
     if os.environ.get("DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT") != "1":
         try:
             with AppServer() as app:
-                app.require_listed_thread(args.thread, target)
-                thread = app.read_thread(args.thread)
+                thread = app.require_resumed_thread(args.thread, target)
                 preflight_status, reason, harness_turn_id, harness_result = inspect_closeout(
                     thread, args.turn
                 )
@@ -1596,8 +1605,7 @@ def debounce_status(args) -> int:
             try:
                 target = Path(state["targetPath"])
                 with AppServer() as app:
-                    app.require_listed_thread(args.thread, target)
-                    thread = app.read_thread(args.thread)
+                    thread = app.require_resumed_thread(args.thread, target)
                     status, reason, harness_turn_id, harness_result = inspect_closeout(
                         thread, state["productTurnId"]
                     )
@@ -1676,7 +1684,7 @@ def interrupt_recorded_target(state: dict) -> dict:
         return {"attempted": False, "status": "no_target"}
     try:
         with AppServer() as app:
-            thread = app.read_thread(thread_id)
+            thread = app.resume_thread(thread_id)
             turn_id = active_turn_id(thread) or turn_id
             if not turn_id or active_turn_id(thread) is None:
                 return {
