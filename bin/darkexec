@@ -757,12 +757,27 @@ def closeout_executive(receipt: dict, path: Path, app: AppServer) -> None:
     save(path, receipt, receipt["status"])
 
 
+def resolved_route(result_text: str, job_id: str, projects: list[str]) -> Path:
+    prefix = f"DARKEXEC_ROUTE_READY {job_id} "
+    if not result_text.startswith(prefix) or "\n" in result_text:
+        raise RuntimeError("DarkExec target resolver returned an invalid acknowledgement")
+    value = result_text[len(prefix):]
+    if value not in projects:
+        raise RuntimeError("DarkExec target resolver returned an unsaved project")
+    target = Path(value).resolve()
+    if target == WORKSPACE.resolve():
+        raise RuntimeError("DarkExec target resolver selected its own executive workspace")
+    return target
+
+
 def dispatch(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir():
         raise SystemExit(f"target is not a directory: {target}")
     if not saved_project(target):
         raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    if args.resolve_target and target != WORKSPACE.resolve():
+        raise SystemExit("--resolve-target requires the exact DarkExec executive workspace")
     prompt = sys.stdin.read()
     if not prompt.strip():
         raise SystemExit("dispatch requires a non-empty prompt on stdin")
@@ -776,6 +791,8 @@ def dispatch(args) -> int:
         request_material += b"\0" + json.dumps(
             direct_input, sort_keys=True, separators=(",", ":")
         ).encode()
+    if args.resolve_target:
+        request_material += b"\0resolve-target"
     request_sha = hashlib.sha256(request_material).hexdigest()
     harness_mode = "read-only" if args.read_only_harness else "standard"
     initial_harness_mode = "debounce" if args.defer_initial_harness else "immediate"
@@ -792,7 +809,12 @@ def dispatch(args) -> int:
         return 1
     if path.exists():
         prior = load_receipt(path)
-        if prior.get("requestSha256") != request_sha or prior.get("targetPath") != str(target):
+        prior_requested_target = prior.get("requestedTargetPath", prior.get("targetPath"))
+        if (
+            prior.get("requestSha256") != request_sha
+            or prior_requested_target != str(target)
+            or bool(prior.get("targetResolution") == "executive") != bool(args.resolve_target)
+        ):
             raise SystemExit("job id already belongs to a different request or target")
         if (
             prior.get("harnessMode", harness_mode) != harness_mode
@@ -804,21 +826,42 @@ def dispatch(args) -> int:
 
     receipt = {
         "schemaVersion": 1, "jobId": args.job_id, "requestSha256": request_sha,
-        "targetPath": str(target), "transport": "codex-app-server-control-socket",
+        "requestedTargetPath": str(target), "targetPath": str(target),
+        "targetResolution": "executive" if args.resolve_target else "exact",
+        "transport": "codex-app-server-control-socket",
         "harnessMode": harness_mode, "initialHarnessMode": initial_harness_mode,
         "createdAt": now(), "executive": {}, "target": {},
     }
     save(path, receipt, "registering")
     interrupted_exit = None
-    control_prompt = (
-        f"DARKEXEC CONTROL TASK. Register job {args.job_id} for exact saved project {target}. "
-        f"The target request SHA-256 is {request_sha}. Do not inspect files, use tools, or perform "
-        f"the target work. Reply only: DARKEXEC_DISPATCH_READY {args.job_id}"
-    )
+    route_projects = saved_projects() if args.resolve_target else []
+    if args.resolve_target:
+        control_prompt = (
+            f"DARKEXEC ROUTE TASK. Select the one exact saved project that owns job {args.job_id}. "
+            f"Allowed projects: {json.dumps(route_projects)}. "
+            f"Natural request: {json.dumps(prompt)}. "
+            "Use only the supplied request and attachments. Do not inspect files, use tools, start "
+            "DarkExec, or perform the work. "
+            f"Reply only: DARKEXEC_ROUTE_READY {args.job_id} /exact/saved/project"
+        )
+        control_input = [{"type": "text", "text": control_prompt}]
+        if direct_input is not None:
+            control_input.extend(
+                item for item in direct_input if item.get("type") in {"image", "localImage"}
+            )
+    else:
+        control_prompt = (
+            f"DARKEXEC CONTROL TASK. Register job {args.job_id} for exact saved project {target}. "
+            f"The target request SHA-256 is {request_sha}. Do not inspect files, use tools, or perform "
+            f"the target work. Reply only: DARKEXEC_DISPATCH_READY {args.job_id}"
+        )
+        control_input = None
     try:
         with AppServer() as app:
             executive_thread = app.start_thread(WORKSPACE)
-            executive = app.run_turn(executive_thread["id"], control_prompt)
+            executive = app.run_turn(
+                executive_thread["id"], control_prompt, input_items=control_input
+            )
             executive_thread = app.require_listed_thread(executive_thread["id"], WORKSPACE)
             receipt["executive"] = {
                 "threadId": executive_thread["id"], "source": executive_thread.get("source"),
@@ -832,6 +875,19 @@ def dispatch(args) -> int:
                 save(path, receipt, "failed")
                 print(json.dumps(receipt) if args.json else render_status(receipt))
                 return 1
+            if args.resolve_target:
+                try:
+                    target = resolved_route(
+                        executive.get("resultText") or "", args.job_id, route_projects
+                    )
+                except RuntimeError as exc:
+                    receipt["error"] = str(exc)
+                    save(path, receipt, "failed")
+                    print(json.dumps(receipt) if args.json else render_status(receipt))
+                    return 1
+                receipt["targetPath"] = str(target)
+                receipt["resolvedTargetPath"] = str(target)
+                save(path, receipt, "target_resolved")
 
             target_thread = app.start_thread(target)
             receipt["target"] = {
@@ -1915,6 +1971,7 @@ def main() -> int:
     launch.add_argument("--input-json")
     launch.add_argument("--read-only-harness", action="store_true")
     launch.add_argument("--defer-initial-harness", action="store_true")
+    launch.add_argument("--resolve-target", action="store_true")
     launch.add_argument("--json", action="store_true")
     run = sub.add_parser("run")
     run.add_argument("--target", required=True)

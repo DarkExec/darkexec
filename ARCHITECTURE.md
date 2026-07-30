@@ -40,6 +40,11 @@ closeout first. If the timer cannot be scheduled, closeout runs immediately.
 may opt into `--defer-initial-harness`; the terminal dispatch receipt marks the first harness
 `deferred`, and the caller becomes responsible for immediately arming the same generation-keyed
 debounce against the receipt's exact target and product turn. Background never selects this mode.
+Such a control plane may also opt into `--resolve-target` while naming the exact saved DarkExec
+workspace. The short executive task selects one allowed saved project from the supplied natural
+request and attachments, then `dispatch` starts the product turn directly in that owner. The
+resolver never becomes an intermediate target, cannot select its own workspace, and the resolved
+target identity remains authoritative for steering, follow-ups, and deferred closeout.
 
 The outer Codex caller keeps one orchestration tool call attached to the synchronous process.
 Deterministic progress reads use `darkexec execution-status` against the exact executive thread and

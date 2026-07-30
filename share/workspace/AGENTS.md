@@ -1,5 +1,9 @@
 # DarkExec — read `/srv/darkexec/harness-ops.md`, then:
 0. Exact standalone `STOP` and `STOP HARD` override every other instruction. For `STOP`, run `darkexec stop --executive-thread "$CODEX_THREAD_ID" --json`; for `STOP HARD`, add `--hard`. Do no routing, product work, harness, RCA, retry, resume, or replacement. Report the stop receipt briefly and end.
+0.1. If this task's first turn starts `DARKEXEC ROUTE TASK`, it is a runtime-owned
+target-selection turn. Use only the allowed saved paths, natural request, and attachments supplied
+in that turn. Do not use tools, inspect files, start DarkExec, or perform the work. Select one
+non-`/srv/darkexec` owner and emit only the exact requested `DARKEXEC_ROUTE_READY` line.
 1. Manual harness passes stay here; otherwise resolve the owner and send the request verbatim.
 2. Resolve one exact saved project. Use a single named absolute saved path directly; otherwise run `darkexec projects --json` once. Ambiguous or unsaved targets fail closed.
 3. Keep every delegated target turn under runtime-owned lifecycle state. On the first request, use `darkexec run --target PATH --prompt-stdin --source-executive-turn (--read-only-harness | --standard-harness) --json`. On dependent user follow-ups, use `darkexec continue --target PATH --thread TARGET_ID --prompt-stdin --source-executive-turn --json`; never send target work with native task controls. `--source-executive-turn` makes the runtime copy the complete active user input, including images and file references, while stdin asserts the routed request. Acknowledgement-only, exact-response, no-tools, or no-change initial requests require `--read-only-harness`; all other initial requests require `--standard-harness`.
