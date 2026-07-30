@@ -36,6 +36,11 @@ manual harness, newer activity, an active turn, or an interrupted lineage makes 
 without duplicate work. Dependent cross-task work and consequential phase changes flush pending
 closeout first. If the timer cannot be scheduled, closeout runs immediately.
 
+`dispatch` retains immediate first harnessing by default. A trusted conversational control plane
+may opt into `--defer-initial-harness`; the terminal dispatch receipt marks the first harness
+`deferred`, and the caller becomes responsible for immediately arming the same generation-keyed
+debounce against the receipt's exact target and product turn. Background never selects this mode.
+
 The outer Codex caller keeps one orchestration tool call attached to the synchronous process.
 Deterministic progress reads use `darkexec execution-status` against the exact executive thread and
 may be projected through non-model UI notifications without settling that call. Ordinary waiting

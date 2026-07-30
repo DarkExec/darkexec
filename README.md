@@ -117,7 +117,10 @@ follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer th
 trailing harness unless a manual or automatic harness already closed the latest product turn.
 Dependent cross-task work and consequential phase changes flush a pending closeout first. If the
 timer cannot be scheduled, closeout runs immediately. Background and direct CLI runs always harness
-immediately.
+immediately by default. A trusted conversational caller may add `--defer-initial-harness` to
+`darkexec dispatch`; the receipt then returns the first target result with harness status
+`deferred`, and that caller must immediately arm `darkexec debounce` for the exact target turn.
+This opt-in does not change Background or ordinary dispatch behavior.
 
 For direct callers, choose exactly one harness mode:
 
