@@ -781,6 +781,8 @@ def dispatch(args) -> int:
             direct_input, sort_keys=True, separators=(",", ":")
         ).encode()
     request_sha = hashlib.sha256(request_material).hexdigest()
+    harness_mode = "read-only" if args.read_only_harness else "standard"
+    initial_harness_mode = "debounce" if args.defer_initial_harness else "immediate"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = path.with_suffix(".lock").open("a+")
     try:
@@ -796,12 +798,18 @@ def dispatch(args) -> int:
         prior = load_receipt(path)
         if prior.get("requestSha256") != request_sha or prior.get("targetPath") != str(target):
             raise SystemExit("job id already belongs to a different request or target")
+        if (
+            prior.get("harnessMode", harness_mode) != harness_mode
+            or prior.get("initialHarnessMode", initial_harness_mode) != initial_harness_mode
+        ):
+            raise SystemExit("job id already belongs to a different harness mode")
         print(json.dumps(prior) if args.json else render_status(prior))
         return 0 if prior.get("status") == "completed" else 1
 
     receipt = {
         "schemaVersion": 1, "jobId": args.job_id, "requestSha256": request_sha,
         "targetPath": str(target), "transport": "codex-app-server-control-socket",
+        "harnessMode": harness_mode, "initialHarnessMode": initial_harness_mode,
         "createdAt": now(), "executive": {}, "target": {},
     }
     save(path, receipt, "registering")
@@ -859,23 +867,27 @@ def dispatch(args) -> int:
                 print(json.dumps(receipt) if args.json else render_status(receipt))
                 return 1
 
-            save(path, receipt, "harness_running")
-            harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
-            def harness_started(_thread_id: str, turn_id: str) -> None:
-                receipt["target"]["harness"]["turnId"] = turn_id
-                save(path, receipt, "harness_running")
-            harness = app.run_turn(target_thread["id"], harness_prompt, on_started=harness_started)
-            receipt["target"]["harness"] = {
-                "status": "completed" if harness.get("ok") else "failed",
-                "turnId": harness.get("turnId"),
-                "usage": harness.get("usage"), "modelCallCount": harness.get("modelCallCount"),
-                "resultText": harness.get("resultText"), "error": harness.get("error") or None,
-            }
-            if not harness.get("ok"):
-                receipt["error"] = harness.get("error") or "Same-task harness turn failed."
-                save(path, receipt, "failed")
-            else:
+            if args.defer_initial_harness:
+                receipt["target"]["harness"] = {"status": "deferred"}
                 save(path, receipt, "completed")
+            else:
+                save(path, receipt, "harness_running")
+                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
+                def harness_started(_thread_id: str, turn_id: str) -> None:
+                    receipt["target"]["harness"]["turnId"] = turn_id
+                    save(path, receipt, "harness_running")
+                harness = app.run_turn(target_thread["id"], harness_prompt, on_started=harness_started)
+                receipt["target"]["harness"] = {
+                    "status": "completed" if harness.get("ok") else "failed",
+                    "turnId": harness.get("turnId"),
+                    "usage": harness.get("usage"), "modelCallCount": harness.get("modelCallCount"),
+                    "resultText": harness.get("resultText"), "error": harness.get("error") or None,
+                }
+                if not harness.get("ok"):
+                    receipt["error"] = harness.get("error") or "Same-task harness turn failed."
+                    save(path, receipt, "failed")
+                else:
+                    save(path, receipt, "completed")
             closeout_executive(receipt, path, app)
     except DispatchInterrupted as exc:
         receipt["error"] = str(exc)
@@ -1837,6 +1849,7 @@ def main() -> int:
     launch.add_argument("--prompt-stdin", action="store_true", required=True)
     launch.add_argument("--input-json")
     launch.add_argument("--read-only-harness", action="store_true")
+    launch.add_argument("--defer-initial-harness", action="store_true")
     launch.add_argument("--json", action="store_true")
     run = sub.add_parser("run")
     run.add_argument("--target", required=True)

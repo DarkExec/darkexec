@@ -341,6 +341,46 @@ def main() -> None:
         assert conflict.returncode != 0
         server.join(timeout=2)
         assert not server.is_alive()
+        deferred_socket, deferred_ready, deferred_inputs = (
+            root / "deferred-initial.sock", threading.Event(), []
+        )
+        deferred_server = threading.Thread(
+            target=fake_app_server,
+            args=(deferred_socket, deferred_ready, True, None, {}, deferred_inputs),
+            daemon=True,
+        )
+        deferred_server.start(); assert deferred_ready.wait(timeout=2)
+        deferred_command = [
+            str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
+            "--job-id", "incident-deferred-initial", "--prompt-stdin",
+            "--read-only-harness", "--defer-initial-harness", "--json",
+        ]
+        deferred = subprocess.run(
+            deferred_command, input="Conversational request.",
+            capture_output=True, text=True,
+            env={**env, "DARKEXEC_APP_SERVER_SOCKET": str(deferred_socket)}, check=False,
+        )
+        deferred_result = json.loads(deferred.stdout)
+        assert deferred.returncode == 0 and deferred_result["status"] == "completed", deferred_result
+        assert deferred_result["harnessMode"] == "read-only", deferred_result
+        assert deferred_result["initialHarnessMode"] == "debounce", deferred_result
+        assert deferred_result["target"]["harness"]["status"] == "deferred", deferred_result
+        assert deferred_result["target"]["turnId"], deferred_result
+        deferred_text = [
+            item.get("text", "")
+            for turn_input in deferred_inputs
+            for item in turn_input
+            if item.get("type") == "text"
+        ]
+        assert not any("Let's do a harness pass" in text for text in deferred_text), deferred_text
+        deferred_server.join(timeout=2)
+        assert not deferred_server.is_alive()
+        mode_conflict = subprocess.run(
+            [item for item in deferred_command if item != "--defer-initial-harness"],
+            input="Conversational request.", capture_output=True, text=True, env=env, check=False,
+        )
+        assert mode_conflict.returncode != 0
+        assert "different harness mode" in mode_conflict.stderr, mode_conflict.stderr
         dispatch_image = root / "dispatch-image.png"
         dispatch_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         dispatch_input = [
@@ -1055,7 +1095,8 @@ def main() -> None:
         "abandoned-receipt-fail-closed", "background-stop-receipt-resolution",
         "background-closeout-user-turn-suppression",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
-        "manual-harness-suppression", "schedule-failure-immediate-closeout", "debounce-status",
+        "deferred-initial-harness", "manual-harness-suppression",
+        "schedule-failure-immediate-closeout", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "install-default-verification", "self-update",
     ]}))
