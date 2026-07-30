@@ -527,33 +527,31 @@ class AppServer:
             if control:
                 control.open()
             while True:
+                if self.buffer:
+                    message = self._next(deadline)
+                else:
+                    remaining = max(0, reconcile_due - time.monotonic())
+                    if deadline is not None:
+                        remaining = min(remaining, max(0, deadline - time.monotonic()))
+                    readers = [self.sock]
+                    if control and control.listener:
+                        readers.append(control.listener)
+                    readable = select.select(readers, [], [], remaining)[0]
+                    if not readable:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError("App Server response timeout")
+                        if reconcile_request_id is None and turn_id:
+                            self.request_id += 1
+                            reconcile_request_id = self.request_id
+                            self._send({
+                                "jsonrpc": "2.0", "id": reconcile_request_id,
+                                "method": "thread/read",
+                                "params": {"threadId": thread_id, "includeTurns": True},
+                            })
+                        reconcile_due = time.monotonic() + 2
+                        continue
+                    message = self._next(deadline) if self.sock in readable else None
                 if control:
-                    if self.buffer:
-                        message = self._next(deadline)
-                    else:
-                        remaining = max(0, reconcile_due - time.monotonic())
-                        if deadline is not None:
-                            remaining = min(remaining, max(0, deadline - time.monotonic()))
-                        readable = select.select(
-                            [self.sock, control.listener], [], [], remaining
-                        )[0]
-                        if not readable:
-                            if deadline is not None and time.monotonic() >= deadline:
-                                raise TimeoutError("App Server response timeout")
-                            if reconcile_request_id is None and turn_id:
-                                self.request_id += 1
-                                reconcile_request_id = self.request_id
-                                self._send({
-                                    "jsonrpc": "2.0", "id": reconcile_request_id,
-                                    "method": "thread/read",
-                                    "params": {"threadId": thread_id, "includeTurns": True},
-                                })
-                            reconcile_due = time.monotonic() + 2
-                            continue
-                        if control.listener not in readable:
-                            message = self._next(deadline)
-                        else:
-                            message = None
                     for connection, request in control.accept():
                         if (
                             request.get("threadId") != thread_id
@@ -594,8 +592,6 @@ class AppServer:
                         })
                     if message is None:
                         continue
-                else:
-                    message = self._next(deadline)
                 if message is None:
                     continue
                 if message.get("id") == request_id:
