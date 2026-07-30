@@ -44,8 +44,10 @@ debounce against the receipt's exact target and product turn. Background never s
 The outer Codex caller keeps one orchestration tool call attached to the synchronous process.
 Deterministic progress reads use `darkexec execution-status` against the exact executive thread and
 may be projected through non-model UI notifications without settling that call. Ordinary waiting
-does not re-enter the executive model. This preserves the active executive turn and queued
-follow-ups while avoiding repeated full-context polling turns.
+does not re-enter the executive model. The attached App Server wait periodically rereads the exact
+target turn after quiet socket intervals, so a dropped completion notification settles from native
+task truth without a timeout or another model turn. This preserves the active executive turn and
+queued follow-ups while avoiding repeated full-context polling turns.
 
 While a product turn is active, `darkexec steer` delivers one exact executive-scoped instruction
 through a mode-0600 local control socket. The attached runner sends native `turn/steer` on its

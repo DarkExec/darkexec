@@ -134,6 +134,9 @@ def fake_app_server(
                 })
             text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
             history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
+            history["status"] = "completed"
+            if prompt == "COMPLETE_WITHOUT_NOTIFICATION":
+                continue
             send_frame(connection, {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "text": text}}})
             threads[thread] += 12
             multiplier = threads[thread] // 12
@@ -145,7 +148,6 @@ def fake_app_server(
                 }},
             }})
             send_frame(connection, {"method": "turn/completed", "params": {"threadId": thread, "turn": {"id": turn, "status": "completed", "error": None}}})
-            history["status"] = "completed"
         elif method == "turn/interrupt":
             thread = message["params"]["threadId"]
             turn = message["params"]["turnId"]
@@ -686,6 +688,31 @@ def main() -> None:
         assert json.loads(long_result.stdout)["status"] == "completed", long_result.stdout
         long_server.join(timeout=2)
         assert not long_server.is_alive()
+        reconciled_socket, reconciled_ready = root / "reconciled.sock", threading.Event()
+        reconciled_server = threading.Thread(
+            target=fake_app_server, args=(reconciled_socket, reconciled_ready), daemon=True
+        )
+        reconciled_server.start(); assert reconciled_ready.wait(timeout=2)
+        reconciled = subprocess.run(
+            run_command, input="COMPLETE_WITHOUT_NOTIFICATION",
+            capture_output=True, text=True,
+            env={
+                **long_env,
+                "DARKEXEC_APP_SERVER_SOCKET": str(reconciled_socket),
+                "CODEX_THREAD_ID": "10000000-0000-4000-8000-000000000006",
+            },
+            check=False, timeout=8,
+        )
+        assert reconciled.stdout, reconciled.stderr
+        reconciled_result = json.loads(reconciled.stdout)
+        assert reconciled.returncode == 0, reconciled.stderr or reconciled.stdout
+        assert reconciled_result["status"] == "completed", reconciled_result
+        assert (
+            reconciled_result["target"]["resultText"]
+            == "TARGET_OK:COMPLETE_WITHOUT_NOTIFICATION"
+        ), reconciled_result
+        reconciled_server.join(timeout=2)
+        assert not reconciled_server.is_alive()
         signal_socket, signal_server_ready, stalled = root / "signal.sock", threading.Event(), threading.Event()
         signal_server = threading.Thread(
             target=fake_app_server,
@@ -1098,7 +1125,8 @@ def main() -> None:
         "deferred-initial-harness", "manual-harness-suppression",
         "schedule-failure-immediate-closeout", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
-        "unbounded-turn-wait", "install-default-verification", "self-update",
+        "unbounded-turn-wait", "lost-completion-reconciliation",
+        "install-default-verification", "self-update",
     ]}))
 
 
