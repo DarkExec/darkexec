@@ -12,6 +12,7 @@ from pathlib import Path
 STATE_ROOT = Path(os.environ.get("DARKEXEC_STATE_ROOT", "/var/lib/darkexec/jobs"))
 SESSION_ROOT = Path(os.environ.get("DARKEXEC_SESSION_ROOT", "/var/lib/darkexec/sessions"))
 EXECUTION_ROOT = Path(os.environ.get("DARKEXEC_EXECUTION_ROOT", "/var/lib/darkexec/executives"))
+CONTROL_ROOT = Path(os.environ.get("DARKEXEC_CONTROL_ROOT", "/var/lib/darkexec/controls"))
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
 CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
 DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
@@ -61,6 +62,9 @@ def session_path(thread_id: str) -> Path:
 def execution_path(thread_id: str) -> Path:
     return EXECUTION_ROOT / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
 
+def control_path(thread_id: str) -> Path:
+    return CONTROL_ROOT / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.sock"
+
 def process_start_ticks(pid: int) -> int | None:
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
@@ -100,6 +104,45 @@ def update_execution(thread_id: str, changes: dict, create: bool = False) -> dic
         return current
     finally:
         lock.close()
+
+def read_execution(thread_id: str) -> dict:
+    path = execution_path(thread_id)
+    if not path.exists():
+        return {
+            "schemaVersion": 1,
+            "executiveThreadId": thread_id,
+            "status": "not_found",
+            "phase": "idle",
+            "runnerActive": False,
+            "target": {},
+        }
+    lock_path = path.with_suffix(".lock")
+    lock = lock_path.open("a+")
+    os.chmod(lock_path, 0o600)
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        state = load_receipt(path)
+    finally:
+        lock.close()
+    runner = state.get("runner") if isinstance(state.get("runner"), dict) else {}
+    pid = int(runner.get("pid") or 0)
+    return {
+        "schemaVersion": 1,
+        "executiveThreadId": thread_id,
+        "status": state.get("status") or "unknown",
+        "phase": state.get("phase") or "unknown",
+        "mode": state.get("mode"),
+        "targetPath": state.get("targetPath"),
+        "runnerActive": bool(pid and process_start_ticks(pid) == runner.get("startTicks")),
+        "target": {
+            key: value
+            for key, value in (state.get("target") or {}).items()
+            if key in {"threadId", "turnId"} and value
+        },
+        "error": state.get("error"),
+        "createdAt": state.get("createdAt"),
+        "updatedAt": state.get("updatedAt"),
+    }
 
 def begin_execution(
     thread_id: str | None,
@@ -169,6 +212,37 @@ def begin_execution(
 def load_receipt(path: Path) -> dict:
     return json.loads(path.read_text())
 
+def receipt_runner_active(path: Path) -> bool:
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        lock.close()
+
+def wait_for_receipt(path: Path) -> dict:
+    terminal = {"completed", "failed", "interrupted"}
+    while True:
+        receipt = load_receipt(path)
+        if receipt.get("status") in terminal:
+            return receipt
+        if not receipt_runner_active(path):
+            receipt = load_receipt(path)
+            if receipt.get("status") in terminal:
+                return receipt
+            abandoned = dict(receipt)
+            abandoned["receiptStatus"] = receipt.get("status")
+            abandoned["status"] = "abandoned"
+            abandoned["error"] = "nonterminal receipt has no active dispatch owner"
+            return abandoned
+        time.sleep(0.25)
+
 def saved_project(path: Path) -> bool:
     try:
         config = tomllib.loads(CONFIG.read_text())
@@ -201,6 +275,64 @@ def usage(raw: dict | None) -> dict:
 
 def usage_delta(after: dict, before: dict) -> dict:
     return {key: max(0, int(after.get(key) or 0) - int(before.get(key) or 0)) for key in after}
+
+class SteerControl:
+    def __init__(self, executive_thread_id: str):
+        self.path = control_path(executive_thread_id)
+        self.listener: socket.socket | None = None
+
+    def open(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        listener.listen(8)
+        listener.setblocking(False)
+        self.listener = listener
+
+    def accept(self) -> list[tuple[socket.socket, dict]]:
+        accepted = []
+        if not self.listener:
+            return accepted
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except BlockingIOError:
+                return accepted
+            try:
+                connection.settimeout(0.2)
+                raw = connection.recv(65537)
+                if len(raw) > 65536:
+                    raise ValueError("steer request is too large")
+                request = json.loads(raw)
+                if not isinstance(request, dict):
+                    raise ValueError("steer request must be an object")
+                accepted.append((connection, request))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self.respond(connection, {"status": "rejected", "error": str(exc)})
+
+    @staticmethod
+    def respond(connection: socket.socket, payload: dict) -> None:
+        try:
+            connection.sendall((json.dumps(payload) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+    def close(self) -> None:
+        if self.listener:
+            self.listener.close()
+            self.listener = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
 
 class AppServer:
     def __init__(self):
@@ -354,6 +486,7 @@ class AppServer:
         prompt: str,
         on_started=None,
         input_items: list[dict] | None = None,
+        steer_key: str | None = None,
     ) -> dict:
         turn_input = input_items if input_items is not None else [{"type": "text", "text": prompt}]
         self.request_id += 1
@@ -367,9 +500,104 @@ class AppServer:
         messages: list[str] = []
         final_usage = None
         model_calls = 0
+        control = SteerControl(steer_key) if steer_key else None
+        pending_steers: dict[int, socket.socket] = {}
+        reconcile_request_id = None
+        reconcile_due = time.monotonic() + 2
+
+        def completed_result(turn: dict) -> dict:
+            previous = self.thread_usage.get(thread_id, {key: 0 for key in usage({})})
+            current = final_usage or previous
+            self.thread_usage[thread_id] = current
+            result_text = messages[-1] if messages else ""
+            ok = turn.get("status") == "completed" and bool(result_text)
+            self.active_turn = None
+            return {
+                "ok": ok, "timedOut": False, "exitCode": 0 if ok else 1,
+                "threadId": thread_id, "turnId": turn_id,
+                "resultText": result_text[:12000],
+                "usage": usage_delta(current, previous),
+                "modelCallCount": model_calls or None,
+                "error": "" if ok else str(
+                    turn.get("error") or "App task failed without a final response"
+                ),
+            }
+
         try:
+            if control:
+                control.open()
             while True:
-                message = self._next(deadline)
+                if control:
+                    if self.buffer:
+                        message = self._next(deadline)
+                    else:
+                        remaining = max(0, reconcile_due - time.monotonic())
+                        if deadline is not None:
+                            remaining = min(remaining, max(0, deadline - time.monotonic()))
+                        readable = select.select(
+                            [self.sock, control.listener], [], [], remaining
+                        )[0]
+                        if not readable:
+                            if deadline is not None and time.monotonic() >= deadline:
+                                raise TimeoutError("App Server response timeout")
+                            if reconcile_request_id is None and turn_id:
+                                self.request_id += 1
+                                reconcile_request_id = self.request_id
+                                self._send({
+                                    "jsonrpc": "2.0", "id": reconcile_request_id,
+                                    "method": "thread/read",
+                                    "params": {"threadId": thread_id, "includeTurns": True},
+                                })
+                            reconcile_due = time.monotonic() + 2
+                            continue
+                        if control.listener not in readable:
+                            message = self._next(deadline)
+                        else:
+                            message = None
+                    for connection, request in control.accept():
+                        if (
+                            request.get("threadId") != thread_id
+                            or request.get("expectedTurnId") != turn_id
+                            or not isinstance(request.get("body"), str)
+                            or not request["body"].strip()
+                            or len(request["body"]) > 20000
+                        ):
+                            control.respond(connection, {
+                                "status": "rejected",
+                                "error": "active target identity does not match the steer request",
+                            })
+                            continue
+                        try:
+                            steer_input = normalize_input_items(
+                                request.get("inputItems") or [{
+                                    "type": "text", "text": request["body"],
+                                }],
+                                request["body"],
+                                "steer request",
+                            )
+                        except RuntimeError as exc:
+                            control.respond(connection, {
+                                "status": "rejected", "error": str(exc),
+                            })
+                            continue
+                        self.request_id += 1
+                        steer_request_id = self.request_id
+                        pending_steers[steer_request_id] = connection
+                        self._send({
+                            "jsonrpc": "2.0", "id": steer_request_id, "method": "turn/steer",
+                            "params": {
+                                "threadId": thread_id,
+                                "expectedTurnId": turn_id,
+                                "input": steer_input,
+                                "clientUserMessageId": request.get("intentId"),
+                            },
+                        })
+                    if message is None:
+                        continue
+                else:
+                    message = self._next(deadline)
+                if message is None:
+                    continue
                 if message.get("id") == request_id:
                     if message.get("error"):
                         raise RuntimeError(str(message["error"]))
@@ -378,6 +606,40 @@ class AppServer:
                         self.active_turn = (thread_id, turn_id)
                         if on_started:
                             on_started(thread_id, turn_id)
+                    continue
+                if message.get("id") in pending_steers:
+                    connection = pending_steers.pop(message["id"])
+                    if message.get("error"):
+                        control.respond(connection, {
+                            "status": "rejected", "error": str(message["error"]),
+                        })
+                    else:
+                        response_turn = (message.get("result") or {}).get("turnId")
+                        control.respond(connection, {
+                            "status": "acknowledged",
+                            "threadId": thread_id,
+                            "turnId": response_turn,
+                        })
+                    continue
+                if reconcile_request_id is not None and message.get("id") == reconcile_request_id:
+                    reconcile_request_id = None
+                    if not message.get("error"):
+                        thread = (message.get("result") or {}).get("thread") or {}
+                        turn = next(
+                            (
+                                candidate for candidate in thread.get("turns", [])
+                                if candidate.get("id") == turn_id
+                            ),
+                            None,
+                        )
+                        if turn and turn.get("status") != "inProgress":
+                            for item in turn.get("items", []):
+                                if item.get("type") == "agentMessage" and item.get("text"):
+                                    text = str(item["text"])
+                                    if not messages or messages[-1] != text:
+                                        messages.append(text)
+                            return completed_result(turn)
+                    reconcile_due = time.monotonic() + 2
                     continue
                 method = message.get("method")
                 params = message.get("params") if isinstance(message.get("params"), dict) else {}
@@ -395,26 +657,21 @@ class AppServer:
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                     if not turn_id or turn.get("id") != turn_id:
                         continue
-                    previous = self.thread_usage.get(thread_id, {key: 0 for key in usage({})})
-                    current = final_usage or previous
-                    self.thread_usage[thread_id] = current
-                    result_text = messages[-1] if messages else ""
-                    ok = turn.get("status") == "completed" and bool(result_text)
-                    self.active_turn = None
-                    return {
-                        "ok": ok, "timedOut": False, "exitCode": 0 if ok else 1,
-                        "threadId": thread_id, "turnId": turn_id,
-                        "resultText": result_text[:12000],
-                        "usage": usage_delta(current, previous),
-                        "modelCallCount": model_calls or None,
-                        "error": "" if ok else str(turn.get("error") or "App task failed without a final response"),
-                    }
+                    return completed_result(turn)
         except TimeoutError:
             self.interrupt_active()
             return {
                 "ok": False, "timedOut": True, "exitCode": None, "threadId": thread_id,
                 "error": f"Codex App turn exceeded {TURN_TIMEOUT} seconds.",
             }
+        finally:
+            for connection in pending_steers.values():
+                if control:
+                    control.respond(connection, {
+                        "status": "rejected", "error": "target turn ended before steer acknowledgement",
+                    })
+            if control:
+                control.close()
 
     def interrupt_active(self) -> bool:
         if not self.active_turn:
@@ -470,13 +727,33 @@ def closeout_executive(receipt: dict, path: Path, app: AppServer) -> None:
     thread_id = (receipt.get("executive") or {}).get("threadId")
     if not thread_id:
         return
+    thread = app.read_thread(thread_id)
+    existing_turn_ids = {
+        turn.get("id") for turn in thread.get("turns", []) if turn.get("id")
+    }
+    if active_turn_id(thread):
+        receipt["executive"]["closeoutStatus"] = "suppressed_active_user_turn"
+        save(path, receipt, receipt["status"])
+        return
     target_id = (receipt.get("target") or {}).get("threadId") or "unavailable"
     prompt = (
         f"DarkExec job {receipt['jobId']} reached {receipt['status']}. Target task: {target_id}. "
         f"Same-task harness: {((receipt.get('target') or {}).get('harness') or {}).get('status', 'not_started')}. "
         "Do not inspect or change anything. Reply with those identities and statuses only."
     )
-    result = app.run_turn(thread_id, prompt)
+    try:
+        result = app.run_turn(thread_id, prompt)
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError):
+        latest = app.read_thread(thread_id)
+        new_turns = [
+            turn for turn in latest.get("turns", [])
+            if turn.get("id") and turn.get("id") not in existing_turn_ids
+        ]
+        if new_turns:
+            receipt["executive"]["closeoutStatus"] = "suppressed_user_activity"
+            save(path, receipt, receipt["status"])
+            return
+        raise
     receipt["executive"]["closeoutUsage"] = result.get("usage")
     receipt["executive"]["closeoutModelCallCount"] = result.get("modelCallCount")
     receipt["executive"]["closeoutResult"] = result.get("resultText")
@@ -494,7 +771,16 @@ def dispatch(args) -> int:
     if not prompt.strip():
         raise SystemExit("dispatch requires a non-empty prompt on stdin")
     path = receipt_path(args.job_id)
-    request_sha = hashlib.sha256(prompt.encode()).hexdigest()
+    try:
+        direct_input = manifest_input(getattr(args, "input_json", None), prompt)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    request_material = prompt.encode()
+    if direct_input is not None:
+        request_material += b"\0" + json.dumps(
+            direct_input, sort_keys=True, separators=(",", ":")
+        ).encode()
+    request_sha = hashlib.sha256(request_material).hexdigest()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = path.with_suffix(".lock").open("a+")
     try:
@@ -553,7 +839,11 @@ def dispatch(args) -> int:
             def target_started(_thread_id: str, turn_id: str) -> None:
                 receipt["target"]["turnId"] = turn_id
                 save(path, receipt, "target_running")
-            target_result = app.run_turn(target_thread["id"], prompt, on_started=target_started)
+            target_result = app.run_turn(
+                target_thread["id"], prompt, on_started=target_started,
+                input_items=direct_input,
+                steer_key=executive_thread["id"],
+            )
             listed_target = app.require_listed_thread(target_thread["id"], target)
             receipt["target"].update({
                 "source": listed_target.get("source"), "appVisible": True,
@@ -617,31 +907,74 @@ def executive_turn_input(app: AppServer, thread_id: str, prompt: str) -> list[di
         if item.get("type") == "userMessage"
         for entry in item.get("content", [])
     ]
+    return normalize_input_items(content, prompt, "executive turn")
+
+
+def normalize_input_items(
+    content: object, prompt: str, source: str, require_local_files: bool = False
+) -> list[dict]:
+    if not isinstance(content, list) or not content or len(content) > 20:
+        raise RuntimeError(f"{source} must contain between 1 and 20 input items")
     supported = {"text", "image", "localImage"}
-    unsupported = sorted({str(entry.get("type")) for entry in content if entry.get("type") not in supported})
+    unsupported = sorted({
+        str(entry.get("type"))
+        for entry in content
+        if not isinstance(entry, dict) or entry.get("type") not in supported
+    })
     if unsupported:
         raise RuntimeError(
-            f"Executive turn contains unsupported input content: {', '.join(unsupported)}"
+            f"{source} contains unsupported input content: {', '.join(unsupported)}"
         )
     text = "\n".join(
         str(entry.get("text") or "") for entry in content if entry.get("type") == "text"
     )
     if not content or prompt not in text:
-        raise RuntimeError("stdin prompt does not match the active executive user turn")
+        raise RuntimeError(f"stdin prompt does not match the {source} text")
     normalized = []
     for entry in content:
         if entry.get("type") == "text":
             normalized.append({"type": "text", "text": str(entry.get("text") or "")})
         elif entry.get("type") == "image" and entry.get("url"):
+            if len(str(entry["url"])) > 35_000_000:
+                raise RuntimeError(f"{source} image exceeds the encoded size limit")
             image = {"type": "image", "url": entry["url"]}
             if entry.get("detail"):
                 image["detail"] = entry["detail"]
             normalized.append(image)
         elif entry.get("type") == "localImage" and entry.get("path"):
-            normalized.append({"type": "localImage", "path": entry["path"]})
+            path = Path(str(entry["path"])).resolve()
+            if require_local_files:
+                if not path.is_file():
+                    raise RuntimeError(f"{source} local image is not a file: {path}")
+                if path.stat().st_size > 25 * 1024 * 1024:
+                    raise RuntimeError(f"{source} local image exceeds 25 MiB: {path}")
+            normalized.append({"type": "localImage", "path": str(path)})
         else:
-            raise RuntimeError(f"Executive turn has an incomplete {entry.get('type')} input item")
+            raise RuntimeError(f"{source} has an incomplete {entry.get('type')} input item")
     return normalized
+
+
+def manifest_input(path_value: str | None, prompt: str) -> list[dict] | None:
+    if not path_value:
+        return None
+    path = Path(path_value).resolve()
+    if not path.is_file() or path.stat().st_size > 128 * 1024:
+        raise RuntimeError(f"input manifest is unavailable or too large: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read input manifest: {exc}") from exc
+    content = payload.get("input") if isinstance(payload, dict) else None
+    return normalize_input_items(content, prompt, "input manifest", require_local_files=True)
+
+
+def requested_input(app: AppServer, args, executive_thread_id: str | None, prompt: str) -> list[dict] | None:
+    if getattr(args, "source_executive_turn", False):
+        if not executive_thread_id:
+            raise RuntimeError("--source-executive-turn requires an executive task")
+        return executive_turn_input(app, executive_thread_id, prompt)
+    return manifest_input(getattr(args, "input_json", None), prompt)
+
 
 def run_target(args) -> int:
     target = Path(args.target).resolve()
@@ -664,11 +997,7 @@ def run_target(args) -> int:
     interrupted_exit = None
     try:
         with AppServer() as app:
-            source_input = (
-                executive_turn_input(app, executive_thread_id, prompt)
-                if args.source_executive_turn and executive_thread_id
-                else None
-            )
+            source_input = requested_input(app, args, executive_thread_id, prompt)
             thread = app.start_thread(target)
             result["target"] = {
                 "threadId": thread["id"], "source": thread.get("source"),
@@ -690,7 +1019,8 @@ def run_target(args) -> int:
                         "target": {"threadId": thread["id"], "turnId": turn_id},
                     })
             target_result = app.run_turn(
-                thread["id"], prompt, on_started=target_started, input_items=source_input
+                thread["id"], prompt, on_started=target_started, input_items=source_input,
+                steer_key=executive_thread_id,
             )
             listed_thread = app.require_listed_thread(thread["id"], target)
             result["target"].update({
@@ -779,11 +1109,7 @@ def continue_target(args) -> int:
     interrupted_exit = None
     try:
         with AppServer() as app:
-            source_input = (
-                executive_turn_input(app, executive_thread_id, prompt)
-                if args.source_executive_turn
-                else None
-            )
+            source_input = requested_input(app, args, executive_thread_id, prompt)
             thread = app.require_listed_thread(args.thread, target)
             update_execution(executive_thread_id, {
                 "phase": "target_starting",
@@ -799,7 +1125,8 @@ def continue_target(args) -> int:
                     "target": {"threadId": args.thread, "turnId": turn_id},
                 })
             turn = app.run_turn(
-                args.thread, prompt, on_started=turn_started, input_items=source_input
+                args.thread, prompt, on_started=turn_started, input_items=source_input,
+                steer_key=executive_thread_id,
             )
             result["target"].update({
                 "source": thread.get("source"), "appVisible": True,
@@ -865,9 +1192,9 @@ def schedule_timer(state: dict, executable: Path) -> tuple[bool, str]:
     digest = hashlib.sha256(state["threadId"].encode()).hexdigest()[:12]
     state["timerAttempt"] = int(state.get("timerAttempt") or 0) + 1
     unit = f"darkexec-closeout-{digest}-g{state['generation']}-a{state['timerAttempt']}"
-    seconds = int(state["debounceSeconds"])
+    calendar_due = str(state["dueAt"]).replace("T", " ").removesuffix("Z") + " UTC"
     command = [
-        runner, f"--unit={unit}", f"--on-active={seconds}s", "--collect", "--quiet",
+        runner, f"--unit={unit}", f"--on-calendar={calendar_due}", "--collect", "--quiet",
         f"--setenv=DARKEXEC_SESSION_ROOT={SESSION_ROOT}",
         f"--setenv=DARKEXEC_CONFIG={CONFIG}",
         f"--setenv=DARKEXEC_APP_SERVER_SOCKET={APP_SERVER_SOCKET}",
@@ -982,17 +1309,28 @@ def arm_debounce(args) -> int:
             return 0 if preflight_status in {"manual_harness_seen", "superseded"} else 1
     stop_timer(prior.get("timerUnit"))
     generation = int(prior.get("generation") or 0) + 1
+    paused = prior.get("status") == "paused"
     state = {
         "schemaVersion": 1, "threadId": args.thread, "targetPath": str(target),
         "productTurnId": args.turn, "generation": generation,
         "debounceSeconds": args.seconds, "harnessMode": args.harness_mode,
         "harnessPrompt": READ_ONLY_HARNESS_PROMPT if args.harness_mode == "read-only" else HARNESS_PROMPT,
-        "status": "pending", "createdAt": prior.get("createdAt") or now(),
+        "status": "paused" if paused else "pending", "createdAt": prior.get("createdAt") or now(),
         "updatedAt": now(),
-        "dueAt": (datetime.now(timezone.utc) + timedelta(seconds=args.seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "dueAt": None if paused else (
+            datetime.now(timezone.utc) + timedelta(seconds=args.seconds)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "remainingSeconds": args.seconds if paused else None,
     }
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write(path, state)
+    if paused:
+        result = {
+            "status": "paused", "threadId": args.thread, "productTurnId": args.turn,
+            "generation": generation, "remainingSeconds": args.seconds,
+        }
+        print(json.dumps(result) if args.json else f"{args.thread}: harness paused")
+        return 0
     scheduled, error = schedule_timer(state, Path(sys.argv[0]).resolve())
     if scheduled:
         atomic_write(path, state)
@@ -1014,17 +1352,133 @@ def cancel_debounce_thread(thread_id: str) -> dict:
     path = session_path(thread_id)
     if not path.exists():
         return {"status": "absent", "threadId": thread_id}
-    else:
+    lock = path.with_suffix(".lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = load_receipt(path)
         stop_timer(state.get("timerUnit"))
-        state.update({"status": "cancelled", "timerUnit": None, "updatedAt": now()})
+        state.update({
+            "status": "cancelled", "timerUnit": None, "dueAt": None,
+            "remainingSeconds": None, "updatedAt": now(),
+        })
         atomic_write(path, state)
         return {"status": "cancelled", "threadId": thread_id, "generation": state.get("generation")}
+    finally:
+        lock.close()
 
 def cancel_debounce(args) -> int:
     result = cancel_debounce_thread(args.thread)
     print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
     return 0
+
+
+def pending_seconds(state: dict) -> int | None:
+    if state.get("status") == "paused":
+        return max(0, int(state.get("remainingSeconds") or 0))
+    if state.get("status") != "pending" or not state.get("dueAt"):
+        return None
+    try:
+        due = datetime.fromisoformat(str(state["dueAt"]).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int((due - datetime.now(timezone.utc)).total_seconds()))
+
+
+def pause_debounce(args) -> int:
+    path = session_path(args.thread)
+    if not path.exists():
+        result = {"status": "absent", "threadId": args.thread}
+    else:
+        lock = path.with_suffix(".lock").open("a+")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_receipt(path)
+            if state.get("status") == "pending":
+                remaining = pending_seconds(state)
+                stop_timer(state.get("timerUnit"))
+                state.update({
+                    "status": "paused", "timerUnit": None, "dueAt": None,
+                    "remainingSeconds": max(1, remaining or 1), "updatedAt": now(),
+                })
+                atomic_write(path, state)
+            result = {
+                "status": state.get("status"), "threadId": args.thread,
+                "generation": state.get("generation"),
+                "remainingSeconds": pending_seconds(state),
+            }
+        finally:
+            lock.close()
+    print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+    return 0 if result.get("status") == "paused" else 1
+
+
+def resume_debounce(args) -> int:
+    path = session_path(args.thread)
+    if not path.exists():
+        result = {"status": "absent", "threadId": args.thread}
+        print(json.dumps(result) if args.json else f"{args.thread}: absent")
+        return 1
+    lock = path.with_suffix(".lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = load_receipt(path)
+        if state.get("status") != "paused":
+            result = {"status": state.get("status"), "threadId": args.thread}
+            print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+            return 1
+        remaining = max(1, int(state.get("remainingSeconds") or state.get("debounceSeconds") or 1))
+        state.update({
+            "status": "pending", "remainingSeconds": None,
+            "dueAt": (datetime.now(timezone.utc) + timedelta(seconds=remaining))
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "updatedAt": now(),
+        })
+        scheduled, error = schedule_timer(state, Path(sys.argv[0]).resolve())
+        state["timerUnit"] = state.get("timerUnit") if scheduled else None
+        if not scheduled:
+            state["scheduleError"] = error
+        atomic_write(path, state)
+        generation = int(state.get("generation") or 0)
+    finally:
+        lock.close()
+    if scheduled:
+        result = {
+            "status": "pending", "threadId": args.thread, "generation": generation,
+            "dueAt": state["dueAt"], "timerUnit": state.get("timerUnit"),
+        }
+    else:
+        result = fire_debounce(args.thread, generation, Path(sys.argv[0]).resolve())
+        result["scheduleError"] = error
+    print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+    return 0 if result.get("status") in {"pending", "completed", "manual_harness_seen", "superseded"} else 1
+
+
+def closeout_now(args) -> int:
+    path = session_path(args.thread)
+    if not path.exists():
+        result = {"status": "absent", "threadId": args.thread}
+        print(json.dumps(result) if args.json else f"{args.thread}: absent")
+        return 1
+    lock = path.with_suffix(".lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = load_receipt(path)
+        if state.get("status") not in {"pending", "paused"}:
+            result = {"status": state.get("status"), "threadId": args.thread}
+            print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+            return 1
+        stop_timer(state.get("timerUnit"))
+        state.update({
+            "status": "pending", "timerUnit": None, "remainingSeconds": None,
+            "dueAt": now(), "updatedAt": now(),
+        })
+        atomic_write(path, state)
+        generation = int(state.get("generation") or 0)
+    finally:
+        lock.close()
+    result = fire_debounce(args.thread, generation, Path(sys.argv[0]).resolve())
+    print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+    return 0 if result.get("status") in {"completed", "manual_harness_seen", "superseded"} else 1
 
 
 def debounce_status(args) -> int:
@@ -1036,9 +1490,11 @@ def debounce_status(args) -> int:
         result = {
             key: state.get(key) for key in (
                 "schemaVersion", "threadId", "targetPath", "productTurnId", "generation",
-                "status", "dueAt", "timerUnit", "harnessTurnId", "error", "updatedAt",
+                "status", "dueAt", "timerUnit", "harnessTurnId", "harnessResult",
+                "error", "updatedAt",
             )
         }
+        result["remainingSeconds"] = pending_seconds(state)
     print(json.dumps(result) if args.json else (
         f"{args.thread}: {result['status']} due={result.get('dueAt') or '-'} "
         f"harness={result.get('harnessTurnId') or '-'}"
@@ -1105,12 +1561,62 @@ def interrupt_recorded_target(state: dict) -> dict:
             "threadId": thread_id, "turnId": turn_id, "error": str(exc),
         }
 
+def background_stop(executive_thread_id: str, path: Path, args) -> int:
+    receipt = load_receipt(path)
+    target_thread_id = (receipt.get("target") or {}).get("threadId")
+    closeout = cancel_debounce_thread(target_thread_id) if target_thread_id else {
+        "status": "absent", "threadId": None,
+    }
+    live = receipt_runner_active(path)
+    if receipt.get("status") in {"completed", "failed", "interrupted"} or not live:
+        result = {
+            "schemaVersion": 1, "source": "background_job",
+            "jobId": receipt.get("jobId"), "executiveThreadId": executive_thread_id,
+            "targetThreadId": target_thread_id, "status": "already_stopped",
+            "priorStatus": receipt.get("status") if not live else None,
+            "mode": "hard" if args.hard else "clean", "closeout": closeout,
+        }
+        print(json.dumps(result) if args.json else (
+            f"{executive_thread_id}: already stopped target={target_thread_id or '-'}"
+        ))
+        return 0
+    interrupt = interrupt_recorded_target(receipt)
+    deadline = time.monotonic() + (2 if args.hard else 10)
+    while receipt_runner_active(path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    latest = load_receipt(path)
+    live = receipt_runner_active(path)
+    terminal = latest.get("status") in {"completed", "failed", "interrupted"}
+    stopped = not live and terminal
+    result = {
+        "schemaVersion": 1, "source": "background_job",
+        "jobId": latest.get("jobId"), "executiveThreadId": executive_thread_id,
+        "targetThreadId": (latest.get("target") or {}).get("threadId") or target_thread_id,
+        "status": "stopped" if stopped else "partial",
+        "receiptStatus": latest.get("status"),
+        "mode": "hard" if args.hard else "clean",
+        "targetState": interrupt.get("status"),
+        "termSent": False, "killSent": False,
+        "interrupt": interrupt, "closeout": closeout,
+    }
+    print(json.dumps(result) if args.json else (
+        f"{executive_thread_id}: {result['status']} "
+        f"target={result['targetThreadId'] or '-'} target_state={result['targetState']}"
+    ))
+    return 0 if stopped else 1
+
 def stop_execution(args) -> int:
     executive_thread_id = requested_executive_thread(args)
     if not executive_thread_id:
         raise SystemExit("stop requires --executive-thread or CODEX_THREAD_ID")
     path = execution_path(executive_thread_id)
     if not path.exists():
+        try:
+            background_path = find_receipt_path(None, executive_thread_id)
+        except SystemExit:
+            background_path = None
+        if background_path:
+            return background_stop(executive_thread_id, background_path, args)
         result = {
             "schemaVersion": 1, "executiveThreadId": executive_thread_id,
             "status": "no_active_run", "mode": "hard" if args.hard else "clean",
@@ -1201,6 +1707,73 @@ def stop_execution(args) -> int:
     return 0 if stopped else 1
 
 
+def execution_status(args) -> int:
+    executive_thread_id = requested_executive_thread(args)
+    if not executive_thread_id:
+        raise SystemExit("execution-status requires --executive-thread or CODEX_THREAD_ID")
+    result = read_execution(executive_thread_id)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(
+            f"{executive_thread_id}: {result['status']} phase={result['phase']} "
+            f"target={(result.get('target') or {}).get('threadId') or '-'} "
+            f"runner_active={str(result['runnerActive']).lower()}"
+        )
+    return 1 if result["status"] == "not_found" else 0
+
+
+def steer_target(args) -> int:
+    executive_thread_id = requested_executive_thread(args)
+    if not executive_thread_id:
+        raise SystemExit("steer requires --executive-thread or CODEX_THREAD_ID")
+    body = sys.stdin.read()
+    if not body.strip():
+        raise SystemExit("steer requires a non-empty prompt on stdin")
+    if len(body) > 20000:
+        raise SystemExit("steer prompt exceeds 20000 characters")
+    try:
+        input_items = manifest_input(getattr(args, "input_json", None), body)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    path = control_path(executive_thread_id)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(20)
+    try:
+        connection.connect(str(path))
+        connection.sendall((json.dumps({
+            "threadId": args.thread,
+            "expectedTurnId": args.turn,
+            "body": body,
+            "inputItems": input_items,
+            "intentId": args.intent_id,
+        }) + "\n").encode())
+        connection.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(map(len, chunks)) > 65536:
+                raise RuntimeError("steer acknowledgement is too large")
+    except FileNotFoundError:
+        raise SystemExit("target is not accepting same-turn steering")
+    except (ConnectionRefusedError, socket.timeout, OSError) as exc:
+        raise SystemExit(f"cannot deliver same-turn steer: {exc}") from exc
+    finally:
+        connection.close()
+    try:
+        result = json.loads(b"".join(chunks))
+    except json.JSONDecodeError as exc:
+        raise SystemExit("target returned no valid steer acknowledgement") from exc
+    print(json.dumps(result) if args.json else (
+        f"{result.get('status')} target={result.get('threadId') or args.thread} "
+        f"turn={result.get('turnId') or args.turn}"
+    ))
+    return 0 if result.get("status") == "acknowledged" else 1
+
+
 def update_install(args) -> int:
     with tempfile.TemporaryDirectory(prefix="darkexec-update-") as temporary:
         checkout = Path(temporary) / "darkexec"
@@ -1230,12 +1803,12 @@ def update_install(args) -> int:
     return 0
 
 
-def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
+def find_receipt_path(job_id: str | None, thread_id: str | None) -> Path:
     if job_id:
         path = receipt_path(job_id)
         if not path.exists():
             raise SystemExit(f"unknown DarkExec job: {job_id}")
-        return load_receipt(path)
+        return path
     for path in sorted(STATE_ROOT.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         receipt = load_receipt(path)
         ids = {
@@ -1243,9 +1816,8 @@ def find_receipt(job_id: str | None, thread_id: str | None) -> dict:
             (receipt.get("target") or {}).get("threadId"),
         }
         if thread_id in ids:
-            return receipt
+            return path
     raise SystemExit(f"unknown DarkExec thread: {thread_id}")
-
 
 def render_status(receipt: dict) -> str:
     return (
@@ -1263,12 +1835,15 @@ def main() -> int:
     launch.add_argument("--target", required=True)
     launch.add_argument("--job-id", required=True)
     launch.add_argument("--prompt-stdin", action="store_true", required=True)
+    launch.add_argument("--input-json")
     launch.add_argument("--read-only-harness", action="store_true")
     launch.add_argument("--json", action="store_true")
     run = sub.add_parser("run")
     run.add_argument("--target", required=True)
     run.add_argument("--executive-thread")
-    run.add_argument("--source-executive-turn", action="store_true")
+    run_input = run.add_mutually_exclusive_group()
+    run_input.add_argument("--source-executive-turn", action="store_true")
+    run_input.add_argument("--input-json")
     run.add_argument("--prompt-stdin", action="store_true", required=True)
     harness = run.add_mutually_exclusive_group(required=True)
     harness.add_argument("--read-only-harness", action="store_true")
@@ -1278,13 +1853,26 @@ def main() -> int:
     continuation.add_argument("--target", required=True)
     continuation.add_argument("--thread", required=True)
     continuation.add_argument("--executive-thread")
-    continuation.add_argument("--source-executive-turn", action="store_true")
+    continuation_input = continuation.add_mutually_exclusive_group()
+    continuation_input.add_argument("--source-executive-turn", action="store_true")
+    continuation_input.add_argument("--input-json")
     continuation.add_argument("--prompt-stdin", action="store_true", required=True)
     continuation.add_argument("--json", action="store_true")
     stop = sub.add_parser("stop")
     stop.add_argument("--executive-thread")
     stop.add_argument("--hard", action="store_true")
     stop.add_argument("--json", action="store_true")
+    execution_read = sub.add_parser("execution-status")
+    execution_read.add_argument("--executive-thread")
+    execution_read.add_argument("--json", action="store_true")
+    steer = sub.add_parser("steer")
+    steer.add_argument("--executive-thread")
+    steer.add_argument("--thread", required=True)
+    steer.add_argument("--turn", required=True)
+    steer.add_argument("--intent-id", required=True)
+    steer.add_argument("--prompt-stdin", action="store_true", required=True)
+    steer.add_argument("--input-json")
+    steer.add_argument("--json", action="store_true")
     debounce = sub.add_parser("debounce")
     debounce.add_argument("--target", required=True)
     debounce.add_argument("--thread", required=True)
@@ -1292,9 +1880,18 @@ def main() -> int:
     debounce.add_argument("--seconds", type=int, default=1800)
     debounce.add_argument("--harness-mode", choices=("read-only", "standard"), required=True)
     debounce.add_argument("--json", action="store_true")
+    pause = sub.add_parser("debounce-pause")
+    pause.add_argument("--thread", required=True)
+    pause.add_argument("--json", action="store_true")
+    resume = sub.add_parser("debounce-resume")
+    resume.add_argument("--thread", required=True)
+    resume.add_argument("--json", action="store_true")
     cancel = sub.add_parser("debounce-cancel")
     cancel.add_argument("--thread", required=True)
     cancel.add_argument("--json", action="store_true")
+    close_now = sub.add_parser("debounce-now")
+    close_now.add_argument("--thread", required=True)
+    close_now.add_argument("--json", action="store_true")
     debounce_read = sub.add_parser("debounce-status")
     debounce_read.add_argument("--thread", required=True)
     debounce_read.add_argument("--json", action="store_true")
@@ -1309,6 +1906,7 @@ def main() -> int:
     identity = status.add_mutually_exclusive_group(required=True)
     identity.add_argument("--job-id")
     identity.add_argument("--thread")
+    status.add_argument("--wait", action="store_true")
     status.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.command == "dispatch":
@@ -1319,12 +1917,22 @@ def main() -> int:
         return continue_target(args)
     if args.command == "stop":
         return stop_execution(args)
+    if args.command == "execution-status":
+        return execution_status(args)
+    if args.command == "steer":
+        return steer_target(args)
     if args.command == "debounce":
         if args.seconds < 1:
             raise SystemExit("debounce seconds must be positive")
         return arm_debounce(args)
+    if args.command == "debounce-pause":
+        return pause_debounce(args)
+    if args.command == "debounce-resume":
+        return resume_debounce(args)
     if args.command == "debounce-cancel":
         return cancel_debounce(args)
+    if args.command == "debounce-now":
+        return closeout_now(args)
     if args.command == "debounce-status":
         return debounce_status(args)
     if args.command == "_debounce-fire":
@@ -1337,9 +1945,10 @@ def main() -> int:
         return 0
     if args.command == "update":
         return update_install(args)
-    receipt = find_receipt(args.job_id, args.thread)
+    path = find_receipt_path(args.job_id, args.thread)
+    receipt = wait_for_receipt(path) if args.wait else load_receipt(path)
     print(json.dumps(receipt) if args.json else render_status(receipt))
-    return 0
+    return 0 if not args.wait or receipt.get("status") == "completed" else 1
 
 
 if __name__ == "__main__":

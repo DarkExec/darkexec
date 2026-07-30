@@ -7,3 +7,7 @@ host state in public reports.
 DarkExec can create Codex tasks with the authority configured by the operator. It is not an
 authorization system or general sandbox. Only dispatch requests and targets that are already within
 the caller's authority.
+
+Same-turn steering uses an executive-scoped mode-0600 Unix socket that exists only while an
+attached product turn is active. It requires exact target and turn identities and is unavailable
+during harness or synthetic closeout work.

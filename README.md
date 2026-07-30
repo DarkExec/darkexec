@@ -109,7 +109,9 @@ The first interactive result receives an immediate same-task harness pass. Clear
 follow-ups can be queued in the same DarkExec conversation while it runs; they wait for that
 immediate harness, then use `darkexec continue` on the established target. DarkExec rereads each
 active executive turn so attachments are copied with its text instead of relying on the executive
-to reconstruct them. Each completed
+to reconstruct them. Trusted direct callers can supply the same typed `text`, `image`, and
+`localImage` input array through a private `--input-json` manifest; stdin remains the exact text
+assertion and local images are verified before native delivery. Each completed
 follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
 `darkexec debounce`; after the conversation becomes idle, it rereads the target and sends one
 trailing harness unless a manual or automatic harness already closed the latest product turn.
@@ -143,6 +145,34 @@ experiments can remain active for hours. `DARKEXEC_TURN_TIMEOUT` may set an expl
 for bounded callers. A caller timeout or signal is an interrupted run, not a polling strategy or
 permission to issue duplicate work.
 
+The installed Codex executive holds that process inside one long-lived orchestration call. Compact
+progress can be read without model re-entry:
+
+```bash
+darkexec execution-status --executive-thread "$CODEX_THREAD_ID" --json
+```
+
+Progress is a read-only projection of the exact active execution identity. It does not detach,
+resume, retry, or replace work. The full attached-call pattern is installed in
+`/srv/darkexec/README.md`.
+
+Typed control surfaces may deliver new context to an active product turn without waking or
+replacing the executive task:
+
+```bash
+printf '%s' 'Use the repaired database owner discovered by the other incident.' |
+  darkexec steer \
+    --executive-thread EXECUTIVE_TASK_ID \
+    --thread TARGET_TASK_ID \
+    --turn ACTIVE_TURN_ID \
+    --intent-id CALLER_INTENT_ID \
+    --prompt-stdin \
+    --json
+```
+
+The attached runner sends the steer on its existing App Server connection. Exact target/turn
+mismatch, an idle target, or a harness turn fails closed.
+
 Inside the installed executive conversation, exact standalone `STOP` requests an urgent clean stop.
 Exact `STOP HARD` sends the native target interruption immediately and escalates only against the
 verified owned runner after a short grace period. Both commands cancel pending closeout, are
@@ -171,13 +201,27 @@ sudo darkexec status --job-id example-read-only-1 --json
 The job ID is idempotent only for the same target and exact request. Conflicting reuse fails closed.
 Receipts default to `/var/lib/darkexec/jobs` with private permissions.
 
-Interactive trailing-closeout state defaults to `/var/lib/darkexec/sessions`. Inspect or cancel an
+The visible Background control task remains idle while its target runs, so waiting consumes no
+executive model turns. If a dependent user follow-up is posted there, the installed executive
+resolves that control task's immutable receipt and attaches once with `darkexec status --wait`.
+Completion reuses only the receipt's exact target task; failed, interrupted, stale-abandoned, or
+mismatched receipts fail closed. Automatic control-task closeout yields to an active real user turn.
+
+Interactive trailing-closeout state defaults to `/var/lib/darkexec/sessions`. Inspect or control an
 armed closeout by exact target task ID:
 
 ```bash
 darkexec debounce-status --thread TARGET_TASK_ID --json
+darkexec debounce-pause --thread TARGET_TASK_ID --json
+darkexec debounce-resume --thread TARGET_TASK_ID --json
 darkexec debounce-cancel --thread TARGET_TASK_ID --json
+darkexec debounce-now --thread TARGET_TASK_ID --json
 ```
+
+Pause stops the timer and survives later follow-ups; each follow-up refreshes its paused remaining
+window. Resume continues the saved window. Cancel removes the current closeout but deliberately
+does not disable future closeout, so the next completed follow-up arms a new timer. Closeout-now
+stops the timer and runs that generation's exact harness pass immediately.
 
 ## What you can prove
 
@@ -243,7 +287,7 @@ only the documented DarkExec-managed symlinks and release paths.
 
 | Path | Owns |
 | --- | --- |
-| `bin/darkexec` | Dispatch, interactive run/continue/stop, debounce, and status CLI |
+| `bin/darkexec` | Dispatch, interactive run/continue/steer/stop, debounce, and status CLI |
 | `share/workspace/` | Installed Codex App executive project |
 | `share/harness-ops.md` | Pinned operating doctrine |
 | `scripts/install.sh` | Commit-addressed installation with effective-default verification |
