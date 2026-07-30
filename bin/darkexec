@@ -1183,6 +1183,15 @@ def user_text(turn: dict) -> str:
     return "\n".join(chunks)
 
 
+def agent_text(turn: dict) -> str:
+    chunks = [
+        str(item["text"])
+        for item in turn.get("items", [])
+        if item.get("type") == "agentMessage" and item.get("text")
+    ]
+    return "\n".join(chunks)[:12000]
+
+
 def stop_timer(unit: str | None) -> None:
     controller = os.environ.get("DARKEXEC_SYSTEMCTL") or shutil.which("systemctl")
     if not unit or not controller:
@@ -1217,14 +1226,19 @@ def schedule_timer(state: dict, executable: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def inspect_closeout(thread: dict, product_turn_id: str) -> tuple[str, str]:
+def inspect_closeout(
+    thread: dict, product_turn_id: str
+) -> tuple[str, str, str | None, str | None]:
     turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
     index = next((i for i, turn in enumerate(turns) if turn.get("id") == product_turn_id), None)
     if index is None:
-        return "failed", f"recorded product turn {product_turn_id} was not found"
+        return "failed", f"recorded product turn {product_turn_id} was not found", None, None
     product = turns[index]
     if product.get("status") != "completed":
-        return "deferred", f"recorded product turn is {product.get('status') or 'unknown'}"
+        return (
+            "deferred", f"recorded product turn is {product.get('status') or 'unknown'}",
+            None, None,
+        )
     for turn in turns[index + 1:]:
         prompt = user_text(turn)
         lowered = prompt.lower()
@@ -1233,12 +1247,17 @@ def inspect_closeout(thread: dict, product_turn_id: str) -> tuple[str, str]:
             or ("harness pass" in lowered and "harness-ops" in lowered)
             or "harness proof only" in lowered
         ):
-            return "manual_harness_seen", f"harness turn {turn.get('id') or '-'} is {turn.get('status') or 'unknown'}"
+            return (
+                "manual_harness_seen",
+                f"harness turn {turn.get('id') or '-'} is {turn.get('status') or 'unknown'}",
+                turn.get("id"),
+                agent_text(turn) or None,
+            )
         if turn.get("status") not in {"completed", "failed", "interrupted", "cancelled"}:
-            return "deferred", f"newer turn {turn.get('id') or '-'} is active"
+            return "deferred", f"newer turn {turn.get('id') or '-'} is active", None, None
         if prompt:
-            return "superseded", f"newer product turn {turn.get('id') or '-'} exists"
-    return "ready", ""
+            return "superseded", f"newer product turn {turn.get('id') or '-'} exists", None, None
+    return "ready", "", None, None
 
 
 def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
@@ -1262,7 +1281,9 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
         with AppServer() as app:
             app.require_listed_thread(thread_id, target)
             thread = app.read_thread(thread_id)
-            status, reason = inspect_closeout(thread, state["productTurnId"])
+            status, reason, harness_turn_id, harness_result = inspect_closeout(
+                thread, state["productTurnId"]
+            )
             if status == "deferred":
                 state["updatedAt"] = now()
                 state["dueAt"] = (
@@ -1275,9 +1296,15 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
                 atomic_write(path, state)
                 return {"status": state["status"], "threadId": thread_id, "reason": reason, "error": error or None}
             if status != "ready":
-                state.update({"status": status, "reason": reason, "updatedAt": now(), "timerUnit": None})
+                state.update({
+                    "status": status, "reason": reason, "updatedAt": now(), "timerUnit": None,
+                    "harnessTurnId": harness_turn_id, "harnessResult": harness_result,
+                })
                 atomic_write(path, state)
-                return {"status": status, "threadId": thread_id, "reason": reason}
+                return {
+                    "status": status, "threadId": thread_id, "reason": reason,
+                    "harnessTurnId": harness_turn_id, "harnessResult": harness_result,
+                }
             result = app.run_turn(thread_id, state["harnessPrompt"])
             state.update({
                 "status": "completed" if result.get("ok") else "failed",
@@ -1287,7 +1314,9 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
             atomic_write(path, state)
             return {
                 "status": state["status"], "threadId": thread_id,
-                "harnessTurnId": state.get("harnessTurnId"), "error": state.get("error"),
+                "harnessTurnId": state.get("harnessTurnId"),
+                "harnessResult": state.get("harnessResult"),
+                "error": state.get("error"),
             }
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
         state.update({"status": "failed", "error": f"debounced closeout failed: {exc}", "updatedAt": now()})
@@ -1306,13 +1335,25 @@ def arm_debounce(args) -> int:
             with AppServer() as app:
                 app.require_listed_thread(args.thread, target)
                 thread = app.read_thread(args.thread)
-                preflight_status, reason = inspect_closeout(thread, args.turn)
+                preflight_status, reason, harness_turn_id, harness_result = inspect_closeout(
+                    thread, args.turn
+                )
         except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
             raise SystemExit(f"cannot preflight debounced closeout: {exc}") from exc
         if preflight_status != "ready":
             if preflight_status in {"manual_harness_seen", "superseded"}:
                 stop_timer(prior.get("timerUnit"))
-            result = {"status": preflight_status, "threadId": args.thread, "reason": reason}
+            if path.exists() and preflight_status == "manual_harness_seen":
+                prior.update({
+                    "status": preflight_status, "reason": reason, "updatedAt": now(),
+                    "timerUnit": None, "harnessTurnId": harness_turn_id,
+                    "harnessResult": harness_result,
+                })
+                atomic_write(path, prior)
+            result = {
+                "status": preflight_status, "threadId": args.thread, "reason": reason,
+                "harnessTurnId": harness_turn_id, "harnessResult": harness_result,
+            }
             print(json.dumps(result) if args.json else f"{args.thread}: {preflight_status} ({reason})")
             return 0 if preflight_status in {"manual_harness_seen", "superseded"} else 1
     stop_timer(prior.get("timerUnit"))
@@ -1495,6 +1536,34 @@ def debounce_status(args) -> int:
         result = {"status": "absent", "threadId": args.thread}
     else:
         state = load_receipt(path)
+        if state.get("status") == "manual_harness_seen" and not state.get("harnessResult"):
+            try:
+                target = Path(state["targetPath"])
+                with AppServer() as app:
+                    app.require_listed_thread(args.thread, target)
+                    thread = app.read_thread(args.thread)
+                    status, reason, harness_turn_id, harness_result = inspect_closeout(
+                        thread, state["productTurnId"]
+                    )
+                if status == "manual_harness_seen" and harness_result:
+                    lock = path.with_suffix(".lock").open("a+")
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                        latest = load_receipt(path)
+                        if (
+                            latest.get("status") == "manual_harness_seen"
+                            and not latest.get("harnessResult")
+                        ):
+                            latest.update({
+                                "reason": reason, "harnessTurnId": harness_turn_id,
+                                "harnessResult": harness_result, "updatedAt": now(),
+                            })
+                            atomic_write(path, latest)
+                        state = latest
+                    finally:
+                        lock.close()
+            except (KeyError, OSError, RuntimeError, TimeoutError, json.JSONDecodeError):
+                pass
         result = {
             key: state.get(key) for key in (
                 "schemaVersion", "threadId", "targetPath", "productTurnId", "generation",

@@ -959,6 +959,7 @@ def main() -> None:
                     "into fast, reliable, and durable execution. Make sure we are following "
                     "/srv/darkexec/harness-ops.md doctrine."
                 )}]},
+                {"id": "a-harness", "type": "agentMessage", "text": "SECOND HARNESS CLOSEOUT"},
             ]},
         ]
         manual_server = threading.Thread(
@@ -974,9 +975,40 @@ def main() -> None:
             [str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread", timer_thread, "--generation", "2"],
             capture_output=True, text=True, env=manual_env, check=False,
         )
-        assert manual.returncode == 0 and json.loads(manual.stdout)["status"] == "manual_harness_seen", manual.stdout
+        manual_result = json.loads(manual.stdout)
+        assert manual.returncode == 0 and manual_result["status"] == "manual_harness_seen", manual.stdout
+        assert manual_result["harnessTurnId"] == "manual-harness", manual_result
+        assert manual_result["harnessResult"] == "SECOND HARNESS CLOSEOUT", manual_result
         manual_server.join(timeout=2)
         assert not manual_server.is_alive()
+        manual_state_path = (
+            Path(timer_env["DARKEXEC_SESSION_ROOT"])
+            / f"{hashlib.sha256(timer_thread.encode()).hexdigest()}.json"
+        )
+        manual_state = json.loads(manual_state_path.read_text())
+        manual_state["harnessTurnId"] = None
+        manual_state["harnessResult"] = None
+        manual_state_path.write_text(json.dumps(manual_state))
+        repair_socket, repair_ready = root / "repair.sock", threading.Event()
+        repair_server = threading.Thread(
+            target=fake_app_server,
+            args=(repair_socket, repair_ready, True, None, {
+                timer_thread: {"cwd": str(target), "turns": manual_turns},
+            }),
+            daemon=True,
+        )
+        repair_server.start(); assert repair_ready.wait(timeout=2)
+        repair_env = {**timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(repair_socket)}
+        repaired = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "debounce-status", "--thread", timer_thread, "--json"],
+            capture_output=True, text=True, env=repair_env, check=False,
+        )
+        repaired_result = json.loads(repaired.stdout)
+        assert repaired.returncode == 0, repaired.stderr
+        assert repaired_result["harnessTurnId"] == "manual-harness", repaired_result
+        assert repaired_result["harnessResult"] == "SECOND HARNESS CLOSEOUT", repaired_result
+        repair_server.join(timeout=2)
+        assert not repair_server.is_alive()
         fallback_socket, fallback_ready = root / "fallback.sock", threading.Event()
         fallback_turns = [{"id": "product-3", "status": "completed", "items": [
             {"id": "u-product-3", "type": "userMessage", "content": [{"type": "text", "text": "More follow-up work"}]},
