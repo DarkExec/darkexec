@@ -125,6 +125,12 @@ def emit_harness_episode(
     configuration: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Best-effort one-way journal emission; failure never changes target execution."""
+    requested_purpose = source.get("episodePurpose")
+    if requested_purpose not in {"ordinary", "control", "fire_drill", "gym_meta"}:
+        requested_purpose = None
+    episode_purpose = requested_purpose or (
+        "control" if harness_mode == "read-only" else "ordinary"
+    )
     identity = {
         "lifecycle": lifecycle,
         "targetPath": target_path,
@@ -147,6 +153,7 @@ def emit_harness_episode(
         "status": status,
         "terminalAt": now(),
         "harnessMode": harness_mode,
+        "episodePurpose": episode_purpose,
         "harnessLifecycle": lifecycle,
         "generation": generation,
         "runtimeRevision": runtime_revision(),

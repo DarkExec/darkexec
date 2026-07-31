@@ -23,6 +23,8 @@ Every terminal harness lifecycle also publishes one immutable private episode un
 `DARKEXEC_HARNESS_EPISODE_ROOT`. Immediate, deferred, exact manual, read-only, failed, interrupted,
 cancelled/superseded, and pre-harness-negative outcomes retain exact target thread, product turn,
 harness turn, generation, mode, runtime, doctrine, configuration, usage, and terminal identity.
+Each receipt also carries a closed `episodePurpose`: standard work defaults to `ordinary`, read-only
+work defaults to `control`, and trusted owners may explicitly mark `fire_drill` or `gym_meta`.
 This append-only journal is a one-way observability output: write failure is attached to the normal
 receipt or command result and never changes target completion, retry, notification, or verification.
 
