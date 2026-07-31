@@ -28,6 +28,15 @@ work defaults to `control`, and trusted owners may explicitly mark `fire_drill` 
 This append-only journal is a one-way observability output: write failure is attached to the normal
 receipt or command result and never changes target completion, retry, notification, or verification.
 
+`schemas/darkexec-harness-episode.v2.schema.json` is an inactive candidate contract for later
+Harness Efficiency Cycle qualification. It separates target and harness phase clocks, model calls,
+cached and uncached usage, operator interaction counts, and configuration/runtime/doctrine/target/
+exposure identities. Every unavailable measurement is explicit `null`; raw prompts, results, and
+trajectories are outside the closed schema. Runtime emission remains v1 until the existing
+intervention is terminal and Harness Gym publishes an executable profile/schema with an immutable
+profile digest. DarkExec will transport those facts but will not interpret metrics or decide
+comparability, concentration, intervention selection, or qualification.
+
 Codex App owns task history and interaction. Callers own detection, authorization, deduplication,
 scheduling, and external messaging. DarkExec owns execution identity, App visibility, same-task
 closeout, and receipt terminalization.

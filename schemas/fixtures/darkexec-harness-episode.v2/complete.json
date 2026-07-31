@@ -1,0 +1,79 @@
+{
+  "schema": "darkexec.harness-episode/v2",
+  "schemaVersion": 2,
+  "jobId": "darkexec-harness-0123456789abcdef0123456789abcdef",
+  "requestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "episodeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "episodePurpose": "ordinary",
+  "harnessLifecycle": "immediate",
+  "status": "completed",
+  "episodeTerminalAt": "2026-07-31T14:00:30Z",
+  "identities": {
+    "configurationRevision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeRevision": "dddddddddddddddddddddddddddddddddddddddd",
+    "doctrineSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "target": {
+      "ownerId": "DarkExec/darkexec",
+      "path": "/srv/dark/repos/darkexec",
+      "revision": "ffffffffffffffffffffffffffffffffffffffff",
+      "threadId": "target-thread",
+      "turnId": "target-turn"
+    },
+    "harness": {"turnId": "harness-turn"},
+    "exposure": {
+      "state": "exposed",
+      "profileId": "harness-efficiency-cycle/v1",
+      "profileDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "interventionId": "owner-intervention-1",
+      "qualificationContractDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "exposureId": "owner-exposure-1",
+      "source": "owner_supplied"
+    }
+  },
+  "measurements": {
+    "target": {
+      "status": "completed",
+      "startedAt": "2026-07-31T14:00:00Z",
+      "terminalAt": "2026-07-31T14:00:10Z",
+      "modelCallCount": 2,
+      "usage": {
+        "inputTokens": 1000,
+        "cachedInputTokens": 700,
+        "uncachedInputTokens": 300,
+        "outputTokens": 100,
+        "reasoningOutputTokens": 20,
+        "totalTokens": 1120
+      },
+      "timingSource": "darkexec_runtime",
+      "usageSource": "codex_app_turn",
+      "modelCallCountSource": "codex_app_turn"
+    },
+    "harness": {
+      "status": "completed",
+      "startedAt": "2026-07-31T14:00:11Z",
+      "terminalAt": "2026-07-31T14:00:30Z",
+      "modelCallCount": 3,
+      "usage": {
+        "inputTokens": 2200,
+        "cachedInputTokens": 1400,
+        "uncachedInputTokens": 800,
+        "outputTokens": 200,
+        "reasoningOutputTokens": 40,
+        "totalTokens": 2440
+      },
+      "timingSource": "darkexec_runtime",
+      "usageSource": "codex_app_turn",
+      "modelCallCountSource": "codex_app_turn"
+    },
+    "operatorInteractions": {
+      "followUpCount": 1,
+      "correctionCount": 1,
+      "source": "darkexec_control_plane"
+    }
+  },
+  "terminalIdentity": {
+    "kind": "background_dispatch",
+    "eventId": "fixture-event",
+    "generation": null
+  }
+}
