@@ -480,16 +480,24 @@ class AppServer:
             raise RuntimeError(f"App Server did not return target task {thread_id}")
         return thread
 
-    def resume_thread(self, thread_id: str) -> dict:
-        result = self._request("thread/resume", {"threadId": thread_id})
+    def resume_thread(self, thread_id: str, rollout_path: str | None = None) -> dict:
+        params = {"threadId": thread_id}
+        if rollout_path:
+            params["path"] = rollout_path
+        result = self._request("thread/resume", params)
         thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
         if thread.get("id") != thread_id:
             raise RuntimeError(f"App Server did not resume target task {thread_id}")
         return thread
 
     def require_resumed_thread(self, thread_id: str, cwd: Path) -> dict:
-        self.require_listed_thread(thread_id, cwd)
-        return self.resume_thread(thread_id)
+        listed = self.require_listed_thread(thread_id, cwd)
+        rollout_path = listed.get("path")
+        if rollout_path is not None and (
+            not isinstance(rollout_path, str) or not Path(rollout_path).is_absolute()
+        ):
+            raise RuntimeError(f"Task {thread_id} has an invalid persisted rollout path.")
+        return self.resume_thread(thread_id, rollout_path)
 
     def run_turn(
         self,

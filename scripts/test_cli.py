@@ -63,10 +63,16 @@ def fake_app_server(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
     ).encode())
-    threads, listed, histories, materialized, loaded, turns = {}, {}, {}, set(), set(), 0
+    threads, listed, histories, materialized, loaded, required_resume_paths, turns = (
+        {}, {}, {}, set(), set(), {}, 0
+    )
     for thread_id, seed in (seeded_threads or {}).items():
         threads[thread_id] = 0
         listed[thread_id] = {"id": thread_id, "source": "vscode", "cwd": seed["cwd"]}
+        if seed.get("path"):
+            listed[thread_id]["path"] = seed["path"]
+        if seed.get("requirePath"):
+            required_resume_paths[thread_id] = seed["path"]
         histories[thread_id] = list(seed.get("turns") or [])
         materialized.add(thread_id)
         if seed.get("loaded", True):
@@ -107,6 +113,15 @@ def fake_app_server(
             }}})
         elif method == "thread/resume":
             thread = message["params"]["threadId"]
+            if (
+                thread in required_resume_paths
+                and message["params"].get("path") != required_resume_paths[thread]
+            ):
+                send_frame(connection, {
+                    "id": message["id"],
+                    "error": {"code": -32600, "message": f"thread not found: {thread}"},
+                })
+                continue
             loaded.add(thread)
             metadata = listed[thread]
             send_frame(connection, {"id": message["id"], "result": {"thread": {
@@ -1040,7 +1055,10 @@ def main() -> None:
         manual_server = threading.Thread(
             target=fake_app_server,
             args=(manual_socket, manual_ready, True, None, {
-                timer_thread: {"cwd": str(target), "turns": manual_turns, "loaded": False},
+                timer_thread: {
+                    "cwd": str(target), "turns": manual_turns, "loaded": False,
+                    "path": str(root / "persisted-target.jsonl"), "requirePath": True,
+                },
             }),
             daemon=True,
         )
@@ -1231,7 +1249,8 @@ def main() -> None:
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "deferred-initial-harness", "executive-target-resolution",
         "manual-harness-suppression",
-        "schedule-failure-immediate-closeout", "cold-task-resume", "debounce-status",
+        "schedule-failure-immediate-closeout", "cold-task-resume",
+        "persisted-rollout-path-resume", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",
         "install-default-verification", "self-update",

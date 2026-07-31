@@ -31,7 +31,8 @@ assertion, so an executive cannot silently drop an attachment while reconstructi
 queued dependent message remains in the executive task until that immediate harness finishes, then
 reuses the established target and resets one 30-minute systemd timer through `darkexec debounce`.
 Generation-keyed state under `/var/lib/darkexec/sessions` makes stale timers harmless. At expiry the
-runtime resumes the exact persisted target, rereads its history, and sends at most one trailing
+runtime resumes the exact persisted target by both its validated task ID and App-listed rollout
+path, rereads its history, and sends at most one trailing
 harness after the latest product turn; a
 manual harness, newer activity, an active turn, or an interrupted lineage makes it stop or defer
 without duplicate work. Dependent cross-task work and consequential phase changes flush pending
