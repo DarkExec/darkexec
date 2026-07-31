@@ -320,6 +320,7 @@ def main() -> None:
         episode = json.loads(episode_path.read_text())
         assert episode["schema"] == "darkexec.harness-episode/v1", episode
         assert episode["harnessMode"] == "read-only", episode
+        assert episode["episodePurpose"] == "control", episode
         assert episode["target"]["turnId"] == result["target"]["turnId"], episode
         assert episode["target"]["harness"]["turnId"] == result["target"]["harness"]["turnId"], episode
         assert episode["runtimeRevision"] == subprocess.run(
@@ -1229,6 +1230,7 @@ def main() -> None:
             if item["harnessLifecycle"] == "manual"
             and item["target"]["harness"]["turnId"] == "manual-harness"
         )
+        assert manual_episode["episodePurpose"] == "ordinary", manual_episode
         assert manual_episode["generation"] == 2 and manual_episode["status"] == "completed"
         abandoned_generation = next(
             item for item in journal
