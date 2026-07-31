@@ -1,0 +1,7 @@
+{
+  "schema": "darkexec.harness-episode/v2",
+  "schemaVersion": 2,
+  "prompt": "SENTINEL RAW PROMPT MUST BE REJECTED",
+  "trajectory": ["SENTINEL RAW TOOL OUTPUT MUST BE REJECTED"],
+  "resultText": "SENTINEL RAW RESULT MUST BE REJECTED"
+}

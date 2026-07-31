@@ -1,0 +1,79 @@
+{
+  "schema": "darkexec.harness-episode/v2",
+  "schemaVersion": 2,
+  "jobId": "darkexec-harness-fedcba9876543210fedcba9876543210",
+  "requestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "episodeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "episodePurpose": "ordinary",
+  "harnessLifecycle": "deferred",
+  "status": "interrupted",
+  "episodeTerminalAt": null,
+  "identities": {
+    "configurationRevision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "runtimeRevision": "dddddddddddddddddddddddddddddddddddddddd",
+    "doctrineSha256": null,
+    "target": {
+      "ownerId": null,
+      "path": "/srv/unknown",
+      "revision": null,
+      "threadId": null,
+      "turnId": null
+    },
+    "harness": {"turnId": null},
+    "exposure": {
+      "state": "unknown",
+      "profileId": null,
+      "profileDigest": null,
+      "interventionId": null,
+      "qualificationContractDigest": null,
+      "exposureId": null,
+      "source": null
+    }
+  },
+  "measurements": {
+    "target": {
+      "status": null,
+      "startedAt": null,
+      "terminalAt": null,
+      "modelCallCount": null,
+      "usage": {
+        "inputTokens": null,
+        "cachedInputTokens": null,
+        "uncachedInputTokens": null,
+        "outputTokens": null,
+        "reasoningOutputTokens": null,
+        "totalTokens": null
+      },
+      "timingSource": null,
+      "usageSource": null,
+      "modelCallCountSource": null
+    },
+    "harness": {
+      "status": null,
+      "startedAt": null,
+      "terminalAt": null,
+      "modelCallCount": null,
+      "usage": {
+        "inputTokens": null,
+        "cachedInputTokens": null,
+        "uncachedInputTokens": null,
+        "outputTokens": null,
+        "reasoningOutputTokens": null,
+        "totalTokens": null
+      },
+      "timingSource": null,
+      "usageSource": null,
+      "modelCallCountSource": null
+    },
+    "operatorInteractions": {
+      "followUpCount": null,
+      "correctionCount": null,
+      "source": null
+    }
+  },
+  "terminalIdentity": {
+    "kind": "deferred",
+    "eventId": null,
+    "generation": 1
+  }
+}

@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://darkexec.com/schemas/darkexec-harness-episode.v2.schema.json",
+  "title": "Inactive candidate DarkExec harness efficiency episode receipt v2",
+  "$comment": "Contract only. DarkExec continues to emit v1 until an immutable Gym profile is approved and activated.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schemaVersion", "jobId", "requestSha256", "episodeDigest", "episodePurpose",
+    "harnessLifecycle", "status", "episodeTerminalAt", "identities", "measurements",
+    "terminalIdentity"
+  ],
+  "properties": {
+    "schema": {"const": "darkexec.harness-episode/v2"},
+    "schemaVersion": {"const": 2},
+    "jobId": {"type": "string", "pattern": "^darkexec-harness-[a-f0-9]{32}$"},
+    "requestSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "episodeDigest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "episodePurpose": {"enum": ["ordinary", "control", "fire_drill", "gym_meta"]},
+    "harnessLifecycle": {"enum": ["immediate", "deferred", "manual"]},
+    "status": {"enum": ["completed", "failed", "interrupted", "abandoned"]},
+    "episodeTerminalAt": {"type": ["string", "null"], "format": "date-time"},
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configurationRevision", "runtimeRevision", "doctrineSha256", "target", "harness", "exposure"],
+      "properties": {
+        "configurationRevision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "runtimeRevision": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "doctrineSha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ownerId", "path", "revision", "threadId", "turnId"],
+          "properties": {
+            "ownerId": {"type": ["string", "null"]},
+            "path": {"type": "string", "minLength": 1},
+            "revision": {"type": ["string", "null"], "pattern": "^[a-f0-9]{40}$"},
+            "threadId": {"type": ["string", "null"]},
+            "turnId": {"type": ["string", "null"]}
+          }
+        },
+        "harness": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["turnId"],
+          "properties": {"turnId": {"type": ["string", "null"]}}
+        },
+        "exposure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state", "profileId", "profileDigest", "interventionId",
+            "qualificationContractDigest", "exposureId", "source"
+          ],
+          "properties": {
+            "state": {"enum": ["exposed", "unexposed", "unknown"]},
+            "profileId": {"type": ["string", "null"]},
+            "profileDigest": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+            "interventionId": {"type": ["string", "null"]},
+            "qualificationContractDigest": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+            "exposureId": {"type": ["string", "null"]},
+            "source": {"enum": ["owner_supplied", null]}
+          }
+        }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "harness", "operatorInteractions"],
+      "properties": {
+        "target": {"$ref": "#/$defs/phaseMeasurement"},
+        "harness": {"$ref": "#/$defs/phaseMeasurement"},
+        "operatorInteractions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["followUpCount", "correctionCount", "source"],
+          "properties": {
+            "followUpCount": {"type": ["integer", "null"], "minimum": 0},
+            "correctionCount": {"type": ["integer", "null"], "minimum": 0},
+            "source": {"enum": ["darkexec_control_plane", null]}
+          }
+        }
+      }
+    },
+    "terminalIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "eventId", "generation"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "eventId": {"type": ["string", "null"]},
+        "generation": {"type": ["integer", "null"], "minimum": 1}
+      }
+    }
+  },
+  "$defs": {
+    "phaseMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "startedAt", "terminalAt", "modelCallCount", "usage",
+        "timingSource", "usageSource", "modelCallCountSource"
+      ],
+      "properties": {
+        "status": {"enum": ["completed", "failed", "interrupted", "abandoned", "not_started", null]},
+        "startedAt": {"type": ["string", "null"], "format": "date-time"},
+        "terminalAt": {"type": ["string", "null"], "format": "date-time"},
+        "modelCallCount": {"type": ["integer", "null"], "minimum": 0},
+        "usage": {"$ref": "#/$defs/usageMeasurement"},
+        "timingSource": {"enum": ["darkexec_runtime", null]},
+        "usageSource": {"enum": ["codex_app_turn", null]},
+        "modelCallCountSource": {"enum": ["codex_app_turn", null]}
+      }
+    },
+    "usageMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputTokens", "cachedInputTokens", "uncachedInputTokens", "outputTokens",
+        "reasoningOutputTokens", "totalTokens"
+      ],
+      "properties": {
+        "inputTokens": {"type": ["integer", "null"], "minimum": 0},
+        "cachedInputTokens": {"type": ["integer", "null"], "minimum": 0},
+        "uncachedInputTokens": {"type": ["integer", "null"], "minimum": 0},
+        "outputTokens": {"type": ["integer", "null"], "minimum": 0},
+        "reasoningOutputTokens": {"type": ["integer", "null"], "minimum": 0},
+        "totalTokens": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  }
+}
