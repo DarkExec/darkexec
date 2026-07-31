@@ -47,6 +47,8 @@ def fake_app_server(
     stall_ready: threading.Event | None = None,
     seeded_threads: dict[str, dict] | None = None,
     observed_inputs: list[list[dict]] | None = None,
+    stall_harness: bool = False,
+    fail_harness: bool = False,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -148,6 +150,18 @@ def fake_app_server(
             if prompt == "WAIT_FOR_SIGNAL":
                 if stall_ready:
                     stall_ready.set()
+                continue
+            if stall_harness and "harness pass" in prompt.lower():
+                if stall_ready:
+                    stall_ready.set()
+                continue
+            if fail_harness and "harness pass" in prompt.lower():
+                history["status"] = "failed"
+                send_frame(connection, {"method": "turn/completed", "params": {
+                    "threadId": thread, "turn": {
+                        "id": turn, "status": "failed", "error": {"message": "fixture harness failure"},
+                    },
+                }})
                 continue
             if prompt == "WAIT_FOR_STEER":
                 if stall_ready:
@@ -272,6 +286,7 @@ def main() -> None:
             "DARKEXEC_EXECUTION_ROOT": str(root / "executions"),
             "DARKEXEC_CONTROL_ROOT": str(root / "controls"),
             "DARKEXEC_SESSION_ROOT": str(root / "sessions"),
+            "DARKEXEC_HARNESS_EPISODE_ROOT": str(root / "harness-episodes"),
             "DARKEXEC_WORKSPACE": str(workspace), "DARKEXEC_CONFIG": str(config),
             "DARKEXEC_APP_SERVER_SOCKET": str(socket_path),
         }
@@ -301,6 +316,17 @@ def main() -> None:
         assert result["target"]["harness"]["status"] == "completed", result
         assert result["target"]["resultText"] == "TARGET_OK:Natural request.", result
         assert result["cumulativeUsage"]["total"] == 48, result
+        episode_path = Path(result["harnessEpisode"]["path"])
+        episode = json.loads(episode_path.read_text())
+        assert episode["schema"] == "darkexec.harness-episode/v1", episode
+        assert episode["harnessMode"] == "read-only", episode
+        assert episode["target"]["turnId"] == result["target"]["turnId"], episode
+        assert episode["target"]["harness"]["turnId"] == result["target"]["harness"]["turnId"], episode
+        assert episode["runtimeRevision"] == subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+        ).stdout.strip(), episode
+        assert episode_path.stat().st_mode & 0o777 == 0o600
+        assert episode_path.parent.stat().st_mode & 0o777 == 0o700
         second = subprocess.run(command, input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert second.returncode == 0
         assert json.loads(second.stdout)["createdAt"] == result["createdAt"]
@@ -544,6 +570,68 @@ def main() -> None:
         )
         assert missing_mode.returncode != 0, missing_mode
         assert "one of the arguments --read-only-harness --standard-harness is required" in missing_mode.stderr, missing_mode.stderr
+        interrupted_harness_socket = root / "interrupted-harness.sock"
+        interrupted_harness_ready, interrupted_harness_started = threading.Event(), threading.Event()
+        interrupted_harness_server = threading.Thread(
+            target=fake_app_server,
+            args=(interrupted_harness_socket, interrupted_harness_ready, True, interrupted_harness_started, {}, None, True),
+            daemon=True,
+        )
+        interrupted_harness_server.start(); assert interrupted_harness_ready.wait(timeout=2)
+        interrupted_harness_process = subprocess.Popen(
+            [
+                str(ROOT / "bin/darkexec"), "run", "--target", str(target),
+                "--prompt-stdin", "--standard-harness", "--json",
+            ],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={
+                **{key: value for key, value in env.items() if key != "CODEX_THREAD_ID"},
+                "DARKEXEC_APP_SERVER_SOCKET": str(interrupted_harness_socket),
+            },
+        )
+        assert interrupted_harness_process.stdin
+        interrupted_harness_process.stdin.write("Complete product before interrupted harness.")
+        interrupted_harness_process.stdin.close()
+        assert interrupted_harness_started.wait(timeout=3)
+        interrupted_harness_process.send_signal(signal.SIGTERM)
+        interrupted_harness_process.wait(timeout=5)
+        interrupted_harness_result = json.loads(interrupted_harness_process.stdout.read())
+        assert interrupted_harness_process.returncode == 128 + signal.SIGTERM
+        assert interrupted_harness_result["status"] == "interrupted", interrupted_harness_result
+        assert interrupted_harness_result["harness"]["status"] == "interrupted", interrupted_harness_result
+        assert interrupted_harness_result["harness"]["turnId"], interrupted_harness_result
+        interrupted_episode = json.loads(Path(interrupted_harness_result["harnessEpisode"]["path"]).read_text())
+        assert interrupted_episode["status"] == "interrupted", interrupted_episode
+        assert interrupted_episode["target"]["harness"]["turnId"], interrupted_episode
+        interrupted_harness_server.join(timeout=2)
+        failed_harness_socket = root / "failed-harness.sock"
+        failed_harness_ready = threading.Event()
+        failed_target = root / "failed-target"
+        failed_target.mkdir()
+        with config.open("a") as handle:
+            handle.write(f'[projects."{failed_target}"]\ntrust_level = "trusted"\n')
+        failed_harness_server = threading.Thread(
+            target=fake_app_server,
+            args=(failed_harness_socket, failed_harness_ready),
+            kwargs={"fail_harness": True}, daemon=True,
+        )
+        failed_harness_server.start(); assert failed_harness_ready.wait(timeout=2)
+        failed_harness = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "run", "--target", str(failed_target),
+                "--prompt-stdin", "--standard-harness", "--json",
+            ], input="Complete product before failed harness.", capture_output=True, text=True,
+            env={
+                **{key: value for key, value in env.items() if key != "CODEX_THREAD_ID"},
+                "DARKEXEC_APP_SERVER_SOCKET": str(failed_harness_socket),
+            }, check=False,
+        )
+        failed_harness_result = json.loads(failed_harness.stdout)
+        assert failed_harness.returncode == 1 and failed_harness_result["status"] == "failed"
+        assert failed_harness_result["harness"]["status"] == "failed", failed_harness_result
+        failed_episode = json.loads(Path(failed_harness_result["harnessEpisode"]["path"]).read_text())
+        assert failed_episode["status"] == "failed" and failed_episode["target"]["harness"]["turnId"]
+        failed_harness_server.join(timeout=2)
         interactive_executive = "10000000-0000-4000-8000-000000000001"
         executive_input = [
             {"type": "text", "text": "Exact response request."},
@@ -565,6 +653,8 @@ def main() -> None:
         run_env = {
             **env, "DARKEXEC_APP_SERVER_SOCKET": str(run_socket),
             "CODEX_THREAD_ID": interactive_executive,
+            # A missing/broken optional Gym journal must not affect ordinary completion.
+            "DARKEXEC_HARNESS_EPISODE_ROOT": str(config),
         }
         run_command = [
             str(ROOT / "bin/darkexec"), "run", "--target", str(target),
@@ -580,6 +670,8 @@ def main() -> None:
         assert interactive_result["target"]["resultText"] == "TARGET_OK:Exact response request.", interactive_result
         assert interactive_result["target"]["appVisible"] is True, interactive_result
         assert interactive_result["harness"]["status"] == "completed", interactive_result
+        assert interactive_result["harnessEpisode"]["path"] is None, interactive_result
+        assert interactive_result["harnessEpisode"]["error"], interactive_result
         assert run_inputs[0] == executive_input, run_inputs[0]
         interactive_state = json.loads(
             (root / "executions" / f"{hashlib.sha256(interactive_executive.encode()).hexdigest()}.json").read_text()
@@ -1128,6 +1220,30 @@ def main() -> None:
         assert fallback_result["scheduleError"], fallback_result
         fallback_server.join(timeout=2)
         assert not fallback_server.is_alive()
+        journal = [
+            json.loads(path.read_text())
+            for path in (root / "harness-episodes").glob("*.json")
+        ]
+        manual_episode = next(
+            item for item in journal
+            if item["harnessLifecycle"] == "manual"
+            and item["target"]["harness"]["turnId"] == "manual-harness"
+        )
+        assert manual_episode["generation"] == 2 and manual_episode["status"] == "completed"
+        abandoned_generation = next(
+            item for item in journal
+            if item["harnessLifecycle"] == "deferred"
+            and item["generation"] == 1
+            and item["target"]["threadId"] == timer_thread
+        )
+        assert abandoned_generation["status"] == "abandoned", abandoned_generation
+        fallback_episode = next(
+            item for item in journal
+            if item["harnessLifecycle"] == "deferred"
+            and item["target"]["turnId"] == "product-3"
+        )
+        assert fallback_episode["status"] == "completed", fallback_episode
+        assert fallback_episode["target"]["harness"]["turnId"], fallback_episode
         cancelled = subprocess.run(
             [str(ROOT / "bin/darkexec"), "debounce-cancel", "--thread", timer_thread, "--json"],
             capture_output=True, text=True, env=timer_env, check=False,
@@ -1253,6 +1369,8 @@ def main() -> None:
         "persisted-rollout-path-resume", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",
+        "append-only-harness-episode", "manual-deferred-episode-identity",
+        "started-harness-interruption-preserved", "journal-failure-isolated",
         "install-default-verification", "self-update",
     ]}))
 

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://darkexec.com/schemas/darkexec-harness-episode.v1.schema.json",
+  "title": "DarkExec terminal harness episode receipt v1",
+  "type": "object",
+  "required": [
+    "schema", "schemaVersion", "jobId", "requestSha256", "episodeDigest", "targetPath",
+    "status", "terminalAt", "harnessMode", "harnessLifecycle", "runtimeRevision",
+    "doctrineSha256", "configurationRevision", "terminalIdentity", "target"
+  ],
+  "properties": {
+    "schema": {"const": "darkexec.harness-episode/v1"},
+    "schemaVersion": {"const": 1},
+    "jobId": {"type": "string", "pattern": "^darkexec-harness-[a-f0-9]{32}$"},
+    "requestSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "episodeDigest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "targetPath": {"type": "string", "minLength": 1},
+    "status": {"enum": ["completed", "failed", "interrupted", "abandoned"]},
+    "terminalAt": {"type": "string", "format": "date-time"},
+    "harnessMode": {"enum": ["standard", "read-only"]},
+    "harnessLifecycle": {"enum": ["immediate", "deferred", "manual"]},
+    "generation": {"type": ["integer", "null"], "minimum": 1},
+    "runtimeRevision": {"type": "string", "minLength": 1},
+    "doctrineSha256": {"type": ["string", "null"]},
+    "configurationRevision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "terminalIdentity": {"type": "object"},
+    "target": {
+      "type": "object",
+      "required": ["threadId", "turnId", "harness"],
+      "properties": {
+        "threadId": {"type": ["string", "null"]},
+        "turnId": {"type": ["string", "null"]},
+        "usage": {"type": ["object", "null"]},
+        "modelCallCount": {"type": ["integer", "null"]},
+        "resultText": {"type": ["string", "null"]},
+        "harness": {
+          "type": "object",
+          "required": ["status", "turnId"],
+          "properties": {
+            "status": {"type": "string"},
+            "turnId": {"type": ["string", "null"]},
+            "usage": {"type": ["object", "null"]},
+            "modelCallCount": {"type": ["integer", "null"]},
+            "resultText": {"type": ["string", "null"]},
+            "error": {"type": ["string", "null"]}
+          }
+        }
+      }
+    }
+  }
+}

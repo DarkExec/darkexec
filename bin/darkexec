@@ -11,6 +11,9 @@ from pathlib import Path
 
 STATE_ROOT = Path(os.environ.get("DARKEXEC_STATE_ROOT", "/var/lib/darkexec/jobs"))
 SESSION_ROOT = Path(os.environ.get("DARKEXEC_SESSION_ROOT", "/var/lib/darkexec/sessions"))
+HARNESS_EPISODE_ROOT = Path(os.environ.get(
+    "DARKEXEC_HARNESS_EPISODE_ROOT", "/var/lib/darkexec/harness-episodes"
+))
 EXECUTION_ROOT = Path(os.environ.get("DARKEXEC_EXECUTION_ROOT", "/var/lib/darkexec/executives"))
 CONTROL_ROOT = Path(os.environ.get("DARKEXEC_CONTROL_ROOT", "/var/lib/darkexec/controls"))
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
@@ -51,6 +54,125 @@ def atomic_write(path: Path, payload: dict) -> None:
         temporary = Path(handle.name)
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+
+
+def canonical_json(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def runtime_revision() -> str:
+    root = Path(__file__).resolve().parents[1]
+    if len(root.name) == 40 and all(character in "0123456789abcdef" for character in root.name):
+        return root.name
+    completed = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False,
+    )
+    revision = completed.stdout.strip()
+    return revision if len(revision) == 40 else "unknown"
+
+
+def doctrine_sha256() -> str | None:
+    try:
+        return hashlib.sha256(DOCTRINE.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def harness_episode_id(identity: dict) -> tuple[str, str]:
+    digest = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+    return f"darkexec-harness-{digest[:32]}", digest
+
+
+def write_harness_episode_once(payload: dict) -> Path:
+    """Publish one immutable terminal episode without replacing prior evidence."""
+    path = HARNESS_EPISODE_ROOT / f"{hashlib.sha256(payload['jobId'].encode()).hexdigest()}.json"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if path.exists():
+        existing = load_receipt(path)
+        if (
+            existing.get("jobId") != payload.get("jobId")
+            or existing.get("episodeDigest") != payload.get("episodeDigest")
+        ):
+            raise RuntimeError(f"harness episode identity conflict: {payload['jobId']}")
+        return path
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as handle:
+        handle.write(rendered)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    os.chmod(temporary, 0o600)
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        existing = load_receipt(path)
+        if (
+            existing.get("jobId") != payload.get("jobId")
+            or existing.get("episodeDigest") != payload.get("episodeDigest")
+        ):
+            raise RuntimeError(f"harness episode identity conflict: {payload['jobId']}")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def emit_harness_episode(
+    *, lifecycle: str, target_path: str, harness_mode: str, status: str,
+    target: dict, harness: dict, source: dict, generation: int | None = None,
+    configuration: dict | None = None,
+) -> tuple[str | None, str | None]:
+    """Best-effort one-way journal emission; failure never changes target execution."""
+    identity = {
+        "lifecycle": lifecycle,
+        "targetPath": target_path,
+        "targetThreadId": target.get("threadId"),
+        "productTurnId": target.get("turnId"),
+        "harnessTurnId": harness.get("turnId"),
+        "generation": generation,
+    }
+    job_id, episode_digest = harness_episode_id(identity)
+    configuration_revision = hashlib.sha256(
+        canonical_json(configuration or {"lifecycle": lifecycle, "harnessMode": harness_mode}).encode()
+    ).hexdigest()
+    payload = {
+        "schema": "darkexec.harness-episode/v1",
+        "schemaVersion": 1,
+        "jobId": job_id,
+        "requestSha256": episode_digest,
+        "episodeDigest": episode_digest,
+        "targetPath": target_path,
+        "status": status,
+        "terminalAt": now(),
+        "harnessMode": harness_mode,
+        "harnessLifecycle": lifecycle,
+        "generation": generation,
+        "runtimeRevision": runtime_revision(),
+        "doctrineSha256": doctrine_sha256(),
+        "configurationRevision": configuration_revision,
+        "terminalIdentity": source,
+        "target": {
+            "threadId": target.get("threadId"),
+            "turnId": target.get("turnId"),
+            "usage": target.get("usage") or target.get("initialUsage"),
+            "modelCallCount": target.get("modelCallCount"),
+            "resultText": target.get("resultText"),
+            "harness": {
+                "status": harness.get("status") or "not_started",
+                "turnId": harness.get("turnId"),
+                "usage": harness.get("usage"),
+                "modelCallCount": harness.get("modelCallCount"),
+                "resultText": harness.get("resultText"),
+                "error": harness.get("error"),
+            },
+        },
+    }
+    try:
+        return str(write_harness_episode_once(payload)), None
+    except Exception as exc:  # journal availability is never an execution dependency
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def receipt_path(job_id: str) -> Path:
@@ -968,6 +1090,29 @@ def dispatch(args) -> int:
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
         receipt["error"] = f"Native Codex App transport failed: {exc}"
         save(path, receipt, "failed")
+    harness = (receipt.get("target") or {}).get("harness") or {"status": "not_started"}
+    if not (args.defer_initial_harness and harness.get("status") == "deferred"):
+        episode_path, episode_error = emit_harness_episode(
+            lifecycle="immediate",
+            target_path=receipt.get("targetPath") or str(target),
+            harness_mode=harness_mode,
+            status=receipt.get("status") or "failed",
+            target=receipt.get("target") or {},
+            harness=harness,
+            source={
+                "kind": "dispatch",
+                "jobId": args.job_id,
+                "initialHarnessMode": initial_harness_mode,
+            },
+            configuration={
+                "command": "dispatch",
+                "harnessMode": harness_mode,
+                "initialHarnessMode": initial_harness_mode,
+                "targetResolution": receipt.get("targetResolution"),
+            },
+        )
+        receipt["harnessEpisode"] = {"path": episode_path, "error": episode_error}
+        save(path, receipt, receipt.get("status") or "failed")
     print(json.dumps(receipt) if args.json else render_status(receipt))
     if interrupted_exit is not None:
         return interrupted_exit
@@ -1069,6 +1214,7 @@ def run_target(args) -> int:
     if not prompt.strip():
         raise SystemExit("run requires a non-empty prompt on stdin")
     executive_thread_id = requested_executive_thread(args)
+    harness_mode = "read-only" if args.read_only_harness else "standard"
     if args.source_executive_turn and not executive_thread_id:
         raise SystemExit("--source-executive-turn requires --executive-thread or CODEX_THREAD_ID")
     begin_execution(executive_thread_id, target, "initial")
@@ -1118,9 +1264,11 @@ def run_target(args) -> int:
                 result["error"] = target_result.get("error") or "Target task failed."
             else:
                 harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
+                result["harness"] = {"status": "running"}
                 if executive_thread_id:
                     update_execution(executive_thread_id, {"phase": "harness_starting"})
                 def harness_started(_thread_id: str, turn_id: str) -> None:
+                    result["harness"]["turnId"] = turn_id
                     if executive_thread_id:
                         update_execution(executive_thread_id, {
                             "phase": "harness_running",
@@ -1140,11 +1288,17 @@ def run_target(args) -> int:
                     result["error"] = harness.get("error") or "Same-task harness turn failed."
     except DispatchInterrupted as exc:
         result["status"] = "interrupted"
+        if (result.get("harness") or {}).get("turnId"):
+            result["harness"]["status"] = "interrupted"
+            result["harness"]["error"] = str(exc)
         result["error"] = str(exc)
         result["targetInterruptAcknowledged"] = exc.target_interrupt_acknowledged
         interrupted_exit = 128 + exc.signum
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
         result["status"] = "failed"
+        if (result.get("harness") or {}).get("turnId"):
+            result["harness"]["status"] = "failed"
+            result["harness"]["error"] = str(exc)
         result["error"] = f"Native Codex App transport failed: {exc}"
     if executive_thread_id:
         update_execution(executive_thread_id, {
@@ -1162,6 +1316,14 @@ def run_target(args) -> int:
             "targetInterruptAcknowledged": result.get("targetInterruptAcknowledged"),
         })
     result["updatedAt"] = now()
+    episode_path, episode_error = emit_harness_episode(
+        lifecycle="immediate", target_path=str(target), harness_mode=harness_mode,
+        status=result["status"], target=result.get("target") or {},
+        harness=result.get("harness") or {"status": "not_started"},
+        source={"kind": "interactive_run", "executiveThreadId": executive_thread_id},
+        configuration={"command": "run", "harnessMode": harness_mode},
+    )
+    result["harnessEpisode"] = {"path": episode_path, "error": episode_error}
     print(json.dumps(result) if args.json else (
         f"{result['status']} target={(result.get('target') or {}).get('threadId') or '-'} "
         f"harness={(result.get('harness') or {}).get('status', 'not_started')}"
@@ -1184,6 +1346,9 @@ def continue_target(args) -> int:
     if not executive_thread_id:
         raise SystemExit("continue requires --executive-thread or CODEX_THREAD_ID")
     begin_execution(executive_thread_id, target, "continue", args.thread)
+    manual_harness_mode = None if args.source_executive_turn else harness_prompt_mode(prompt)
+    manual_product: dict = {}
+    manual_generation = None
     result = {
         "schemaVersion": 1, "executiveThreadId": executive_thread_id,
         "targetPath": str(target), "transport": "codex-app-server-control-socket",
@@ -1194,6 +1359,21 @@ def continue_target(args) -> int:
         with AppServer() as app:
             source_input = requested_input(app, args, executive_thread_id, prompt)
             thread = app.require_resumed_thread(args.thread, target)
+            if manual_harness_mode:
+                turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+                for candidate in reversed(turns):
+                    if user_text(candidate) and not harness_prompt_mode(user_text(candidate)):
+                        manual_product = {
+                            "threadId": args.thread,
+                            "turnId": candidate.get("id"),
+                            "resultText": agent_text(candidate) or None,
+                        }
+                        break
+                closeout_path = session_path(args.thread)
+                if closeout_path.exists():
+                    closeout_state = load_receipt(closeout_path)
+                    if closeout_state.get("productTurnId") == manual_product.get("turnId"):
+                        manual_generation = closeout_state.get("generation")
             update_execution(executive_thread_id, {
                 "phase": "target_starting",
                 "target": {
@@ -1238,6 +1418,28 @@ def continue_target(args) -> int:
         "targetInterruptAcknowledged": result.get("targetInterruptAcknowledged"),
     })
     result["updatedAt"] = now()
+    if manual_harness_mode:
+        manual_harness = {
+            "status": result["status"],
+            "turnId": (result.get("target") or {}).get("turnId"),
+            "resultText": (result.get("target") or {}).get("resultText"),
+            "usage": (result.get("target") or {}).get("usage"),
+            "modelCallCount": (result.get("target") or {}).get("modelCallCount"),
+            "error": result.get("error"),
+        }
+        episode_path, episode_error = emit_harness_episode(
+            lifecycle="manual", target_path=str(target), harness_mode=manual_harness_mode,
+            status=result["status"], target=manual_product or {
+                "threadId": args.thread, "turnId": None,
+            }, harness=manual_harness, generation=manual_generation,
+            source={
+                "kind": "interactive_manual",
+                "executiveThreadId": executive_thread_id,
+                "targetThreadId": args.thread,
+            },
+            configuration={"command": "continue", "harnessMode": manual_harness_mode},
+        )
+        result["harnessEpisode"] = {"path": episode_path, "error": episode_error}
     print(json.dumps(result) if args.json else (
         f"{result['status']} target={args.thread} "
         f"turn={(result.get('target') or {}).get('turnId') or '-'}"
@@ -1256,6 +1458,15 @@ def user_text(turn: dict) -> str:
             if content.get("type") == "text" and content.get("text"):
                 chunks.append(str(content["text"]))
     return "\n".join(chunks)
+
+
+def harness_prompt_mode(prompt: str) -> str | None:
+    lowered = prompt.lower()
+    if prompt == READ_ONLY_HARNESS_PROMPT or "harness proof only" in lowered:
+        return "read-only"
+    if prompt == HARNESS_PROMPT or ("harness pass" in lowered and "harness-ops" in lowered):
+        return "standard"
+    return None
 
 
 def agent_text(turn: dict) -> str:
@@ -1316,12 +1527,13 @@ def inspect_closeout(
         )
     for turn in turns[index + 1:]:
         prompt = user_text(turn)
-        lowered = prompt.lower()
-        if (
-            prompt in {HARNESS_PROMPT, READ_ONLY_HARNESS_PROMPT}
-            or ("harness pass" in lowered and "harness-ops" in lowered)
-            or "harness proof only" in lowered
-        ):
+        if harness_prompt_mode(prompt):
+            if turn.get("status") not in {"completed", "failed", "interrupted", "cancelled"}:
+                return (
+                    "deferred",
+                    f"manual harness turn {turn.get('id') or '-'} is {turn.get('status') or 'unknown'}",
+                    None, None,
+                )
             return (
                 "manual_harness_seen",
                 f"harness turn {turn.get('id') or '-'} is {turn.get('status') or 'unknown'}",
@@ -1333,6 +1545,52 @@ def inspect_closeout(
         if prompt:
             return "superseded", f"newer product turn {turn.get('id') or '-'} exists", None, None
     return "ready", "", None, None
+
+
+def thread_turn(thread: dict, turn_id: str | None) -> dict:
+    return next(
+        (turn for turn in (thread.get("turns") or []) if turn.get("id") == turn_id), {}
+    )
+
+
+def emit_closeout_episode(
+    state: dict, thread: dict, *, lifecycle: str, status: str,
+    harness_status: str, harness_turn_id: str | None, harness_result: str | None,
+    harness_usage: dict | None = None, harness_model_calls: int | None = None,
+    error: str | None = None,
+) -> tuple[str | None, str | None]:
+    product = thread_turn(thread, state.get("productTurnId"))
+    return emit_harness_episode(
+        lifecycle=lifecycle,
+        target_path=state["targetPath"],
+        harness_mode=state["harnessMode"],
+        status=status,
+        target={
+            "threadId": state["threadId"],
+            "turnId": state.get("productTurnId"),
+            "resultText": agent_text(product) or None,
+        },
+        harness={
+            "status": harness_status,
+            "turnId": harness_turn_id,
+            "usage": harness_usage,
+            "modelCallCount": harness_model_calls,
+            "resultText": harness_result,
+            "error": error,
+        },
+        generation=state.get("generation"),
+        source={
+            "kind": "debounce",
+            "threadId": state["threadId"],
+            "productTurnId": state.get("productTurnId"),
+            "generation": state.get("generation"),
+        },
+        configuration={
+            "command": "debounce",
+            "harnessMode": state["harnessMode"],
+            "debounceSeconds": state.get("debounceSeconds"),
+        },
+    )
 
 
 def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
@@ -1350,8 +1608,15 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
             "status": "failed", "error": f"target is no longer an exact saved Codex project: {target}",
             "updatedAt": now(), "timerUnit": None,
         })
+        episode_path, episode_error = emit_closeout_episode(
+            state, {"turns": []}, lifecycle="deferred", status="failed",
+            harness_status="not_started", harness_turn_id=None, harness_result=None,
+            error=state["error"],
+        )
+        state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
         atomic_write(path, state)
         return {"status": "failed", "threadId": thread_id, "error": state["error"]}
+    thread: dict = {"turns": []}
     try:
         with AppServer() as app:
             thread = app.require_resumed_thread(thread_id, target)
@@ -1367,24 +1632,64 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
                 state["timerUnit"] = state.get("timerUnit") if scheduled else None
                 state["error"] = None if scheduled else error
                 state["status"] = "pending" if scheduled else "failed"
+                if not scheduled:
+                    episode_path, episode_error = emit_closeout_episode(
+                        state, thread, lifecycle="deferred", status="failed",
+                        harness_status="not_started", harness_turn_id=None,
+                        harness_result=None, error=error,
+                    )
+                    state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
                 atomic_write(path, state)
                 return {"status": state["status"], "threadId": thread_id, "reason": reason, "error": error or None}
             if status != "ready":
+                if status == "manual_harness_seen":
+                    observed = thread_turn(thread, harness_turn_id)
+                    observed_status = observed.get("status") or "completed"
+                    terminal_status = "interrupted" if observed_status == "cancelled" else observed_status
+                    episode_path, episode_error = emit_closeout_episode(
+                        state, thread, lifecycle="manual", status=terminal_status,
+                        harness_status=terminal_status, harness_turn_id=harness_turn_id,
+                        harness_result=harness_result,
+                    )
+                else:
+                    episode_path, episode_error = emit_closeout_episode(
+                        state, thread, lifecycle="deferred", status="abandoned",
+                        harness_status="not_started", harness_turn_id=None,
+                        harness_result=None, error=reason,
+                    )
                 state.update({
                     "status": status, "reason": reason, "updatedAt": now(), "timerUnit": None,
                     "harnessTurnId": harness_turn_id, "harnessResult": harness_result,
+                    "harnessEpisode": {"path": episode_path, "error": episode_error},
                 })
                 atomic_write(path, state)
                 return {
                     "status": status, "threadId": thread_id, "reason": reason,
                     "harnessTurnId": harness_turn_id, "harnessResult": harness_result,
                 }
-            result = app.run_turn(thread_id, state["harnessPrompt"])
+            state["harnessStatus"] = "starting"
+            atomic_write(path, state)
+            def harness_started(_thread_id: str, turn_id: str) -> None:
+                state.update({
+                    "harnessStatus": "running", "harnessTurnId": turn_id, "updatedAt": now(),
+                })
+                atomic_write(path, state)
+            result = app.run_turn(thread_id, state["harnessPrompt"], on_started=harness_started)
             state.update({
                 "status": "completed" if result.get("ok") else "failed",
+                "harnessStatus": "completed" if result.get("ok") else "failed",
                 "harnessTurnId": result.get("turnId"), "harnessResult": result.get("resultText"),
+                "harnessUsage": result.get("usage"),
+                "harnessModelCallCount": result.get("modelCallCount"),
                 "error": result.get("error") or None, "updatedAt": now(), "timerUnit": None,
             })
+            episode_path, episode_error = emit_closeout_episode(
+                state, thread, lifecycle="deferred", status=state["status"],
+                harness_status=state["harnessStatus"], harness_turn_id=state.get("harnessTurnId"),
+                harness_result=state.get("harnessResult"), harness_usage=state.get("harnessUsage"),
+                harness_model_calls=state.get("harnessModelCallCount"), error=state.get("error"),
+            )
+            state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
             atomic_write(path, state)
             return {
                 "status": state["status"], "threadId": thread_id,
@@ -1392,8 +1697,30 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
                 "harnessResult": state.get("harnessResult"),
                 "error": state.get("error"),
             }
+    except DispatchInterrupted as exc:
+        started = bool(state.get("harnessTurnId"))
+        state.update({
+            "status": "interrupted", "harnessStatus": "interrupted" if started else "not_started",
+            "error": str(exc), "updatedAt": now(), "timerUnit": None,
+        })
+        episode_path, episode_error = emit_closeout_episode(
+            state, thread, lifecycle="deferred", status="interrupted",
+            harness_status=state["harnessStatus"], harness_turn_id=state.get("harnessTurnId"),
+            harness_result=state.get("harnessResult"), error=state["error"],
+        )
+        state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
+        atomic_write(path, state)
+        return {"status": "interrupted", "threadId": thread_id, "error": state["error"]}
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
         state.update({"status": "failed", "error": f"debounced closeout failed: {exc}", "updatedAt": now()})
+        started = bool(state.get("harnessTurnId"))
+        state["harnessStatus"] = "failed" if started else "not_started"
+        episode_path, episode_error = emit_closeout_episode(
+            state, thread, lifecycle="deferred", status="failed",
+            harness_status=state["harnessStatus"], harness_turn_id=state.get("harnessTurnId"),
+            harness_result=state.get("harnessResult"), error=state["error"],
+        )
+        state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
         atomic_write(path, state)
         return {"status": "failed", "threadId": thread_id, "error": state["error"]}
 
@@ -1417,10 +1744,19 @@ def arm_debounce(args) -> int:
             if preflight_status in {"manual_harness_seen", "superseded"}:
                 stop_timer(prior.get("timerUnit"))
             if path.exists() and preflight_status == "manual_harness_seen":
+                observed = thread_turn(thread, harness_turn_id)
+                observed_status = observed.get("status") or "completed"
+                terminal_status = "interrupted" if observed_status == "cancelled" else observed_status
+                episode_path, episode_error = emit_closeout_episode(
+                    prior, thread, lifecycle="manual", status=terminal_status,
+                    harness_status=terminal_status, harness_turn_id=harness_turn_id,
+                    harness_result=harness_result,
+                )
                 prior.update({
                     "status": preflight_status, "reason": reason, "updatedAt": now(),
                     "timerUnit": None, "harnessTurnId": harness_turn_id,
                     "harnessResult": harness_result,
+                    "harnessEpisode": {"path": episode_path, "error": episode_error},
                 })
                 atomic_write(path, prior)
             result = {
@@ -1429,6 +1765,17 @@ def arm_debounce(args) -> int:
             }
             print(json.dumps(result) if args.json else f"{args.thread}: {preflight_status} ({reason})")
             return 0 if preflight_status in {"manual_harness_seen", "superseded"} else 1
+    if (
+        prior.get("status") in {"pending", "paused"}
+        and prior.get("productTurnId")
+        and prior.get("productTurnId") != args.turn
+    ):
+        episode_path, episode_error = emit_closeout_episode(
+            prior, thread if 'thread' in locals() else {"turns": []},
+            lifecycle="deferred", status="abandoned", harness_status="not_started",
+            harness_turn_id=None, harness_result=None, error="superseded by newer generation",
+        )
+        prior["harnessEpisode"] = {"path": episode_path, "error": episode_error}
     stop_timer(prior.get("timerUnit"))
     generation = int(prior.get("generation") or 0) + 1
     paused = prior.get("status") == "paused"
@@ -1479,6 +1826,17 @@ def cancel_debounce_thread(thread_id: str) -> dict:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = load_receipt(path)
         stop_timer(state.get("timerUnit"))
+        if (
+            state.get("status") in {"pending", "paused"}
+            and state.get("targetPath") and state.get("productTurnId")
+            and state.get("harnessMode")
+        ):
+            episode_path, episode_error = emit_closeout_episode(
+                state, {"turns": []}, lifecycle="deferred", status="abandoned",
+                harness_status="not_started", harness_turn_id=None, harness_result=None,
+                error="debounced closeout cancelled",
+            )
+            state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
         state.update({
             "status": "cancelled", "timerUnit": None, "dueAt": None,
             "remainingSeconds": None, "updatedAt": now(),
