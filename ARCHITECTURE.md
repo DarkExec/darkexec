@@ -19,6 +19,13 @@ background:  darkexec dispatch -> running Codex App control socket
 harness, usage, and terminal state under `DARKEXEC_STATE_ROOT`. Interactive debounce state is
 separate under `DARKEXEC_SESSION_ROOT` and is readable with `darkexec debounce-status`.
 
+Every terminal harness lifecycle also publishes one immutable private episode under
+`DARKEXEC_HARNESS_EPISODE_ROOT`. Immediate, deferred, exact manual, read-only, failed, interrupted,
+cancelled/superseded, and pre-harness-negative outcomes retain exact target thread, product turn,
+harness turn, generation, mode, runtime, doctrine, configuration, usage, and terminal identity.
+This append-only journal is a one-way observability output: write failure is attached to the normal
+receipt or command result and never changes target completion, retry, notification, or verification.
+
 Codex App owns task history and interaction. Callers own detection, authorization, deduplication,
 scheduling, and external messaging. DarkExec owns execution identity, App visibility, same-task
 closeout, and receipt terminalization.
@@ -88,6 +95,7 @@ and repairs a missing or broken binding.
 - the authenticated running Codex App and its control socket;
 - exact saved-project roots;
 - durable local receipt state;
+- append-only terminal harness episode identity;
 - executive-scoped active-run identity and verified process ownership;
 - executive-scoped same-turn steering sockets;
 - signal and timeout terminalization;

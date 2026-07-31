@@ -4,6 +4,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; commit="$(git -C "$root
 install="${DARKEXEC_INSTALL_ROOT:-/opt/darkexec}"; release="$install/releases/$commit"; workspace="${DARKEXEC_WORKSPACE:-/srv/darkexec}"
 bin_path="${DARKEXEC_BIN_PATH:-/usr/local/bin/darkexec}"; host_doctrine="${DARKEXEC_HOST_DOCTRINE_PATH:-/srv/harness-ops.md}"
 execution_root="${DARKEXEC_EXECUTION_ROOT:-/var/lib/darkexec/executives}"
+harness_episode_root="${DARKEXEC_HARNESS_EPISODE_ROOT:-/var/lib/darkexec/harness-episodes}"
 "$root/scripts/validate.sh"; mkdir -p "$install/releases" "$workspace"
 [[ -d "$release" ]] || { git clone --quiet --no-local "$root" "$release"; git -C "$release" checkout --quiet --detach "$commit"; }
 "$release/scripts/verify_install_contract.py" "$release/bin/darkexec" >/dev/null
@@ -12,7 +13,7 @@ ln -sfn "$install/current/share/workspace/AGENTS.md" "$workspace/AGENTS.md"; ln 
 ln -sfn "$install/current/share/harness-ops.md" "$workspace/harness-ops.md"
 [[ -e "$host_doctrine" ]] || ln -sfn "$workspace/harness-ops.md" "$host_doctrine"
 mkdir -p "$(dirname "$bin_path")"; ln -sfn "$install/current/bin/darkexec" "$bin_path"
-mkdir -p "$execution_root"; chmod 0700 "$execution_root"
+mkdir -p "$execution_root" "$harness_episode_root"; chmod 0700 "$execution_root" "$harness_episode_root"
 doctrine_sha="$(sha256sum "$release/share/harness-ops.md" | awk '{print $1}')"
-printf '{"commit":"%s","workspace":"%s","binPath":"%s","doctrineSha256":"%s","turnTimeoutDefault":0,"stopControl":true,"executionRoot":"%s","nextAction":"Open %s in Codex App and send the outcome you want."}\n' \
-  "$commit" "$workspace" "$bin_path" "$doctrine_sha" "$execution_root" "$workspace"
+printf '{"commit":"%s","workspace":"%s","binPath":"%s","doctrineSha256":"%s","turnTimeoutDefault":0,"stopControl":true,"executionRoot":"%s","harnessEpisodeRoot":"%s","nextAction":"Open %s in Codex App and send the outcome you want."}\n' \
+  "$commit" "$workspace" "$bin_path" "$doctrine_sha" "$execution_root" "$harness_episode_root" "$workspace"

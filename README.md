@@ -240,6 +240,7 @@ execution lifecycle reached a terminal state”:
 | Executive and target task IDs, where applicable | Trace the exact native Codex App work |
 | App-listed project roots | Prove the work ran under the intended owner |
 | Target and same-task harness results | Separate product completion from lifecycle closeout |
+| `/var/lib/darkexec/harness-episodes` | Immutable private terminal harness evidence for optional evaluation |
 | Per-task model usage | Measure executive and target cost independently |
 | Terminal status, error, and timestamps | Make supervision and recovery deterministic |
 | Release and doctrine identity | Tie runtime behavior to exact installed artifacts |
