@@ -773,6 +773,44 @@ def main() -> None:
         assert "PRIVATE DIRECT FOLLOW-UP" not in target_status_result.stdout
         target_status_server.join(timeout=2)
         assert not target_status_server.is_alive()
+        target_input_socket, target_input_ready = root / "target-input.sock", threading.Event()
+        target_input_server = threading.Thread(
+            target=fake_app_server,
+            args=(target_input_socket, target_input_ready, True, None, {
+                status_target_thread: {"cwd": str(target), "turns": [
+                    {"id": "baseline-turn", "status": "completed", "items": [
+                        {"id": "baseline-user", "type": "userMessage", "content": [
+                            {"type": "text", "text": "Original product work"},
+                        ]},
+                    ]},
+                    {"id": "direct-turn", "status": "inProgress", "items": [
+                        {"id": "direct-user", "type": "userMessage", "content": [
+                            {"type": "text", "text": "PRIVATE DIRECT FOLLOW-UP"},
+                        ]},
+                    ]},
+                ]},
+            }),
+            daemon=True,
+        )
+        target_input_server.start(); assert target_input_ready.wait(timeout=2)
+        target_input_result = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "target-status", "--target", str(target),
+                "--thread", status_target_thread, "--after-turn", "baseline-turn",
+                "--include-input", "--json",
+            ],
+            capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(target_input_socket)},
+            check=False,
+        )
+        target_input_payload = json.loads(target_input_result.stdout)
+        assert target_input_result.returncode == 0, target_input_result.stderr
+        assert (
+            target_input_payload["newerTurn"]["inputText"] == "PRIVATE DIRECT FOLLOW-UP"
+        ), target_input_payload
+        assert target_input_payload["newerTurns"] == [target_input_payload["newerTurn"]]
+        target_input_server.join(timeout=2)
+        assert not target_input_server.is_alive()
         direct_image = root / "direct-image.png"
         direct_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         direct_manifest = root / "direct-input.json"
@@ -1419,7 +1457,8 @@ def main() -> None:
         "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
         "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
-        "interactive-execution-status", "privacy-safe-target-status", "direct-structured-input",
+        "interactive-execution-status", "privacy-safe-target-status",
+        "bounded-native-input-reconciliation", "direct-structured-input",
         "attached-same-turn-steer",
         "runtime-owned-follow-up",
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
