@@ -41,6 +41,12 @@ Codex App owns task history and interaction. Callers own detection, authorizatio
 scheduling, and external messaging. DarkExec owns execution identity, App visibility, same-task
 closeout, and receipt terminalization.
 
+A trusted control plane may inspect an exact saved target task with `darkexec target-status`. The
+bounded result reports only whether a newer user turn exists plus its identity, lifecycle status,
+and product-or-harness classification. It never returns prompt or result content. This lets a
+control plane reconcile native Codex App follow-ups without reconstructing the transcript or
+opening raw App Server access.
+
 Interactive routing uses runtime-owned `run` and `continue` commands so each executive, runner,
 target task, and active turn is durably bound before waiting. The first target result is harnessed
 immediately. For delegated user turns, the runtime rereads the one active executive turn and clones

@@ -2249,6 +2249,48 @@ def execution_status(args) -> int:
     return 1 if result["status"] == "not_found" else 0
 
 
+def target_status(args) -> int:
+    target = Path(args.target).resolve()
+    if not target.is_dir() or not saved_project(target):
+        raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    try:
+        with AppServer() as app:
+            thread = app.require_resumed_thread(args.thread, target)
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot inspect target task: {exc}") from exc
+    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+    baseline = next(
+        (index for index, turn in enumerate(turns) if turn.get("id") == args.after_turn),
+        None,
+    )
+    if baseline is None:
+        raise SystemExit(f"recorded product turn {args.after_turn} was not found")
+    newer = None
+    for turn in turns[baseline + 1:]:
+        prompt = user_text(turn)
+        if not prompt:
+            continue
+        newer = {
+            "turnId": turn.get("id"),
+            "turnStatus": turn.get("status") or "unknown",
+            "turnKind": "harness" if harness_prompt_mode(prompt) else "product",
+        }
+    result = {
+        "schemaVersion": 1,
+        "threadId": args.thread,
+        "targetPath": str(target),
+        "baselineTurnId": args.after_turn,
+        "status": "newer_turn" if newer else "unchanged",
+        "newerTurn": newer,
+    }
+    print(json.dumps(result) if args.json else (
+        f"{args.thread}: {result['status']} "
+        f"turn={(newer or {}).get('turnId') or '-'} "
+        f"turn_status={(newer or {}).get('turnStatus') or '-'}"
+    ))
+    return 0
+
+
 def steer_target(args) -> int:
     executive_thread_id = requested_executive_thread(args)
     if not executive_thread_id:
@@ -2393,6 +2435,11 @@ def main() -> int:
     execution_read = sub.add_parser("execution-status")
     execution_read.add_argument("--executive-thread")
     execution_read.add_argument("--json", action="store_true")
+    target_read = sub.add_parser("target-status")
+    target_read.add_argument("--target", required=True)
+    target_read.add_argument("--thread", required=True)
+    target_read.add_argument("--after-turn", required=True)
+    target_read.add_argument("--json", action="store_true")
     steer = sub.add_parser("steer")
     steer.add_argument("--executive-thread")
     steer.add_argument("--thread", required=True)
@@ -2447,6 +2494,8 @@ def main() -> int:
         return stop_execution(args)
     if args.command == "execution-status":
         return execution_status(args)
+    if args.command == "target-status":
+        return target_status(args)
     if args.command == "steer":
         return steer_target(args)
     if args.command == "debounce":
