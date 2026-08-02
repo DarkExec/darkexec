@@ -1151,19 +1151,31 @@ def normalize_input_items(
     if not isinstance(content, list) or not content or len(content) > 20:
         raise RuntimeError(f"{source} must contain between 1 and 20 input items")
     supported = {"text", "image", "localImage"}
+    if any(not isinstance(entry, dict) for entry in content):
+        raise RuntimeError(f"{source} input items must be objects")
     unsupported = sorted({
-        str(entry.get("type"))
-        for entry in content
-        if not isinstance(entry, dict) or entry.get("type") not in supported
+        str(entry.get("type")) for entry in content if entry.get("type") not in supported
     })
     if unsupported:
         raise RuntimeError(
             f"{source} contains unsupported input content: {', '.join(unsupported)}"
         )
-    text = "\n".join(
+    text_items = [
         str(entry.get("text") or "") for entry in content if entry.get("type") == "text"
+    ]
+    text = "\n".join(text_items)
+    annotations = text.removeprefix(f"{prompt}\n\n").splitlines()
+    annotations_match = (
+        len(text_items) == 1
+        and text.startswith(f"{prompt}\n\n")
+        and bool(annotations)
+        and all(
+            (line.startswith('Attached image: "') and line.endswith('"'))
+            or (line.startswith('Attached file: "') and '" at ' in line)
+            for line in annotations
+        )
     )
-    if not content or prompt not in text:
+    if text != prompt and not annotations_match:
         raise RuntimeError(f"stdin prompt does not match the {source} text")
     normalized = []
     for entry in content:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline contract test for dispatch, status, idempotency, and same-task harness."""
 
-import base64, fcntl, hashlib, json, os, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import base64, fcntl, hashlib, json, os, runpy, signal, socket, struct, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -248,6 +248,31 @@ def fake_app_server(
 def main() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
+        normalize_input_items = runpy.run_path(str(ROOT / "bin/darkexec"))["normalize_input_items"]
+        attachment_input = [
+            {"type": "text", "text": 'Approve release.\n\nAttached image: "logo.png"'},
+            {"type": "localImage", "path": "/tmp/logo.png"},
+        ]
+        assert normalize_input_items(
+            attachment_input, "Approve release.", "input manifest"
+        ) == attachment_input
+        for invalid_content, error in (
+            ([42], "input manifest input items must be objects"),
+            (
+                [{"type": "text", "text": "Do not approve release."}],
+                "stdin prompt does not match the input manifest text",
+            ),
+            (
+                [{"type": "text", "text": "Approve release.\nActually, do not approve."}],
+                "stdin prompt does not match the input manifest text",
+            ),
+        ):
+            try:
+                normalize_input_items(invalid_content, "approve release.", "input manifest")
+            except RuntimeError as exc:
+                assert str(exc) == error, exc
+            else:
+                raise AssertionError(f"accepted invalid structured input: {invalid_content}")
         install_contract = subprocess.run(
             [str(ROOT / "scripts/verify_install_contract.py"), str(ROOT / "bin/darkexec")],
             capture_output=True, text=True, check=False,
@@ -503,7 +528,7 @@ def main() -> None:
         dispatch_image = root / "dispatch-image.png"
         dispatch_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         dispatch_input = [
-            {"type": "text", "text": "Attachment dispatch.\n\nAttached image: logo.png"},
+            {"type": "text", "text": 'Attachment dispatch.\n\nAttached image: "logo.png"'},
             {"type": "localImage", "path": str(dispatch_image)},
         ]
         dispatch_manifest = root / "dispatch-input.json"
@@ -713,7 +738,7 @@ def main() -> None:
         direct_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         direct_manifest = root / "direct-input.json"
         direct_input = [
-            {"type": "text", "text": "Direct attachment request.\n\nAttached image: logo.png"},
+            {"type": "text", "text": 'Direct attachment request.\n\nAttached image: "logo.png"'},
             {"type": "localImage", "path": str(direct_image)},
         ]
         direct_manifest.write_text(json.dumps({"schemaVersion": 1, "input": direct_input}))
