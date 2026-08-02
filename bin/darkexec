@@ -2278,6 +2278,11 @@ def target_status(args) -> int:
         }
         if args.include_input:
             newer["inputText"] = prompt[:20000]
+        if args.include_result and newer["turnStatus"] in {
+            "completed", "failed", "interrupted", "cancelled",
+        }:
+            newer["resultText"] = agent_text(turn) or None
+        if args.include_input or args.include_result:
             newer_turns.append(newer)
             if len(newer_turns) > 100:
                 raise SystemExit("more than 100 newer user turns require reconciliation")
@@ -2289,7 +2294,7 @@ def target_status(args) -> int:
         "status": "newer_turn" if newer else "unchanged",
         "newerTurn": newer,
     }
-    if args.include_input:
+    if args.include_input or args.include_result:
         result["newerTurns"] = newer_turns
     print(json.dumps(result) if args.json else (
         f"{args.thread}: {result['status']} "
@@ -2448,6 +2453,7 @@ def main() -> int:
     target_read.add_argument("--thread", required=True)
     target_read.add_argument("--after-turn", required=True)
     target_read.add_argument("--include-input", action="store_true")
+    target_read.add_argument("--include-result", action="store_true")
     target_read.add_argument("--json", action="store_true")
     steer = sub.add_parser("steer")
     steer.add_argument("--executive-thread")
