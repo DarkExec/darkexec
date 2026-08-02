@@ -933,6 +933,131 @@ def resolved_route(result_text: str, job_id: str, projects: list[str]) -> Path:
     return target
 
 
+def global_route_candidates(path: Path) -> list[dict]:
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read global route candidates: {exc}") from exc
+    if not isinstance(payload, list) or not payload or len(payload) > 500:
+        raise RuntimeError("global route candidates must contain 1 to 500 entries")
+    candidates = []
+    seen = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            raise RuntimeError("global route candidates must be objects")
+        host_id = item.get("hostId")
+        target_path = item.get("targetPath")
+        host_label = item.get("hostLabel")
+        if (
+            not isinstance(host_id, str) or not 8 <= len(host_id) <= 128
+            or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in host_id)
+        ):
+            raise RuntimeError("global route candidate hostId is invalid")
+        if (
+            not isinstance(target_path, str) or not Path(target_path).is_absolute()
+            or len(target_path) > 4096
+        ):
+            raise RuntimeError("global route candidate targetPath is invalid")
+        if not isinstance(host_label, str) or not host_label.strip() or len(host_label) > 120:
+            raise RuntimeError("global route candidate hostLabel is invalid")
+        identity = (host_id, target_path)
+        if identity in seen:
+            raise RuntimeError("global route candidates contain a duplicate host and project")
+        seen.add(identity)
+        candidates.append({
+            "hostId": host_id,
+            "hostLabel": host_label.strip(),
+            "targetPath": target_path,
+        })
+    return candidates
+
+
+def resolved_global_route(result_text: str, job_id: str, candidates: list[dict]) -> dict:
+    prefix = f"DARKEXEC_GLOBAL_ROUTE_READY {job_id} "
+    if not result_text.startswith(prefix) or "\n" in result_text:
+        raise RuntimeError("DarkExec global resolver returned an invalid acknowledgement")
+    try:
+        selected = json.loads(result_text[len(prefix):])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("DarkExec global resolver returned invalid JSON") from exc
+    identity = (selected.get("hostId"), selected.get("targetPath")) if isinstance(selected, dict) else None
+    allowed = {(item["hostId"], item["targetPath"]) for item in candidates}
+    if identity not in allowed:
+        raise RuntimeError("DarkExec global resolver returned an unknown host or project")
+    return next(item for item in candidates if (item["hostId"], item["targetPath"]) == identity)
+
+
+def resolve_global(args) -> int:
+    prompt = sys.stdin.read()
+    if not prompt.strip():
+        raise SystemExit("resolve-global requires a non-empty prompt on stdin")
+    try:
+        candidates = global_route_candidates(Path(args.candidates_json))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    request_sha = hashlib.sha256(
+        prompt.encode() + b"\0" + canonical_json({"candidates": candidates}).encode()
+    ).hexdigest()
+    path = receipt_path(f"global-route:{args.job_id}")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = path.with_suffix(".lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if path.exists():
+            print(json.dumps(load_receipt(path)))
+        else:
+            print(json.dumps({"jobId": args.job_id, "status": "starting"}))
+        return 1
+    if path.exists():
+        prior = load_receipt(path)
+        if prior.get("requestSha256") != request_sha:
+            raise SystemExit("global route job id already belongs to different input")
+        print(json.dumps(prior) if args.json else prior.get("targetPath", ""))
+        return 0 if prior.get("status") == "completed" else 1
+    receipt = {
+        "schemaVersion": 1,
+        "jobId": args.job_id,
+        "requestSha256": request_sha,
+        "transport": "codex-app-server-control-socket",
+        "createdAt": now(),
+        "executive": {},
+    }
+    save(path, receipt, "routing")
+    control_prompt = (
+        f"DARKEXEC GLOBAL ROUTE TASK. Select the one exact host and saved project that owns job {args.job_id}. "
+        f"Allowed candidates: {json.dumps(candidates)}. Natural request: {json.dumps(prompt)}. "
+        "Use only the supplied request and candidate metadata. Do not inspect files, use tools, start "
+        "DarkExec, or perform the work. Reply only: "
+        f"DARKEXEC_GLOBAL_ROUTE_READY {args.job_id} "
+        '{"hostId":"exact-host-id","targetPath":"/exact/saved/project"}'
+    )
+    try:
+        with AppServer() as app:
+            thread = app.start_thread(WORKSPACE)
+            result = app.run_turn(thread["id"], control_prompt)
+            listed = app.require_listed_thread(thread["id"], WORKSPACE)
+            receipt["executive"] = {
+                "threadId": listed["id"],
+                "source": listed.get("source"),
+                "appVisible": True,
+                "listedCwd": listed.get("cwd"),
+                "initialUsage": result.get("usage"),
+                "initialModelCallCount": result.get("modelCallCount"),
+                "initialResult": result.get("resultText"),
+            }
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or "global resolver did not complete")
+            selected = resolved_global_route(result.get("resultText") or "", args.job_id, candidates)
+            receipt.update(selected)
+            save(path, receipt, "completed")
+    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+        receipt["error"] = f"Global target resolution failed: {exc}"
+        save(path, receipt, "failed")
+    print(json.dumps(receipt) if args.json else receipt.get("targetPath", ""))
+    return 0 if receipt.get("status") == "completed" else 1
+
+
 def dispatch(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir():
@@ -2602,6 +2727,11 @@ def main() -> int:
     fire.add_argument("--generation", type=int, required=True)
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
+    global_resolve = sub.add_parser("resolve-global")
+    global_resolve.add_argument("--job-id", required=True)
+    global_resolve.add_argument("--candidates-json", required=True)
+    global_resolve.add_argument("--prompt-stdin", action="store_true", required=True)
+    global_resolve.add_argument("--json", action="store_true")
     update = sub.add_parser("update")
     update.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
@@ -2613,6 +2743,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "dispatch":
         return dispatch(args)
+    if args.command == "resolve-global":
+        return resolve_global(args)
     if args.command == "run":
         return run_target(args)
     if args.command == "continue":

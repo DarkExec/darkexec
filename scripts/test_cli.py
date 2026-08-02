@@ -183,7 +183,22 @@ def fake_app_server(
                         {"type": "text", "text": "Dependent follow-up while Background is running."},
                     ]}],
                 })
-            if prompt.startswith("DARKEXEC ROUTE TASK."):
+            if prompt.startswith("DARKEXEC GLOBAL ROUTE TASK."):
+                allowed = json.loads(
+                    prompt.split("Allowed candidates: ", 1)[1].split(
+                        ". Natural request:", 1
+                    )[0]
+                )
+                selected = next(item for item in allowed if item["hostLabel"] == "DROIDFI")
+                job_id = prompt.split("owns job ", 1)[1].split(".", 1)[0]
+                text = (
+                    f"DARKEXEC_GLOBAL_ROUTE_READY {job_id} "
+                    + json.dumps({
+                        "hostId": selected["hostId"],
+                        "targetPath": selected["targetPath"],
+                    }, separators=(",", ":"))
+                )
+            elif prompt.startswith("DARKEXEC ROUTE TASK."):
                 allowed = json.loads(
                     prompt.split("Allowed projects: ", 1)[1].split(
                         ". Natural request:", 1
@@ -330,6 +345,42 @@ def main() -> None:
         workspace.mkdir()
         config = root / "config.toml"
         config.write_text(f'[projects."{target}"]\ntrust_level = "trusted"\n')
+        route_candidates = root / "route-candidates.json"
+        route_candidates.write_text(json.dumps([
+            {"hostId": "host-agentfsd", "hostLabel": "AgentFSD", "targetPath": str(target)},
+            {"hostId": "host-droidfi", "hostLabel": "DROIDFI", "targetPath": "/root/openclaw-maintenance"},
+        ]))
+        route_socket = root / "route-app.sock"
+        route_ready = threading.Event()
+        route_server = threading.Thread(
+            target=fake_app_server, args=(route_socket, route_ready), daemon=True
+        )
+        route_server.start()
+        assert route_ready.wait(timeout=2)
+        route_env = {
+            **os.environ, "DARKEXEC_STATE_ROOT": str(root / "state"),
+            "DARKEXEC_WORKSPACE": str(workspace), "DARKEXEC_CONFIG": str(config),
+            "DARKEXEC_APP_SERVER_SOCKET": str(route_socket),
+        }
+        route = subprocess.run([
+            str(ROOT / "bin/darkexec"), "resolve-global", "--job-id", "route-1",
+            "--candidates-json", str(route_candidates), "--prompt-stdin", "--json",
+        ], input="Fix the OpenClaw issue on DROIDFI.", capture_output=True, text=True,
+            env=route_env, check=False)
+        assert route.returncode == 0, route.stderr or route.stdout
+        route_result = json.loads(route.stdout)
+        assert route_result["status"] == "completed", route_result
+        assert route_result["hostId"] == "host-droidfi", route_result
+        assert route_result["targetPath"] == "/root/openclaw-maintenance", route_result
+        assert route_result["executive"]["appVisible"] is True, route_result
+        repeated_route = subprocess.run([
+            str(ROOT / "bin/darkexec"), "resolve-global", "--job-id", "route-1",
+            "--candidates-json", str(route_candidates), "--prompt-stdin", "--json",
+        ], input="Fix the OpenClaw issue on DROIDFI.", capture_output=True, text=True,
+            env=route_env, check=False)
+        assert repeated_route.returncode == 0, repeated_route.stderr
+        assert json.loads(repeated_route.stdout)["createdAt"] == route_result["createdAt"]
+
         socket_path = root / "app.sock"
         ready = threading.Event()
         server = threading.Thread(target=fake_app_server, args=(socket_path, ready), daemon=True)
