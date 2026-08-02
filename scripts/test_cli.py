@@ -749,6 +749,8 @@ def main() -> None:
                         {"id": "direct-user", "type": "userMessage", "content": [
                             {"type": "text", "text": "PRIVATE DIRECT FOLLOW-UP"},
                         ]},
+                        {"id": "direct-agent", "type": "agentMessage",
+                         "text": "PRIVATE DIRECT RESULT"},
                     ]},
                 ]},
             }),
@@ -771,6 +773,7 @@ def main() -> None:
             "turnId": "direct-turn", "turnStatus": "inProgress", "turnKind": "product",
         }, target_status_payload
         assert "PRIVATE DIRECT FOLLOW-UP" not in target_status_result.stdout
+        assert "PRIVATE DIRECT RESULT" not in target_status_result.stdout
         target_status_server.join(timeout=2)
         assert not target_status_server.is_alive()
         target_input_socket, target_input_ready = root / "target-input.sock", threading.Event()
@@ -783,10 +786,12 @@ def main() -> None:
                             {"type": "text", "text": "Original product work"},
                         ]},
                     ]},
-                    {"id": "direct-turn", "status": "inProgress", "items": [
+                    {"id": "direct-turn", "status": "completed", "items": [
                         {"id": "direct-user", "type": "userMessage", "content": [
                             {"type": "text", "text": "PRIVATE DIRECT FOLLOW-UP"},
                         ]},
+                        {"id": "direct-agent", "type": "agentMessage",
+                         "text": "PRIVATE DIRECT RESULT"},
                     ]},
                 ]},
             }),
@@ -797,7 +802,7 @@ def main() -> None:
             [
                 str(ROOT / "bin/darkexec"), "target-status", "--target", str(target),
                 "--thread", status_target_thread, "--after-turn", "baseline-turn",
-                "--include-input", "--json",
+                "--include-input", "--include-result", "--json",
             ],
             capture_output=True, text=True,
             env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(target_input_socket)},
@@ -807,6 +812,9 @@ def main() -> None:
         assert target_input_result.returncode == 0, target_input_result.stderr
         assert (
             target_input_payload["newerTurn"]["inputText"] == "PRIVATE DIRECT FOLLOW-UP"
+        ), target_input_payload
+        assert (
+            target_input_payload["newerTurn"]["resultText"] == "PRIVATE DIRECT RESULT"
         ), target_input_payload
         assert target_input_payload["newerTurns"] == [target_input_payload["newerTurn"]]
         target_input_server.join(timeout=2)
