@@ -167,7 +167,10 @@ darkexec target-status --target /exact/saved/project --thread TARGET_TASK_ID \
   --after-turn LAST_RECORDED_PRODUCT_TURN --json
 ```
 
-The result contains only newer turn identity, status, and product-or-harness classification.
+The default result contains only newer turn identity, status, and product-or-harness
+classification. A trusted private assignment journal may add `--include-input` to receive up to
+100 bounded newer user messages; larger gaps fail closed, and agent output plus the rest of the
+transcript remain excluded.
 
 Progress is a read-only projection of the exact active execution identity. It does not detach,
 resume, retry, or replace work. The full attached-call pattern is installed in

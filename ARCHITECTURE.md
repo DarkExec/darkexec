@@ -46,6 +46,10 @@ bounded result reports only whether a newer user turn exists plus its identity, 
 and product-or-harness classification. It never returns prompt or result content. This lets a
 control plane reconcile native Codex App follow-ups without reconstructing the transcript or
 opening raw App Server access.
+When that control plane explicitly requests `--include-input`, the same exact-target read may also
+return up to 100 newer user turns, each bounded to 20,000 characters, for its private assignment
+journal. It fails rather than silently omitting a larger gap. The default remains content-free,
+and no agent response or broader transcript is returned.
 
 Interactive routing uses runtime-owned `run` and `continue` commands so each executive, runner,
 target task, and active turn is durably bound before waiting. The first target result is harnessed
