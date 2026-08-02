@@ -159,6 +159,16 @@ progress can be read without model re-entry:
 darkexec execution-status --executive-thread "$CODEX_THREAD_ID" --json
 ```
 
+An assignment control plane that already owns an exact saved target identity can reconcile a turn
+started directly in Codex App without reading its content:
+
+```bash
+darkexec target-status --target /exact/saved/project --thread TARGET_TASK_ID \
+  --after-turn LAST_RECORDED_PRODUCT_TURN --json
+```
+
+The result contains only newer turn identity, status, and product-or-harness classification.
+
 Progress is a read-only projection of the exact active execution identity. It does not detach,
 resume, retry, or replace work. The full attached-call pattern is installed in
 `/srv/darkexec/README.md`.

@@ -734,6 +734,45 @@ def main() -> None:
         assert unknown_status_result["runnerActive"] is False, unknown_status_result
         run_server.join(timeout=2)
         assert not run_server.is_alive()
+        status_target_thread = interactive_result["target"]["threadId"]
+        target_status_socket, target_status_ready = root / "target-status.sock", threading.Event()
+        target_status_server = threading.Thread(
+            target=fake_app_server,
+            args=(target_status_socket, target_status_ready, True, None, {
+                status_target_thread: {"cwd": str(target), "turns": [
+                    {"id": "baseline-turn", "status": "completed", "items": [
+                        {"id": "baseline-user", "type": "userMessage", "content": [
+                            {"type": "text", "text": "Original product work"},
+                        ]},
+                    ]},
+                    {"id": "direct-turn", "status": "inProgress", "items": [
+                        {"id": "direct-user", "type": "userMessage", "content": [
+                            {"type": "text", "text": "PRIVATE DIRECT FOLLOW-UP"},
+                        ]},
+                    ]},
+                ]},
+            }),
+            daemon=True,
+        )
+        target_status_server.start(); assert target_status_ready.wait(timeout=2)
+        target_status_result = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "target-status", "--target", str(target),
+                "--thread", status_target_thread, "--after-turn", "baseline-turn", "--json",
+            ],
+            capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(target_status_socket)},
+            check=False,
+        )
+        target_status_payload = json.loads(target_status_result.stdout)
+        assert target_status_result.returncode == 0, target_status_result.stderr
+        assert target_status_payload["status"] == "newer_turn", target_status_payload
+        assert target_status_payload["newerTurn"] == {
+            "turnId": "direct-turn", "turnStatus": "inProgress", "turnKind": "product",
+        }, target_status_payload
+        assert "PRIVATE DIRECT FOLLOW-UP" not in target_status_result.stdout
+        target_status_server.join(timeout=2)
+        assert not target_status_server.is_alive()
         direct_image = root / "direct-image.png"
         direct_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         direct_manifest = root / "direct-input.json"
@@ -1380,7 +1419,7 @@ def main() -> None:
         "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
         "one-executive", "one-target", "same-task-harness",
         "interactive-harness-mode-required", "interactive-target-run", "private-execution-state",
-        "interactive-execution-status", "direct-structured-input",
+        "interactive-execution-status", "privacy-safe-target-status", "direct-structured-input",
         "attached-same-turn-steer",
         "runtime-owned-follow-up",
         "bound-target-no-replacement", "executive-scoped-clean-stop", "idempotent-stop",
