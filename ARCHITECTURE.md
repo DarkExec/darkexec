@@ -9,7 +9,7 @@ interactive: installed workspace -> exact saved project -> verbatim target task
                                                     -> attached same-turn steering
                                                     -> immediate initial harness
                                                     -> same-target follow-up burst
-                                                    -> 30-minute trailing harness
+                                                    -> bounded fresh-context trailing harness
 background:  darkexec dispatch -> running Codex App control socket
                               -> App-listed executive and target tasks
                               -> same-target harness -> durable receipt/status
@@ -61,11 +61,18 @@ queued dependent message remains in the executive task until that immediate harn
 reuses the established target and resets one 30-minute systemd timer through `darkexec debounce`.
 Generation-keyed state under `/var/lib/darkexec/sessions` makes stale timers harmless. At expiry the
 runtime resumes the exact persisted target by both its validated task ID and App-listed rollout
-path, rereads its history, and sends at most one trailing
-harness after the latest product turn; a
+path, rereads its history, and freezes a bounded private capsule of post-harness user requests,
+agent results, failure kinds, changed paths, and counts. It starts one fresh target-owned closeout
+task from that capsule and sends at most one trailing harness after the latest product turn; a
 manual harness, newer activity, an active turn, or an interrupted lineage makes it stop or defer
 without duplicate work. Dependent cross-task work and consequential phase changes flush pending
 closeout first. If the timer cannot be scheduled, closeout runs immediately.
+
+The capsule omits raw command/tool output and tool arguments, binds the exact source task and
+product turn, and records its digest plus the separate harness task identity. The source task remains
+the continuation owner. App Server per-call `last` usage is accumulated for the closeout so resumed
+thread history is never mislabeled as harness usage. Immediate and explicit manual harness turns
+remain in the source task.
 
 `dispatch` retains immediate first harnessing by default. A trusted conversational control plane
 may opt into `--defer-initial-harness`; the terminal dispatch receipt marks the first harness

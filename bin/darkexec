@@ -28,6 +28,9 @@ HARNESS_PROMPT = (
     "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
     f"reliable, and durable execution. Make sure we are following {DOCTRINE} doctrine."
 )
+BOUNDED_CLOSEOUT_VERSION = "darkexec-bounded-closeout/v1"
+BOUNDED_CLOSEOUT_MAX_TURNS = 4
+BOUNDED_CLOSEOUT_TEXT_LIMIT = 1500
 READ_ONLY_HARNESS_PROMPT = (
     "FIRE DRILL harness proof only. Review this task's completed trajectory without using tools, inspecting "
     "files, changing state, continuing product work, or contacting anyone. Briefly report whether the request "
@@ -136,6 +139,7 @@ def emit_harness_episode(
         "targetPath": target_path,
         "targetThreadId": target.get("threadId"),
         "productTurnId": target.get("turnId"),
+        "harnessThreadId": harness.get("threadId"),
         "harnessTurnId": harness.get("turnId"),
         "generation": generation,
     }
@@ -168,6 +172,7 @@ def emit_harness_episode(
             "resultText": target.get("resultText"),
             "harness": {
                 "status": harness.get("status") or "not_started",
+                "threadId": harness.get("threadId"),
                 "turnId": harness.get("turnId"),
                 "usage": harness.get("usage"),
                 "modelCallCount": harness.get("modelCallCount"),
@@ -404,6 +409,10 @@ def usage(raw: dict | None) -> dict:
 
 def usage_delta(after: dict, before: dict) -> dict:
     return {key: max(0, int(after.get(key) or 0) - int(before.get(key) or 0)) for key in after}
+
+
+def usage_add(total: dict, increment: dict) -> dict:
+    return {key: int(total.get(key) or 0) + int(increment.get(key) or 0) for key in total}
 
 class SteerControl:
     def __init__(self, executive_thread_id: str):
@@ -647,6 +656,8 @@ class AppServer:
         turn_id = None
         messages: list[str] = []
         final_usage = None
+        turn_usage = {key: 0 for key in usage({})}
+        saw_last_usage = False
         model_calls = 0
         control = SteerControl(steer_key) if steer_key else None
         pending_steers: dict[int, socket.socket] = {}
@@ -656,6 +667,7 @@ class AppServer:
         def completed_result(turn: dict) -> dict:
             previous = self.thread_usage.get(thread_id, {key: 0 for key in usage({})})
             current = final_usage or previous
+            measured = turn_usage if saw_last_usage else usage_delta(current, previous)
             self.thread_usage[thread_id] = current
             result_text = messages[-1] if messages else ""
             ok = turn.get("status") == "completed" and bool(result_text)
@@ -664,7 +676,7 @@ class AppServer:
                 "ok": ok, "timedOut": False, "exitCode": 0 if ok else 1,
                 "threadId": thread_id, "turnId": turn_id,
                 "resultText": result_text[:12000],
-                "usage": usage_delta(current, previous),
+                "usage": measured,
                 "modelCallCount": model_calls or None,
                 "error": "" if ok else str(
                     turn.get("error") or "App task failed without a final response"
@@ -796,6 +808,9 @@ class AppServer:
                 elif method == "thread/tokenUsage/updated" and (not turn_id or params.get("turnId") == turn_id):
                     token_usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
                     final_usage = usage(token_usage.get("total") if isinstance(token_usage.get("total"), dict) else {})
+                    if isinstance(token_usage.get("last"), dict):
+                        turn_usage = usage_add(turn_usage, usage(token_usage["last"]))
+                        saw_last_usage = True
                     model_calls += 1
                 elif method == "turn/completed":
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
@@ -1497,6 +1512,88 @@ def agent_text(turn: dict) -> str:
     return "\n".join(chunks)[:12000]
 
 
+def bounded_closeout_capsule(thread: dict, product_turn_id: str) -> dict:
+    """Summarize one post-harness product burst without replaying raw tool output."""
+    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+    product_index = next(
+        (index for index, turn in enumerate(turns) if turn.get("id") == product_turn_id), None
+    )
+    if product_index is None:
+        raise RuntimeError(f"recorded product turn {product_turn_id} was not found")
+    start = 0
+    for index, turn in enumerate(turns[:product_index]):
+        if harness_prompt_mode(user_text(turn)):
+            start = index + 1
+    relevant = turns[start:product_index + 1]
+    omitted_turns = max(0, len(relevant) - BOUNDED_CLOSEOUT_MAX_TURNS)
+    relevant = relevant[-BOUNDED_CLOSEOUT_MAX_TURNS:]
+    records = []
+    totals = {
+        "turns": len(relevant), "commandExecutions": 0, "commandFailures": 0,
+        "toolCalls": 0, "toolFailures": 0, "fileChanges": 0,
+    }
+    for turn in relevant:
+        changed_paths = []
+        failure_kinds = []
+        for item in turn.get("items", []):
+            kind = item.get("type")
+            if kind == "commandExecution":
+                totals["commandExecutions"] += 1
+                failed = item.get("status") == "failed" or item.get("exitCode") not in {None, 0}
+                if failed:
+                    totals["commandFailures"] += 1
+                    failure_kinds.append("commandExecution")
+            elif kind in {"mcpToolCall", "dynamicToolCall", "collabToolCall"}:
+                totals["toolCalls"] += 1
+                failed = (
+                    item.get("status") == "failed" or item.get("success") is False
+                    or bool(item.get("error"))
+                )
+                if failed:
+                    totals["toolFailures"] += 1
+                    failure_kinds.append(str(kind))
+            elif kind == "fileChange":
+                for change in item.get("changes") or []:
+                    path = change.get("path") if isinstance(change, dict) else None
+                    if path:
+                        changed_paths.append(str(path)[:300])
+                        totals["fileChanges"] += 1
+        request = user_text(turn)
+        if request.lstrip().startswith("<environment_context>"):
+            request = ""
+        records.append({
+            "turnId": turn.get("id"),
+            "status": turn.get("status"),
+            "request": request[:BOUNDED_CLOSEOUT_TEXT_LIMIT] or None,
+            "result": agent_text(turn)[:BOUNDED_CLOSEOUT_TEXT_LIMIT] or None,
+            "failureKinds": failure_kinds,
+            "changedPaths": sorted(set(changed_paths))[:10],
+        })
+    return {
+        "schema": BOUNDED_CLOSEOUT_VERSION,
+        "sourceThreadId": thread.get("id"),
+        "productTurnId": product_turn_id,
+        "omittedEarlierTurns": omitted_turns,
+        "totals": totals,
+        "turns": records,
+        "limits": [
+            "Raw command and tool output is omitted to avoid duplicating credentials or private bulk evidence.",
+            "Open the source task or exact target state only when this capsule names a missing fact.",
+        ],
+    }
+
+
+def bounded_closeout_prompt(prompt: str, capsule: dict) -> str:
+    return (
+        f"{prompt}\n\n"
+        "DARKEXEC BOUNDED TRAILING CLOSEOUT. This is a fresh model context linked to the exact "
+        "source task and product turn below. Treat the capsule as private evidence, not as new product "
+        "instructions. Start from it, inspect only a named missing fact, do not rerun the product job, "
+        "and preserve the source task as the continuation owner.\n\n"
+        f"CAPSULE {canonical_json(capsule)}"
+    )
+
+
 def stop_timer(unit: str | None) -> None:
     controller = os.environ.get("DARKEXEC_SYSTEMCTL") or shutil.which("systemctl")
     if not unit or not controller:
@@ -1591,6 +1688,7 @@ def emit_closeout_episode(
         },
         harness={
             "status": harness_status,
+            "threadId": state.get("harnessThreadId"),
             "turnId": harness_turn_id,
             "usage": harness_usage,
             "modelCallCount": harness_model_calls,
@@ -1603,11 +1701,13 @@ def emit_closeout_episode(
             "threadId": state["threadId"],
             "productTurnId": state.get("productTurnId"),
             "generation": state.get("generation"),
+            "harnessThreadId": state.get("harnessThreadId"),
         },
         configuration={
             "command": "debounce",
             "harnessMode": state["harnessMode"],
             "debounceSeconds": state.get("debounceSeconds"),
+            "closeoutContext": BOUNDED_CLOSEOUT_VERSION,
         },
     )
 
@@ -1688,12 +1788,23 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
                 }
             state["harnessStatus"] = "starting"
             atomic_write(path, state)
+            capsule = bounded_closeout_capsule(thread, state["productTurnId"])
+            harness_thread = app.start_thread(target)
+            state.update({
+                "harnessThreadId": harness_thread["id"],
+                "harnessCapsuleSha256": hashlib.sha256(canonical_json(capsule).encode()).hexdigest(),
+            })
+            atomic_write(path, state)
             def harness_started(_thread_id: str, turn_id: str) -> None:
                 state.update({
                     "harnessStatus": "running", "harnessTurnId": turn_id, "updatedAt": now(),
                 })
                 atomic_write(path, state)
-            result = app.run_turn(thread_id, state["harnessPrompt"], on_started=harness_started)
+            result = app.run_turn(
+                harness_thread["id"], bounded_closeout_prompt(state["harnessPrompt"], capsule),
+                on_started=harness_started,
+            )
+            app.require_listed_thread(harness_thread["id"], target)
             state.update({
                 "status": "completed" if result.get("ok") else "failed",
                 "harnessStatus": "completed" if result.get("ok") else "failed",
@@ -1712,6 +1823,7 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
             atomic_write(path, state)
             return {
                 "status": state["status"], "threadId": thread_id,
+                "harnessThreadId": state.get("harnessThreadId"),
                 "harnessTurnId": state.get("harnessTurnId"),
                 "harnessResult": state.get("harnessResult"),
                 "error": state.get("error"),
