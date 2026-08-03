@@ -88,7 +88,13 @@ def fake_app_server(
             send_frame(connection, {"id": message["id"], "result": {"userAgent": "fake"}})
         elif method == "thread/start":
             cwd = message["params"]["cwd"]
-            thread = "00000000-0000-4000-8000-000000000001" if cwd.endswith("darkexec") else "00000000-0000-4000-8000-000000000002"
+            if cwd.endswith("darkexec"):
+                thread = "00000000-0000-4000-8000-000000000001"
+            else:
+                suffix = 2
+                while f"00000000-0000-4000-8000-{suffix:012d}" in threads:
+                    suffix += 1
+                thread = f"00000000-0000-4000-8000-{suffix:012d}"
             threads[thread] = 0
             listed[thread] = {"id": thread, "source": "vscode", "cwd": cwd}
             histories[thread] = []
@@ -196,7 +202,10 @@ def fake_app_server(
             threads[thread] += 12
             multiplier = threads[thread] // 12
             send_frame(connection, {"method": "thread/tokenUsage/updated", "params": {
-                "threadId": thread, "turnId": turn, "tokenUsage": {"total": {
+                "threadId": thread, "turnId": turn, "tokenUsage": {"last": {
+                    "inputTokens": 10, "cachedInputTokens": 4,
+                    "outputTokens": 2, "reasoningOutputTokens": 1, "totalTokens": 12,
+                }, "total": {
                     "inputTokens": 10 * multiplier, "cachedInputTokens": 4 * multiplier,
                     "outputTokens": 2 * multiplier, "reasoningOutputTokens": multiplier,
                     "totalTokens": threads[thread],
@@ -231,7 +240,10 @@ def fake_app_server(
             }})
             threads[thread] += 12
             send_frame(connection, {"method": "thread/tokenUsage/updated", "params": {
-                "threadId": thread, "turnId": turn, "tokenUsage": {"total": {
+                "threadId": thread, "turnId": turn, "tokenUsage": {"last": {
+                    "inputTokens": 10, "cachedInputTokens": 4, "outputTokens": 2,
+                    "reasoningOutputTokens": 1, "totalTokens": 12,
+                }, "total": {
                     "inputTokens": 10, "cachedInputTokens": 4, "outputTokens": 2,
                     "reasoningOutputTokens": 1, "totalTokens": threads[thread],
                 }},
@@ -248,7 +260,24 @@ def fake_app_server(
 def main() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
-        normalize_input_items = runpy.run_path(str(ROOT / "bin/darkexec"))["normalize_input_items"]
+        runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
+        normalize_input_items = runtime["normalize_input_items"]
+        capsule = runtime["bounded_closeout_capsule"]({
+            "id": "source-thread",
+            "turns": [{
+                "id": "product-turn", "status": "completed", "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "Ship it"}]},
+                    {"type": "commandExecution", "status": "failed", "exitCode": 1,
+                     "command": "secret-bearing command", "aggregatedOutput": "private output"},
+                    {"type": "fileChange", "changes": [{"path": "owned.py", "kind": "update"}]},
+                    {"type": "agentMessage", "text": "Delivered with one corrected retry."},
+                ],
+            }],
+        }, "product-turn")
+        assert capsule["sourceThreadId"] == "source-thread", capsule
+        assert capsule["totals"]["commandFailures"] == 1, capsule
+        assert capsule["turns"][0]["changedPaths"] == ["owned.py"], capsule
+        assert "secret-bearing" not in json.dumps(capsule) and "private output" not in json.dumps(capsule)
         attachment_input = [
             {"type": "text", "text": 'Approve release.\n\nAttached image: "logo.png"'},
             {"type": "localImage", "path": "/tmp/logo.png"},
@@ -1308,12 +1337,16 @@ def main() -> None:
         fallback_socket, fallback_ready = root / "fallback.sock", threading.Event()
         fallback_turns = [{"id": "product-3", "status": "completed", "items": [
             {"id": "u-product-3", "type": "userMessage", "content": [{"type": "text", "text": "More follow-up work"}]},
+            {"id": "failed-command", "type": "commandExecution", "status": "failed", "exitCode": 2,
+             "command": "private command", "aggregatedOutput": "private output"},
+            {"id": "a-product-3", "type": "agentMessage", "text": "Completed after one retry."},
         ]}]
+        fallback_inputs = []
         fallback_server = threading.Thread(
             target=fake_app_server,
             args=(fallback_socket, fallback_ready, True, None, {
                 timer_thread: {"cwd": str(target), "turns": fallback_turns},
-            }),
+            }, fallback_inputs),
             daemon=True,
         )
         fallback_server.start(); assert fallback_ready.wait(timeout=2)
@@ -1329,6 +1362,14 @@ def main() -> None:
         fallback_result = json.loads(fallback.stdout)
         assert fallback.returncode == 0 and fallback_result["status"] == "completed", fallback_result
         assert fallback_result["scheduleError"], fallback_result
+        assert fallback_result["harnessThreadId"] != timer_thread, fallback_result
+        capsule_prompt = next(
+            item["text"] for item in fallback_inputs[-1]
+            if item.get("type") == "text"
+        )
+        assert "DARKEXEC BOUNDED TRAILING CLOSEOUT" in capsule_prompt, capsule_prompt
+        assert '"sourceThreadId":"' + timer_thread + '"' in capsule_prompt, capsule_prompt
+        assert "private command" not in capsule_prompt and "private output" not in capsule_prompt
         fallback_server.join(timeout=2)
         assert not fallback_server.is_alive()
         journal = [
@@ -1356,6 +1397,8 @@ def main() -> None:
         )
         assert fallback_episode["status"] == "completed", fallback_episode
         assert fallback_episode["target"]["harness"]["turnId"], fallback_episode
+        assert fallback_episode["target"]["harness"]["threadId"] == fallback_result["harnessThreadId"]
+        assert fallback_episode["target"]["harness"]["usage"]["input"] == 10, fallback_episode
         cancelled = subprocess.run(
             [str(ROOT / "bin/darkexec"), "debounce-cancel", "--thread", timer_thread, "--json"],
             capture_output=True, text=True, env=timer_env, check=False,
@@ -1478,7 +1521,8 @@ def main() -> None:
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "deferred-initial-harness", "executive-target-resolution",
         "manual-harness-suppression",
-        "schedule-failure-immediate-closeout", "cold-task-resume",
+        "schedule-failure-immediate-closeout", "bounded-fresh-context-closeout",
+        "per-call-closeout-usage", "cold-task-resume",
         "persisted-rollout-path-resume", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",

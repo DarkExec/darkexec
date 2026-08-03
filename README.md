@@ -28,8 +28,8 @@
 Most coding agents stop when the code exists.
 
 DarkExec stays accountable for the whole chain: resolve the owning project, preserve your request,
-create visible native Codex App work, wait through the target result, close out in the same task,
-and return inspectable proof.
+create visible native Codex App work, wait through the target result, close out from exact bounded
+evidence, and return inspectable proof.
 
 ```text
 You: "in /srv/voice find the checkout failure, fix it, and prove recovery"
@@ -39,7 +39,7 @@ DarkExec:
   ✓ created one visible target task
   ✓ preserved the request as its first turn
   ✓ waited for the result
-  ✓ completed the same-task Harness Ops closeout
+  ✓ completed the identity-bound Harness Ops closeout
   ✓ returned task identity, status, and usage
 ```
 
@@ -113,8 +113,9 @@ to reconstruct them. Trusted direct callers can supply the same typed `text`, `i
 `localImage` input array through a private `--input-json` manifest; stdin remains the exact text
 assertion and local images are verified before native delivery. Each completed
 follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
-`darkexec debounce`; after the conversation becomes idle, it rereads the target and sends one
-trailing harness unless a manual or automatic harness already closed the latest product turn.
+`darkexec debounce`; after the conversation becomes idle, it rereads the target, builds a bounded
+private capsule, and sends one fresh-context trailing harness unless a manual or automatic harness
+already closed the latest product turn. The exact source task remains the continuation owner.
 Dependent cross-task work and consequential phase changes flush a pending closeout first. If the
 timer cannot be scheduled, closeout runs immediately. Background and direct CLI runs always harness
 immediately by default. A trusted conversational caller may add `--defer-initial-harness` to
@@ -252,7 +253,7 @@ execution lifecycle reached a terminal state”:
 | --- | --- |
 | Executive and target task IDs, where applicable | Trace the exact native Codex App work |
 | App-listed project roots | Prove the work ran under the intended owner |
-| Target and same-task harness results | Separate product completion from lifecycle closeout |
+| Source target plus harness task/turn results | Separate product completion from bounded lifecycle closeout |
 | `/var/lib/darkexec/harness-episodes` | Immutable private terminal harness evidence for optional evaluation |
 | Per-task model usage | Measure executive and target cost independently |
 | Terminal status, error, and timestamps | Make supervision and recovery deterministic |

@@ -36,9 +36,10 @@
         "resultText": {"type": ["string", "null"]},
         "harness": {
           "type": "object",
-          "required": ["status", "turnId"],
+          "required": ["status", "threadId", "turnId"],
           "properties": {
             "status": {"type": "string"},
+            "threadId": {"type": ["string", "null"]},
             "turnId": {"type": ["string", "null"]},
             "usage": {"type": ["object", "null"]},
             "modelCallCount": {"type": ["integer", "null"]},
