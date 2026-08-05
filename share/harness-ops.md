@@ -102,11 +102,13 @@ Normal prompt:
 
 > Let's do a harness pass where we take a look at this session and turn trial and error into fast, reliable, and durable execution. Make sure we are following `harness-ops.md` doctrine.
 
-Treat this as a bounded closeout episode, not another engineering pass. Compile the contract from the completed trajectory and fresh target state; do not ask the operator for a form.
+Treat this as a bounded closeout episode, not another product engineering pass. Compile the contract from the completed trajectory and fresh target state; do not ask the operator for a form. Complete trajectory evidence is a starting point, not a reason to avoid the minimum current owner inspection needed to test one intervention or retain decision.
 
-Select at most one coherent intervention at the earliest owner. It may require cohesive artifacts, or no change. Do not continue product work, mutate production, rerun the representative job, or repair a newly discovered product defect unless this current prompt explicitly authorizes it; record the next engineering episode and stop.
+Select at most one coherent intervention at the earliest owner. It may require cohesive artifacts, or no change. Retain/no-change requires current proof that an existing delivered owner addresses the exact observed tax; zero failures, aggregate telemetry, uncertainty, or failure to inspect the owner are not sufficient. Do not continue product behavior, replay the representative job, alter production data, or repair a newly discovered product defect unless this current prompt explicitly authorizes it; record that product issue for a separate engineering episode.
 
-Promote accepted knowledge, compact telemetry, close delivery and cleanup obligations, report proof and limits, and leave the exact next transition. Episode escape, unauthorized production mutation, or a serious safety regression automatically fails the harness pass; score artifact quality separately.
+An authorized harness intervention is not complete as a local edit, branch, commit, pushed branch, or draft pull request. Unless the target workflow names a real external approval gate, carry it through validation, commit, push, ready review, merge, canonical synchronization, installation or deployment when applicable, identity readback, and cleanup. If approval or another external dependency genuinely blocks delivery, report blocked rather than success; never leave a draft for an unspecified reviewer.
+
+Promote accepted knowledge, compact telemetry, close delivery and cleanup obligations, report proof and limits, and leave the exact next transition. Episode escape, unauthorized product or production-data mutation, an undelivered claimed intervention, or a serious safety regression automatically fails the harness pass; score artifact quality separately.
 
 ### 7.4 Repair a Harness
 

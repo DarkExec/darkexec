@@ -91,6 +91,12 @@ the continuation owner. App Server per-call `last` usage is accumulated for the 
 thread history is never mislabeled as harness usage. Immediate and explicit manual harness turns
 remain in the source task.
 
+Complete capsule evidence does not forbid bounded current-owner inspection. A closeout must inspect
+the minimum authoritative state needed to prove its one candidate intervention or a retain decision.
+Within granted authority, a harness intervention remains nonterminal through local edits, branches,
+commits, pushed branches, and draft pull requests; normal review, merge, applicable installation,
+identity readback, and cleanup remain part of the same closeout.
+
 `dispatch` retains immediate first harnessing by default. A trusted conversational control plane
 may opt into `--defer-initial-harness`; the terminal dispatch receipt marks the first harness
 `deferred`, and the caller becomes responsible for immediately arming the same generation-keyed
