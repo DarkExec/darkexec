@@ -76,7 +76,9 @@ runtime resumes the exact persisted target by both its validated task ID and App
 path, rereads its history, and freezes a bounded private capsule representing every post-harness
 turn. Per-turn request/result text is bounded, raw tool payloads stay omitted, and the native rollout
 contributes aggregate and ranked token, model-call, tool-call, compaction, duration, and failure
-telemetry. It starts one fresh target-owned closeout
+telemetry. Fixed-label activity totals and bounded ordered spans preserve where inspect, edit,
+validation, browser, delivery, deploy, and wait cost occurred without retaining commands, arguments,
+paths, or raw output. It starts one fresh target-owned closeout
 task from that capsule and sends at most one trailing harness after the latest product turn; a
 manual harness, newer activity, an active turn, or an interrupted lineage makes it stop or defer
 without duplicate work. Dependent cross-task work and consequential phase changes flush pending

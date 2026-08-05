@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import argparse, base64, fcntl, hashlib, json
+import argparse, base64, fcntl, hashlib, json, re
 import os, select, shutil, signal, socket, struct, subprocess, sys
 import tempfile, time, tomllib
 from datetime import datetime, timedelta, timezone
@@ -33,6 +33,7 @@ BOUNDED_CLOSEOUT_VERSION = "darkexec-bounded-closeout/v2"
 BOUNDED_CLOSEOUT_TEXT_LIMIT = 1500
 BOUNDED_CLOSEOUT_REQUEST_LIMIT = 800
 BOUNDED_CLOSEOUT_RESULT_HEAD_LIMIT = 500
+BOUNDED_CLOSEOUT_ACTIVITY_SPAN_LIMIT = 64
 READ_ONLY_HARNESS_PROMPT = (
     "FIRE DRILL harness proof only. Review this task's completed trajectory without using tools, inspecting "
     "files, changing state, continuing product work, or contacting anyone. Briefly report whether the request "
@@ -1657,6 +1658,87 @@ def capsule_agent_text(turn: dict) -> tuple[str | None, str | None]:
     )
 
 
+def rollout_activity_kind(payload: dict) -> str:
+    """Classify one native tool call without retaining its arguments or command text."""
+    outer = str(payload.get("name") or "").lower()
+    encoded = str(payload.get("input") or payload.get("arguments") or "")
+    lowered = encoded.lower()
+    nested = set(re.findall(r"tools\.([a-zA-Z0-9_]+)", encoded))
+    if outer == "wait" or nested.intersection({"wait", "write_stdin"}):
+        return "wait"
+    if nested.intersection({"apply_patch", "image_gen__imagegen"}):
+        return "edit"
+    if nested.intersection({"update_plan"}):
+        return "plan"
+    if nested.intersection({"view_image", "playwright"}) or "playwright" in lowered:
+        return "browser"
+    if any(marker in lowered for marker in (
+        "git push", "git commit", "gh pr create", "gh pr merge", "gh api.*merge",
+    )):
+        return "delivery"
+    if any(marker in lowered for marker in (
+        "install-host", "release_status", "deploy.py", "systemctl restart",
+    )):
+        return "deploy"
+    if any(marker in lowered for marker in (
+        "validate.sh", "unittest", "pytest", "test_cli.py", "npm test", "bash -n",
+    )):
+        return "validate"
+    if any(marker in lowered for marker in (
+        "rg ", "sed -n", "git status", "git diff", "git show", "git log",
+        "sqlite", "pragma table_info", "find ", "ls-tree", "readlink",
+    )):
+        return "inspect"
+    return "other"
+
+
+def summarized_rollout_activity(activities: list[dict]) -> dict:
+    """Return fixed-label totals and bounded ordered spans; discard private call material."""
+    kinds = ("initial", "inspect", "plan", "edit", "validate", "browser", "delivery",
+             "deploy", "wait", "other")
+    totals = {
+        kind: {"kind": kind, "toolCalls": 0, "toolFailures": 0,
+               "toolOutputBytes": 0, "modelCallsAfter": 0}
+        for kind in kinds
+    }
+    spans = []
+    for activity in activities:
+        if not any(int(activity.get(key) or 0) for key in (
+            "toolCalls", "toolFailures", "toolOutputBytes", "modelCallsAfter"
+        )):
+            continue
+        kind = activity["kind"]
+        target = totals[kind]
+        target["toolCalls"] += int(activity.get("toolCalls") or 0)
+        target["toolFailures"] += int(activity.get("toolFailures") or 0)
+        target["toolOutputBytes"] += int(activity.get("toolOutputBytes") or 0)
+        target["modelCallsAfter"] += int(activity.get("modelCallsAfter") or 0)
+        if spans and spans[-1]["kind"] == kind:
+            span = spans[-1]
+            span["toolCalls"] += int(activity.get("toolCalls") or 0)
+            span["toolFailures"] += int(activity.get("toolFailures") or 0)
+            span["toolOutputBytes"] += int(activity.get("toolOutputBytes") or 0)
+            span["modelCallsAfter"] += int(activity.get("modelCallsAfter") or 0)
+        else:
+            spans.append({
+                "kind": kind,
+                "toolCalls": int(activity.get("toolCalls") or 0),
+                "toolFailures": int(activity.get("toolFailures") or 0),
+                "toolOutputBytes": int(activity.get("toolOutputBytes") or 0),
+                "modelCallsAfter": int(activity.get("modelCallsAfter") or 0),
+            })
+    visible_totals = [record for record in totals.values() if any(
+        int(record[key] or 0) for key in (
+            "toolCalls", "toolFailures", "toolOutputBytes", "modelCallsAfter"
+        )
+    )]
+    return {
+        "totals": visible_totals,
+        "spans": spans[:BOUNDED_CLOSEOUT_ACTIVITY_SPAN_LIMIT],
+        "omittedSpans": max(0, len(spans) - BOUNDED_CLOSEOUT_ACTIVITY_SPAN_LIMIT),
+    }
+
+
 def rollout_closeout_evidence(
     rollout_path: str | None, source_thread_id: str, turn_ids: list[str]
 ) -> dict:
@@ -1677,9 +1759,14 @@ def rollout_closeout_evidence(
             "turnId": turn_id, "startedAt": None, "completedAt": None, "durationMs": None,
             "modelCalls": 0, "toolCalls": 0, "toolFailures": 0, "toolOutputBytes": 0,
             "compactions": 0, "usage": {key: 0 for key in usage({})},
+            "activity": {},
             "_baselineUsage": {key: 0 for key in usage({})},
             "_lastUsageSum": {key: 0 for key in usage({})},
             "_sawTotalUsage": False,
+            "_activities": [{"kind": "initial", "toolCalls": 0, "toolFailures": 0,
+                              "toolOutputBytes": 0, "modelCallsAfter": 0}],
+            "_activityCalls": {},
+            "_lastActivity": None,
         }
         for turn_id in turn_ids
     }
@@ -1722,16 +1809,39 @@ def rollout_closeout_evidence(
                                 records[active_turn_id]["_lastUsageSum"], usage(last)
                             )
                             records[active_turn_id]["modelCalls"] += 1
+                            activity = records[active_turn_id]["_lastActivity"]
+                            if activity is None:
+                                activity = records[active_turn_id]["_activities"][0]
+                            activity["modelCallsAfter"] += 1
                         if isinstance(total_usage, dict):
                             records[active_turn_id]["_sawTotalUsage"] = True
                 elif item_type == "response_item" and active_turn_id in wanted:
                     response_type = payload.get("type")
                     if response_type in {"custom_tool_call", "function_call"}:
-                        records[active_turn_id]["toolCalls"] += 1
+                        record = records[active_turn_id]
+                        record["toolCalls"] += 1
+                        activity = {
+                            "kind": rollout_activity_kind(payload), "toolCalls": 1,
+                            "toolFailures": 0, "toolOutputBytes": 0, "modelCallsAfter": 0,
+                        }
+                        record["_activities"].append(activity)
+                        record["_lastActivity"] = activity
+                        call_id = payload.get("call_id")
+                        if call_id:
+                            record["_activityCalls"][str(call_id)] = activity
                     elif response_type in {"custom_tool_call_output", "function_call_output"}:
-                        records[active_turn_id]["toolOutputBytes"] += len(raw_line)
+                        record = records[active_turn_id]
+                        output_bytes = len(raw_line)
+                        record["toolOutputBytes"] += output_bytes
+                        activity = record["_activityCalls"].get(str(payload.get("call_id") or ""))
+                        if activity is None:
+                            activity = record["_lastActivity"]
+                        if activity is not None:
+                            activity["toolOutputBytes"] += output_bytes
                         if payload.get("is_error") is True or payload.get("success") is False:
-                            records[active_turn_id]["toolFailures"] += 1
+                            record["toolFailures"] += 1
+                            if activity is not None:
+                                activity["toolFailures"] += 1
                 elif item_type == "compacted" and active_turn_id in wanted:
                     records[active_turn_id]["compactions"] += 1
                 elif item_type == "event_msg" and payload.get("type") == "task_complete":
@@ -1759,9 +1869,13 @@ def rollout_closeout_evidence(
         "usage": {key: 0 for key in usage({})},
     }
     for record in records.values():
+        record["activity"] = summarized_rollout_activity(record["_activities"])
         record.pop("_baselineUsage", None)
         record.pop("_lastUsageSum", None)
         record.pop("_sawTotalUsage", None)
+        record.pop("_activities", None)
+        record.pop("_activityCalls", None)
+        record.pop("_lastActivity", None)
     for record in records.values():
         for key in ("modelCalls", "toolCalls", "toolFailures", "toolOutputBytes", "compactions"):
             totals[key] += int(record[key] or 0)
@@ -1773,6 +1887,10 @@ def rollout_closeout_evidence(
     elif missing:
         reason = "persisted rollout is missing one or more post-harness turns"
     ordered = [records[turn_id] for turn_id in turn_ids]
+    aggregate_activities = []
+    for record in ordered:
+        for activity in record["activity"]["totals"]:
+            aggregate_activities.append(activity)
     return {
         "status": "complete" if complete else "incomplete",
         "evidenceComplete": complete,
@@ -1780,6 +1898,7 @@ def rollout_closeout_evidence(
         "sourceSha256": digest.hexdigest(),
         "missingTurnIds": missing,
         "totals": totals,
+        "activityTotals": summarized_rollout_activity(aggregate_activities)["totals"],
         "turns": ordered,
         "hotspots": sorted(
             ordered,
@@ -1861,6 +1980,7 @@ def bounded_closeout_capsule(thread: dict, product_turn_id: str) -> dict:
         "telemetry": telemetry,
         "limits": [
             "Raw command and tool output is omitted to avoid duplicating credentials or private bulk evidence.",
+            "Tool arguments and commands are reduced to fixed-label activity totals and ordered spans.",
             "Every post-harness turn is represented; detailed text is bounded per turn.",
             "Open the source task or exact target state only when this capsule names a missing fact.",
         ],
