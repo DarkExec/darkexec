@@ -280,6 +280,7 @@ def main() -> None:
         source_rollout = root / "source-rollout.jsonl"
         source_rollout.write_text("\n".join(json.dumps(item) for item in [
             {"type": "session_meta", "payload": {"id": "source-thread"}},
+            {"type": "session_meta", "payload": {"id": "forked-from-thread"}},
             {"timestamp": "2026-08-05T00:00:00Z", "type": "event_msg", "payload": {
                 "type": "task_started", "turn_id": "product-turn",
             }},

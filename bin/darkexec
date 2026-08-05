@@ -1700,7 +1700,11 @@ def rollout_closeout_evidence(
                 payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
                 item_type = item.get("type")
                 if item_type == "session_meta":
-                    observed_thread_id = payload.get("id")
+                    # A native fork starts with its own identity and then copies the source
+                    # rollout, including the source session_meta record. The first identity is
+                    # therefore authoritative for the persisted rollout being evaluated.
+                    if observed_thread_id is None:
+                        observed_thread_id = payload.get("id")
                 elif item_type == "event_msg" and payload.get("type") == "task_started":
                     active_turn_id = payload.get("turn_id")
                     if active_turn_id in wanted:
