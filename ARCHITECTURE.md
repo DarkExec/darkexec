@@ -9,7 +9,7 @@ interactive: installed workspace -> exact saved project -> verbatim target task
                                                     -> attached same-turn steering
                                                     -> immediate initial harness
                                                     -> same-target follow-up burst
-                                                    -> bounded fresh-context trailing harness
+                                                    -> same-session trailing harness
 background:  darkexec dispatch -> running Codex App control socket
                               -> App-listed executive and target tasks
                               -> same-target harness -> durable receipt/status
@@ -78,27 +78,16 @@ queued dependent message remains in the executive task until that immediate harn
 reuses the established target and resets one 30-minute systemd timer through `darkexec debounce`.
 Generation-keyed state under `/var/lib/darkexec/sessions` makes stale timers harmless. At expiry the
 runtime resumes the exact persisted target by both its validated task ID and App-listed rollout
-path, rereads its history, and freezes a bounded private capsule representing every post-harness
-turn. Per-turn request/result text is bounded, raw tool payloads stay omitted, and the native rollout
-contributes aggregate and ranked token, model-call, tool-call, compaction, duration, and failure
-telemetry. Fixed-label activity totals and bounded ordered spans preserve where inspect, edit,
-validation, browser, delivery, deploy, and wait cost occurred without retaining commands, arguments,
-paths, or raw output. It starts one fresh target-owned closeout
-task from that capsule and sends at most one trailing harness after the latest product turn; a
+path, then sends the captured configured prompt as at most one trailing harness turn in that same
+task. The harness therefore receives the source session's actual context without a copied,
+truncated, or separately injected representation. A
 manual harness, newer activity, an active turn, or an interrupted lineage makes it stop or defer
 without duplicate work. Dependent cross-task work and consequential phase changes flush pending
 closeout first. If the timer cannot be scheduled, closeout runs immediately.
 
-The capsule omits raw command/tool output and tool arguments, binds the exact source task and
-product turn, and records its digest plus the separate harness task identity. Missing rollout or
-turn evidence is explicit. The source task remains
-the continuation owner. App Server per-call `last` usage is accumulated for the closeout so resumed
-thread history is never mislabeled as harness usage. Immediate and explicit manual harness turns
-remain in the source task.
-
-Complete capsule evidence does not forbid bounded current-owner inspection. A closeout must inspect
-the minimum authoritative state needed to make the smallest durable harness improvement.
-Within granted authority, a harness intervention remains nonterminal through local edits, branches,
+Privacy-safe native rollout telemetry may still populate receipts, but it is never injected into the
+harness prompt. App Server per-call `last` usage keeps resumed thread history from being mislabeled
+as harness usage. Within granted authority, a harness intervention remains nonterminal through local edits, branches,
 commits, pushed branches, and draft pull requests; normal review, merge, applicable installation,
 identity readback, and cleanup remain part of the same closeout.
 
