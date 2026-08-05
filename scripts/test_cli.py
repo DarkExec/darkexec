@@ -284,9 +284,13 @@ def main() -> None:
             {"timestamp": "2026-08-05T00:00:00Z", "type": "event_msg", "payload": {
                 "type": "task_started", "turn_id": "product-turn",
             }},
-            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
             {"type": "response_item", "payload": {
-                "type": "custom_tool_call_output", "success": True,
+                "type": "custom_tool_call", "call_id": "private-call", "name": "exec",
+                "input": 'tools.exec_command({"cmd":"rg secret-token private-file"})',
+            }},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "private-call",
+                "success": True, "output": "private output",
             }},
             {"timestamp": "2026-08-05T00:00:01Z", "type": "event_msg", "payload": {
                 "type": "token_count", "info": {"last_token_usage": {
@@ -318,7 +322,16 @@ def main() -> None:
         assert capsule["telemetry"]["totals"]["modelCalls"] == 1, capsule
         assert capsule["telemetry"]["totals"]["toolCalls"] == 1, capsule
         assert capsule["telemetry"]["totals"]["usage"]["total"] == 105, capsule
-        assert "secret-bearing" not in json.dumps(capsule) and "private output" not in json.dumps(capsule)
+        activity = capsule["telemetry"]["turns"][0]["activity"]
+        assert activity["totals"][0]["kind"] == "inspect", activity
+        assert activity["totals"][0]["modelCallsAfter"] == 1, activity
+        assert activity["spans"] == [activity["totals"][0]], activity
+        assert capsule["telemetry"]["activityTotals"] == activity["totals"], capsule
+        rendered_capsule = json.dumps(capsule)
+        assert "secret-bearing" not in rendered_capsule, capsule
+        assert "secret-token" not in rendered_capsule, capsule
+        assert "private-file" not in rendered_capsule, capsule
+        assert "private output" not in rendered_capsule, capsule
         long_burst = runtime["bounded_closeout_capsule"]({
             "id": "long-thread",
             "turns": [{
