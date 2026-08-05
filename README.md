@@ -104,6 +104,9 @@ executive uses the synchronous `darkexec run` lifecycle so target and active-tur
 durable and stoppable from the executive conversation.
 When a request does not name one exact saved project, `darkexec projects --json` provides the
 read-only project list used to resolve the target once or fail closed.
+An authenticated multi-host control plane can use `darkexec resolve-global` with its bounded list
+of `(hostId, targetPath)` candidates. The result selects exactly one supplied pair; the control
+plane then dispatches on that host. The runtime never invents a host or remote transport.
 
 The first interactive result receives an immediate same-task harness pass. Clearly dependent
 follow-ups can be queued in the same DarkExec conversation while it runs; they wait for that
@@ -293,10 +296,14 @@ general sandbox. Callers retain authorization, scheduling, deduplication, and ex
 
 ```bash
 sudo darkexec update
+darkexec identity --json
 ```
 
 `darkexec update` fetches public `main`, runs the release validator, creates a commit-addressed
 release, and atomically switches `/opt/darkexec/current`. Reinstall a known checkout to roll back.
+Coordinated callers use `--expected-commit <40-hex-sha>` so a moved release fails before install.
+`darkexec identity --json` readbacks the installed runtime revision, workspace, exact saved
+projects, protocol version, and native Codex App socket readiness without starting work.
 Installation also exposes the pinned release doctrine at both `/srv/darkexec/harness-ops.md` and the
 conventional `/srv/harness-ops.md` host path when that host path has no existing doctrine owner.
 Readable existing bindings are preserved; missing or broken bindings are repaired to the pinned

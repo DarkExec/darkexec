@@ -1555,6 +1555,14 @@ def main() -> None:
         updated_result = json.loads(updated.stdout)
         assert updated.returncode == 0 and updated_result["status"] == "updated", updated.stderr or updated.stdout
         assert updated_result["commit"] == "update-test", updated_result
+        expected_update = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "update", "--expected-commit", "0" * 40, "--json"],
+            capture_output=True, text=True,
+            env={**env, "DARKEXEC_UPDATE_REPOSITORY": str(update_source), "DARKEXEC_UPDATE_REF": "main"},
+            check=False,
+        )
+        assert expected_update.returncode != 0, expected_update.stdout
+        assert "DarkExec update moved" in expected_update.stderr, expected_update.stderr
     print(json.dumps({"status": "passed", "contracts": [
         "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
         "one-executive", "one-target", "same-task-harness",
@@ -1579,7 +1587,7 @@ def main() -> None:
         "unbounded-turn-wait", "lost-completion-reconciliation",
         "append-only-harness-episode", "manual-deferred-episode-identity",
         "started-harness-interruption-preserved", "journal-failure-isolated",
-        "install-default-verification", "self-update",
+        "install-default-verification", "self-update", "pinned-self-update",
     ]}))
 
 

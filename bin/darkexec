@@ -22,6 +22,7 @@ DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops
 TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "0"))
 UPDATE_REPOSITORY = os.environ.get("DARKEXEC_UPDATE_REPOSITORY", "https://github.com/DarkExec/darkexec")
 UPDATE_REF = os.environ.get("DARKEXEC_UPDATE_REF", "main")
+REMOTE_PROTOCOL_VERSION = 1
 APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
                                         "/root/.codex/app-server-control/app-server-control.sock"))
 HARNESS_PROMPT = (
@@ -2602,6 +2603,14 @@ def update_install(args) -> int:
         fetched = subprocess.run(clone, capture_output=True, text=True, check=False)
         if fetched.returncode:
             raise SystemExit(f"cannot fetch DarkExec update: {fetched.stderr.strip() or fetched.stdout.strip()}")
+        fetched_commit = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if args.expected_commit and fetched_commit != args.expected_commit:
+            raise SystemExit(
+                f"DarkExec update moved: expected {args.expected_commit}, fetched {fetched_commit}"
+            )
         installed = subprocess.run(
             [str(checkout / "scripts/install.sh")],
             capture_output=True, text=True, check=False,
@@ -2619,6 +2628,30 @@ def update_install(args) -> int:
         f"next={result.get('nextAction')}"
     ))
     return 0
+
+
+def identity(args) -> int:
+    socket_ready = False
+    socket_error = None
+    try:
+        with AppServer():
+            socket_ready = True
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        socket_error = str(exc)[:500]
+    result = {
+        "schemaVersion": 1,
+        "protocolVersion": REMOTE_PROTOCOL_VERSION,
+        "runtimeRevision": runtime_revision(),
+        "workspace": str(WORKSPACE),
+        "appServerReady": socket_ready,
+        "appServerError": socket_error,
+        "projects": saved_projects(),
+    }
+    print(json.dumps(result) if args.json else (
+        f"runtime={result['runtimeRevision']} protocol={REMOTE_PROTOCOL_VERSION} "
+        f"app_server={'ready' if socket_ready else 'unavailable'}"
+    ))
+    return 0 if socket_ready and result["projects"] else 1
 
 
 def find_receipt_path(job_id: str | None, thread_id: str | None) -> Path:
@@ -2733,7 +2766,10 @@ def main() -> int:
     global_resolve.add_argument("--prompt-stdin", action="store_true", required=True)
     global_resolve.add_argument("--json", action="store_true")
     update = sub.add_parser("update")
+    update.add_argument("--expected-commit")
     update.add_argument("--json", action="store_true")
+    identity_read = sub.add_parser("identity")
+    identity_read.add_argument("--json", action="store_true")
     status = sub.add_parser("status")
     identity = status.add_mutually_exclusive_group(required=True)
     identity.add_argument("--job-id")
@@ -2745,6 +2781,8 @@ def main() -> int:
         return dispatch(args)
     if args.command == "resolve-global":
         return resolve_global(args)
+    if args.command == "identity":
+        return identity(args)
     if args.command == "run":
         return run_target(args)
     if args.command == "continue":
