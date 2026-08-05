@@ -277,8 +277,29 @@ def main() -> None:
         root = Path(temp)
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
         normalize_input_items = runtime["normalize_input_items"]
+        source_rollout = root / "source-rollout.jsonl"
+        source_rollout.write_text("\n".join(json.dumps(item) for item in [
+            {"type": "session_meta", "payload": {"id": "source-thread"}},
+            {"timestamp": "2026-08-05T00:00:00Z", "type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "product-turn",
+            }},
+            {"type": "response_item", "payload": {"type": "custom_tool_call"}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "success": True,
+            }},
+            {"timestamp": "2026-08-05T00:00:01Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"last_token_usage": {
+                    "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 5,
+                    "reasoning_output_tokens": 2, "total_tokens": 105,
+                }},
+            }},
+            {"timestamp": "2026-08-05T00:00:02Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "product-turn", "duration_ms": 2000,
+            }},
+        ]) + "\n")
         capsule = runtime["bounded_closeout_capsule"]({
             "id": "source-thread",
+            "_rolloutPath": str(source_rollout),
             "turns": [{
                 "id": "product-turn", "status": "completed", "items": [
                     {"type": "userMessage", "content": [{"type": "text", "text": "Ship it"}]},
@@ -292,7 +313,25 @@ def main() -> None:
         assert capsule["sourceThreadId"] == "source-thread", capsule
         assert capsule["totals"]["commandFailures"] == 1, capsule
         assert capsule["turns"][0]["changedPaths"] == ["owned.py"], capsule
+        assert capsule["evidenceComplete"] is True, capsule
+        assert capsule["telemetry"]["totals"]["modelCalls"] == 1, capsule
+        assert capsule["telemetry"]["totals"]["toolCalls"] == 1, capsule
+        assert capsule["telemetry"]["totals"]["usage"]["total"] == 105, capsule
         assert "secret-bearing" not in json.dumps(capsule) and "private output" not in json.dumps(capsule)
+        long_burst = runtime["bounded_closeout_capsule"]({
+            "id": "long-thread",
+            "turns": [{
+                "id": f"turn-{number}", "status": "completed", "items": [
+                    {"type": "userMessage", "content": [{
+                        "type": "text", "text": f"Request {number}",
+                    }]},
+                    {"type": "agentMessage", "text": f"Result {number}"},
+                ],
+            } for number in range(8)],
+        }, "turn-7")
+        assert len(long_burst["turns"]) == 8, long_burst
+        assert long_burst["omittedEarlierTurns"] == 0, long_burst
+        assert long_burst["evidenceComplete"] is False, long_burst
         attachment_input = [
             {"type": "text", "text": 'Approve release.\n\nAttached image: "logo.png"'},
             {"type": "localImage", "path": "/tmp/logo.png"},
