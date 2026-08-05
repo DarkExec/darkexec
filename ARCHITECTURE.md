@@ -52,6 +52,18 @@ User input is bounded to 20,000 characters and terminal agent results to 12,000 
 fails rather than silently omitting a larger gap. The default remains content-free, and no broader
 transcript is returned.
 
+An authenticated multi-host control plane may ask one local DarkExec executive to choose among a
+bounded candidate file of `(hostId, targetPath)` pairs with `resolve-global`. The receipt is keyed
+to the request and candidate digest, and the result must exactly match a supplied pair. DarkExec
+does not connect to the selected host; the control plane retains transport authority and performs
+the subsequent exact-host dispatch.
+
+An authenticated multi-host control plane may ask one local DarkExec executive to choose among a
+bounded candidate file of `(hostId, targetPath)` pairs with `resolve-global`. The receipt is keyed
+to the request and candidate digest, and the result must exactly match a supplied pair. DarkExec
+does not connect to the selected host; the control plane retains transport authority and performs
+the subsequent exact-host dispatch.
+
 Interactive routing uses runtime-owned `run` and `continue` commands so each executive, runner,
 target task, and active turn is durably bound before waiting. The first target result is harnessed
 immediately. For delegated user turns, the runtime rereads the one active executive turn and clones
@@ -97,6 +109,10 @@ through a mode-0600 local control socket. The attached runner sends native `turn
 existing App Server connection and returns the native acknowledgement. The socket exists only
 during product turns, requires the exact target and turn precondition, and is absent during harness
 or synthetic closeout turns.
+
+The `identity` command proves installed commit, protocol, saved projects, and App Server readiness
+without starting work. Coordinated updates may require an exact fetched commit; a mismatch stops
+before validation or the atomic current-release switch.
 
 `darkexec run` and `darkexec dispatch` remain one-shot/background paths and harness immediately.
 Their target and harness turns wait without a runtime deadline by default; explicit positive
