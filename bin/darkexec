@@ -1971,6 +1971,8 @@ def emit_closeout_episode(
         target={
             "threadId": state["threadId"],
             "turnId": state.get("productTurnId"),
+            "usage": state.get("targetUsage"),
+            "modelCallCount": state.get("targetModelCallCount"),
             "resultText": agent_text(product) or None,
         },
         harness={
@@ -2077,9 +2079,14 @@ def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
             atomic_write(path, state)
             capsule = bounded_closeout_capsule(thread, state["productTurnId"])
             harness_thread = app.start_thread(target)
+            telemetry_totals = capsule.get("telemetry", {}).get("totals", {})
             state.update({
                 "harnessThreadId": harness_thread["id"],
                 "harnessCapsuleSha256": hashlib.sha256(canonical_json(capsule).encode()).hexdigest(),
+                "targetUsage": telemetry_totals.get("usage") if capsule["evidenceComplete"] else None,
+                "targetModelCallCount": (
+                    telemetry_totals.get("modelCalls") if capsule["evidenceComplete"] else None
+                ),
             })
             atomic_write(path, state)
             def harness_started(_thread_id: str, turn_id: str) -> None:
