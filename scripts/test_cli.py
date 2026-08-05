@@ -1432,11 +1432,36 @@ def main() -> None:
              "command": "private command", "aggregatedOutput": "private output"},
             {"id": "a-product-3", "type": "agentMessage", "text": "Completed after one retry."},
         ]}]
+        fallback_rollout = root / "fallback-target.jsonl"
+        fallback_rollout.write_text("\n".join(json.dumps(item) for item in [
+            {"type": "session_meta", "payload": {"id": timer_thread}},
+            {"timestamp": "2026-08-05T00:00:00Z", "type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "product-3",
+            }},
+            {"timestamp": "2026-08-05T00:00:01Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {
+                    "last_token_usage": {
+                        "input_tokens": 90, "cached_input_tokens": 50, "output_tokens": 10,
+                        "reasoning_output_tokens": 3, "total_tokens": 100,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 90, "cached_input_tokens": 50, "output_tokens": 10,
+                        "reasoning_output_tokens": 3, "total_tokens": 100,
+                    },
+                },
+            }},
+            {"timestamp": "2026-08-05T00:00:02Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "product-3", "duration_ms": 2000,
+            }},
+        ]) + "\n")
         fallback_inputs = []
         fallback_server = threading.Thread(
             target=fake_app_server,
             args=(fallback_socket, fallback_ready, True, None, {
-                timer_thread: {"cwd": str(target), "turns": fallback_turns},
+                timer_thread: {
+                    "cwd": str(target), "turns": fallback_turns,
+                    "path": str(fallback_rollout), "requirePath": True,
+                },
             }, fallback_inputs),
             daemon=True,
         )
@@ -1490,6 +1515,8 @@ def main() -> None:
         assert fallback_episode["target"]["harness"]["turnId"], fallback_episode
         assert fallback_episode["target"]["harness"]["threadId"] == fallback_result["harnessThreadId"]
         assert fallback_episode["target"]["harness"]["usage"]["input"] == 10, fallback_episode
+        assert fallback_episode["target"]["usage"]["total"] == 100, fallback_episode
+        assert fallback_episode["target"]["modelCallCount"] == 1, fallback_episode
         cancelled = subprocess.run(
             [str(ROOT / "bin/darkexec"), "debounce-cancel", "--thread", timer_thread, "--json"],
             capture_output=True, text=True, env=timer_env, check=False,
