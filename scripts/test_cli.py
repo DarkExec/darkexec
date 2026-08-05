@@ -330,55 +330,22 @@ def main() -> None:
                 "type": "task_complete", "turn_id": "product-turn", "duration_ms": 2000,
             }},
         ]) + "\n")
-        capsule = runtime["bounded_closeout_capsule"]({
-            "id": "source-thread",
-            "_rolloutPath": str(source_rollout),
-            "turns": [{
-                "id": "product-turn", "status": "completed", "items": [
-                    {"type": "userMessage", "content": [{"type": "text", "text": "Ship it"}]},
-                    {"type": "commandExecution", "status": "failed", "exitCode": 1,
-                     "command": "secret-bearing command", "aggregatedOutput": "private output"},
-                    {"type": "fileChange", "changes": [{"path": "owned.py", "kind": "update"}]},
-                    {"type": "agentMessage", "text": "Delivered with one corrected retry."},
-                ],
-            }],
-        }, "product-turn")
-        assert capsule["sourceThreadId"] == "source-thread", capsule
-        assert capsule["totals"]["commandFailures"] == 1, capsule
-        assert capsule["turns"][0]["changedPaths"] == ["owned.py"], capsule
-        assert capsule["evidenceComplete"] is True, capsule
-        assert capsule["telemetry"]["totals"]["modelCalls"] == 1, capsule
-        assert capsule["telemetry"]["totals"]["toolCalls"] == 1, capsule
-        assert capsule["telemetry"]["totals"]["usage"]["total"] == 105, capsule
-        activity = capsule["telemetry"]["turns"][0]["activity"]
+        source_evidence = runtime["rollout_closeout_evidence"](
+            str(source_rollout), "source-thread", ["product-turn"]
+        )
+        assert source_evidence["evidenceComplete"] is True, source_evidence
+        assert source_evidence["totals"]["modelCalls"] == 1, source_evidence
+        assert source_evidence["totals"]["toolCalls"] == 1, source_evidence
+        assert source_evidence["totals"]["usage"]["total"] == 105, source_evidence
+        activity = source_evidence["turns"][0]["activity"]
         assert activity["totals"][0]["kind"] == "inspect", activity
         assert activity["totals"][0]["modelCallsAfter"] == 1, activity
         assert activity["spans"] == [activity["totals"][0]], activity
-        assert capsule["telemetry"]["activityTotals"] == activity["totals"], capsule
-        closeout_prompt = runtime["bounded_closeout_prompt"]("Harness pass.", capsule)
-        assert "avoidable trial, error, stale routing, or repeated work" in closeout_prompt
-        assert "repairing, simplifying, consolidating, or removing" in closeout_prompt
-        assert "retain decision" not in closeout_prompt.lower()
-        assert "retain/no-change" not in closeout_prompt.lower()
-        rendered_capsule = json.dumps(capsule)
-        assert "secret-bearing" not in rendered_capsule, capsule
-        assert "secret-token" not in rendered_capsule, capsule
-        assert "private-file" not in rendered_capsule, capsule
-        assert "private output" not in rendered_capsule, capsule
-        long_burst = runtime["bounded_closeout_capsule"]({
-            "id": "long-thread",
-            "turns": [{
-                "id": f"turn-{number}", "status": "completed", "items": [
-                    {"type": "userMessage", "content": [{
-                        "type": "text", "text": f"Request {number}",
-                    }]},
-                    {"type": "agentMessage", "text": f"Result {number}"},
-                ],
-            } for number in range(8)],
-        }, "turn-7")
-        assert len(long_burst["turns"]) == 8, long_burst
-        assert long_burst["omittedEarlierTurns"] == 0, long_burst
-        assert long_burst["evidenceComplete"] is False, long_burst
+        assert source_evidence["activityTotals"] == activity["totals"], source_evidence
+        rendered_evidence = json.dumps(source_evidence)
+        assert "secret-token" not in rendered_evidence, source_evidence
+        assert "private-file" not in rendered_evidence, source_evidence
+        assert "private output" not in rendered_evidence, source_evidence
         attachment_input = [
             {"type": "text", "text": 'Approve release.\n\nAttached image: "logo.png"'},
             {"type": "localImage", "path": "/tmp/logo.png"},
@@ -1524,20 +1491,16 @@ def main() -> None:
         fallback_result = json.loads(fallback.stdout)
         assert fallback.returncode == 0 and fallback_result["status"] == "completed", fallback_result
         assert fallback_result["scheduleError"], fallback_result
-        assert fallback_result["harnessThreadId"] != timer_thread, fallback_result
-        capsule_prompt = next(
+        assert fallback_result["harnessThreadId"] == timer_thread, fallback_result
+        submitted_prompt = next(
             item["text"] for item in fallback_inputs[-1]
             if item.get("type") == "text"
         )
-        assert "DARKEXEC BOUNDED TRAILING CLOSEOUT" in capsule_prompt, capsule_prompt
-        assert '"sourceThreadId":"' + timer_thread + '"' in capsule_prompt, capsule_prompt
-        assert "private command" not in capsule_prompt and "private output" not in capsule_prompt
-        assert "minimum current authoritative owner state" in capsule_prompt, capsule_prompt
-        assert "repairing, simplifying, consolidating, or removing" in capsule_prompt, capsule_prompt
-        assert "retain/no-change" not in capsule_prompt.lower(), capsule_prompt
-        assert "ready-for-review pull request" in capsule_prompt, capsule_prompt
-        assert "draft pull request is not success" in capsule_prompt, capsule_prompt
-        assert "inspect only a named missing fact" not in capsule_prompt, capsule_prompt
+        fallback_state = json.loads(manual_state_path.read_text())
+        assert submitted_prompt == fallback_state["harnessPrompt"], submitted_prompt
+        assert "DARKEXEC BOUNDED TRAILING CLOSEOUT" not in submitted_prompt, submitted_prompt
+        assert "CAPSULE" not in submitted_prompt, submitted_prompt
+        assert "harnessCapsuleSha256" not in fallback_state, fallback_state
         fallback_server.join(timeout=2)
         assert not fallback_server.is_alive()
         journal = [
@@ -1565,7 +1528,7 @@ def main() -> None:
         )
         assert fallback_episode["status"] == "completed", fallback_episode
         assert fallback_episode["target"]["harness"]["turnId"], fallback_episode
-        assert fallback_episode["target"]["harness"]["threadId"] == fallback_result["harnessThreadId"]
+        assert fallback_episode["target"]["harness"]["threadId"] == timer_thread
         assert fallback_episode["target"]["harness"]["usage"]["input"] == 10, fallback_episode
         assert fallback_episode["target"]["usage"]["total"] == 100, fallback_episode
         assert fallback_episode["target"]["modelCallCount"] == 1, fallback_episode
@@ -1710,7 +1673,7 @@ def main() -> None:
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "deferred-initial-harness", "executive-target-resolution",
         "manual-harness-suppression",
-        "schedule-failure-immediate-closeout", "bounded-fresh-context-closeout",
+            "schedule-failure-immediate-closeout", "same-session-trailing-closeout",
         "per-call-closeout-usage", "cold-task-resume",
         "persisted-rollout-path-resume", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",

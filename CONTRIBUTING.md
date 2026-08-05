@@ -9,7 +9,5 @@ customer data belong outside this repository.
 Run `./scripts/validate.sh` and describe the behavioral claim, proof, compatibility limits, and
 rollback for material changes.
 
-Trailing closeout must preserve exact source task/product-turn identity, represent every post-harness
-turn, omit raw tool output from its bounded capsule, expose missing evidence rather than silently
-truncating it, attribute only per-call harness usage, and leave the source task as the sole
-continuation owner.
+Trailing closeout must preserve exact source task/product-turn identity, run in that source task,
+send exactly the configured harness prompt, and attribute only per-call harness usage.

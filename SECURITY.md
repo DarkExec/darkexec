@@ -12,11 +12,9 @@ Same-turn steering uses an executive-scoped mode-0600 Unix socket that exists on
 attached product turn is active. It requires exact target and turn identities and is unavailable
 during harness or synthetic closeout work.
 
-Automatic trailing closeout copies only bounded user/agent text, failure kinds, changed paths, and
-counts into its fresh target-owned task. It never copies raw command or tool output, tool arguments,
-attachments, or broad transcript state. Capsule text remains private and can retain sensitive text
-the user or agent placed in the source messages. Its digest and exact source, product, harness-task,
-and harness-turn identities remain in runtime-owned receipts.
+Automatic trailing closeout resumes the exact source task and adds only the configured harness
+prompt. It does not copy the transcript, tool output, attachments, or other task content into a
+second task.
 
 The editable standard harness prompt is bounded, atomically replaced, and stored in a mode-0600
 runtime file beneath a mode-0700 state directory. The read-only fire-drill prompt is fixed
