@@ -91,6 +91,12 @@ as harness usage. Within granted authority, a harness intervention remains nonte
 commits, pushed branches, and draft pull requests; normal review, merge, applicable installation,
 identity readback, and cleanup remain part of the same closeout.
 
+Regression history: parent `DarkExec/darkexec-harness` PR #30 (`51e14d6a`) violated this ownership
+contract by creating a separate harness task with hidden bounded-closeout instructions and a
+trajectory capsule. Runtime PR #40 and parent PR #69 restored same-session verbatim closeout. Do not
+recreate the separate-task or injected-context path; `same-session-trailing-closeout` is the owning
+runtime validation contract.
+
 `dispatch` retains immediate first harnessing by default. A trusted conversational control plane
 may opt into `--defer-initial-harness`; the terminal dispatch receipt marks the first harness
 `deferred`, and the caller becomes responsible for immediately arming the same generation-keyed
