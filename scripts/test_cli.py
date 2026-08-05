@@ -276,6 +276,34 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
+        prompt_path = root / "config" / "harness-prompt.txt"
+        prompt_env = {**os.environ, "DARKEXEC_HARNESS_PROMPT_PATH": str(prompt_path)}
+        default_prompt = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "harness-prompt", "--json"],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert default_prompt["source"] == "default" and default_prompt["isDefault"] is True
+        custom_text = "Review this completed session and make one durable harness improvement."
+        saved_prompt = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "harness-prompt", "--set-stdin", "--json"],
+            input=custom_text, capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert saved_prompt == {
+            "schemaVersion": 1, "prompt": custom_text,
+            "source": "custom", "isDefault": False,
+        }, saved_prompt
+        assert prompt_path.read_text() == custom_text + "\n"
+        assert prompt_path.stat().st_mode & 0o777 == 0o600
+        empty_prompt = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "harness-prompt", "--set-stdin", "--json"],
+            input="  ", capture_output=True, text=True, env=prompt_env, check=False,
+        )
+        assert empty_prompt.returncode != 0 and "must not be empty" in empty_prompt.stderr
+        reset_prompt = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "harness-prompt", "--reset", "--json"],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert reset_prompt["source"] == "default" and not prompt_path.exists()
         normalize_input_items = runtime["normalize_input_items"]
         source_rollout = root / "source-rollout.jsonl"
         source_rollout.write_text("\n".join(json.dumps(item) for item in [

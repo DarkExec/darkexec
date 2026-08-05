@@ -18,6 +18,11 @@ background:  darkexec dispatch -> running Codex App control socket
 `darkexec dispatch` rejects unsaved targets and conflicting job reuse. It records executive, target,
 harness, usage, and terminal state under `DARKEXEC_STATE_ROOT`. Interactive debounce state is
 separate under `DARKEXEC_SESSION_ROOT` and is readable with `darkexec debounce-status`.
+The standard harness prompt is runtime-owned and defaults to the doctrine's normal wind-up request.
+`darkexec harness-prompt` reads it, while authenticated control planes may atomically set or reset
+the mode-0600 override under `/var/lib/darkexec/config`. Immediate passes read the current value;
+each trailing closeout captures it when that closeout generation is scheduled. The read-only fire
+drill prompt is fixed separately and cannot be weakened through this setting.
 
 Every terminal harness lifecycle also publishes one immutable private episode under
 `DARKEXEC_HARNESS_EPISODE_ROOT`. Immediate, deferred, exact manual, read-only, failed, interrupted,

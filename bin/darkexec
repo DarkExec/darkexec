@@ -19,16 +19,20 @@ CONTROL_ROOT = Path(os.environ.get("DARKEXEC_CONTROL_ROOT", "/var/lib/darkexec/c
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
 CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
 DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
+HARNESS_PROMPT_PATH = Path(os.environ.get(
+    "DARKEXEC_HARNESS_PROMPT_PATH", "/var/lib/darkexec/config/harness-prompt.txt"
+))
 TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "0"))
 UPDATE_REPOSITORY = os.environ.get("DARKEXEC_UPDATE_REPOSITORY", "https://github.com/DarkExec/darkexec")
 UPDATE_REF = os.environ.get("DARKEXEC_UPDATE_REF", "main")
 REMOTE_PROTOCOL_VERSION = 1
 APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
                                         "/root/.codex/app-server-control/app-server-control.sock"))
-HARNESS_PROMPT = (
+DEFAULT_HARNESS_PROMPT = (
     "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
     f"reliable, and durable execution. Make sure we are following {DOCTRINE} doctrine."
 )
+MAX_HARNESS_PROMPT = 20000
 BOUNDED_CLOSEOUT_VERSION = "darkexec-bounded-closeout/v2"
 BOUNDED_CLOSEOUT_TEXT_LIMIT = 1500
 BOUNDED_CLOSEOUT_REQUEST_LIMIT = 800
@@ -41,6 +45,64 @@ READ_ONLY_HARNESS_PROMPT = (
 )
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def validate_harness_prompt(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("harness prompt must not be empty")
+    if len(value) > MAX_HARNESS_PROMPT:
+        raise ValueError(f"harness prompt exceeds {MAX_HARNESS_PROMPT} characters")
+    return value
+
+
+def standard_harness_prompt() -> str:
+    if not HARNESS_PROMPT_PATH.exists():
+        return DEFAULT_HARNESS_PROMPT
+    try:
+        return validate_harness_prompt(HARNESS_PROMPT_PATH.read_text())
+    except OSError as exc:
+        raise RuntimeError(f"cannot read harness prompt setting: {exc}") from exc
+
+
+def set_standard_harness_prompt(value: str) -> str:
+    value = validate_harness_prompt(value)
+    HARNESS_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=HARNESS_PROMPT_PATH.parent, prefix=".harness-prompt.", delete=False
+    ) as handle:
+        handle.write(value + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    try:
+        temporary.chmod(0o600)
+        os.replace(temporary, HARNESS_PROMPT_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return value
+
+
+def harness_prompt_setting(args) -> int:
+    try:
+        if args.set_stdin:
+            prompt = set_standard_harness_prompt(sys.stdin.read())
+            source = "custom"
+        elif args.reset:
+            HARNESS_PROMPT_PATH.unlink(missing_ok=True)
+            prompt = DEFAULT_HARNESS_PROMPT
+            source = "default"
+        else:
+            prompt = standard_harness_prompt()
+            source = "custom" if HARNESS_PROMPT_PATH.exists() else "default"
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    result = {
+        "schemaVersion": 1, "prompt": prompt, "source": source,
+        "isDefault": prompt == DEFAULT_HARNESS_PROMPT,
+    }
+    print(json.dumps(result) if args.json else prompt)
+    return 0
 
 
 class DispatchInterrupted(Exception):
@@ -1218,7 +1280,7 @@ def dispatch(args) -> int:
                 save(path, receipt, "completed")
             else:
                 save(path, receipt, "harness_running")
-                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
+                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt()
                 def harness_started(_thread_id: str, turn_id: str) -> None:
                     receipt["target"]["harness"]["turnId"] = turn_id
                     save(path, receipt, "harness_running")
@@ -1428,7 +1490,7 @@ def run_target(args) -> int:
                 result["status"] = "failed"
                 result["error"] = target_result.get("error") or "Target task failed."
             else:
-                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else HARNESS_PROMPT
+                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt()
                 result["harness"] = {"status": "running"}
                 if executive_thread_id:
                     update_execution(executive_thread_id, {"phase": "harness_starting"})
@@ -1629,7 +1691,7 @@ def harness_prompt_mode(prompt: str) -> str | None:
     lowered = prompt.lower()
     if prompt == READ_ONLY_HARNESS_PROMPT or "harness proof only" in lowered:
         return "read-only"
-    if prompt == HARNESS_PROMPT or ("harness pass" in lowered and "harness-ops" in lowered):
+    if prompt == standard_harness_prompt() or ("harness pass" in lowered and "harness-ops" in lowered):
         return "standard"
     return None
 
@@ -2334,7 +2396,11 @@ def arm_debounce(args) -> int:
         "schemaVersion": 1, "threadId": args.thread, "targetPath": str(target),
         "productTurnId": args.turn, "generation": generation,
         "debounceSeconds": args.seconds, "harnessMode": args.harness_mode,
-        "harnessPrompt": READ_ONLY_HARNESS_PROMPT if args.harness_mode == "read-only" else HARNESS_PROMPT,
+        "harnessPrompt": (
+            READ_ONLY_HARNESS_PROMPT
+            if args.harness_mode == "read-only"
+            else standard_harness_prompt()
+        ),
         "status": "paused" if paused else "pending", "createdAt": prior.get("createdAt") or now(),
         "updatedAt": now(),
         "dueAt": None if paused else (
@@ -3054,6 +3120,11 @@ def main() -> int:
     fire.add_argument("--generation", type=int, required=True)
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
+    prompt_setting = sub.add_parser("harness-prompt")
+    prompt_action = prompt_setting.add_mutually_exclusive_group()
+    prompt_action.add_argument("--set-stdin", action="store_true")
+    prompt_action.add_argument("--reset", action="store_true")
+    prompt_setting.add_argument("--json", action="store_true")
     global_resolve = sub.add_parser("resolve-global")
     global_resolve.add_argument("--job-id", required=True)
     global_resolve.add_argument("--candidates-json", required=True)
@@ -3111,6 +3182,8 @@ def main() -> int:
         paths = saved_projects()
         print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))
         return 0
+    if args.command == "harness-prompt":
+        return harness_prompt_setting(args)
     if args.command == "update":
         return update_install(args)
     path = find_receipt_path(args.job_id, args.thread)

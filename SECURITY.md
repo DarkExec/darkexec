@@ -17,3 +17,7 @@ counts into its fresh target-owned task. It never copies raw command or tool out
 attachments, or broad transcript state. Capsule text remains private and can retain sensitive text
 the user or agent placed in the source messages. Its digest and exact source, product, harness-task,
 and harness-turn identities remain in runtime-owned receipts.
+
+The editable standard harness prompt is bounded, atomically replaced, and stored in a mode-0600
+runtime file beneath a mode-0700 state directory. The read-only fire-drill prompt is fixed
+separately and cannot be changed through this setting.
