@@ -327,6 +327,11 @@ def main() -> None:
         assert activity["totals"][0]["modelCallsAfter"] == 1, activity
         assert activity["spans"] == [activity["totals"][0]], activity
         assert capsule["telemetry"]["activityTotals"] == activity["totals"], capsule
+        closeout_prompt = runtime["bounded_closeout_prompt"]("Harness pass.", capsule)
+        assert "avoidable trial, error, stale routing, or repeated work" in closeout_prompt
+        assert "repairing, simplifying, consolidating, or removing" in closeout_prompt
+        assert "retain decision" not in closeout_prompt.lower()
+        assert "retain/no-change" not in closeout_prompt.lower()
         rendered_capsule = json.dumps(capsule)
         assert "secret-bearing" not in rendered_capsule, capsule
         assert "secret-token" not in rendered_capsule, capsule
@@ -1500,7 +1505,8 @@ def main() -> None:
         assert '"sourceThreadId":"' + timer_thread + '"' in capsule_prompt, capsule_prompt
         assert "private command" not in capsule_prompt and "private output" not in capsule_prompt
         assert "minimum current authoritative owner state" in capsule_prompt, capsule_prompt
-        assert "existing delivered owner addresses the exact tax" in capsule_prompt, capsule_prompt
+        assert "repairing, simplifying, consolidating, or removing" in capsule_prompt, capsule_prompt
+        assert "retain/no-change" not in capsule_prompt.lower(), capsule_prompt
         assert "ready-for-review pull request" in capsule_prompt, capsule_prompt
         assert "draft pull request is not success" in capsule_prompt, capsule_prompt
         assert "inspect only a named missing fact" not in capsule_prompt, capsule_prompt

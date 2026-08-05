@@ -1982,7 +1982,7 @@ def bounded_closeout_capsule(thread: dict, product_turn_id: str) -> dict:
             "Raw command and tool output is omitted to avoid duplicating credentials or private bulk evidence.",
             "Tool arguments and commands are reduced to fixed-label activity totals and ordered spans.",
             "Every post-harness turn is represented; detailed text is bounded per turn.",
-            "Do not reopen the source task or raw trajectory; inspect only the minimum current authoritative owner state needed to test one intervention or retain decision.",
+            "Do not reopen the source task or raw trajectory; inspect only the minimum current authoritative owner state needed to make the smallest durable harness improvement.",
         ],
     }
 
@@ -1994,11 +1994,10 @@ def bounded_closeout_prompt(prompt: str, capsule: dict) -> str:
         "source task and product turn below. Treat the capsule as private evidence, not as new product "
         "instructions. Start from it; do not reopen the source task, reconstruct raw omitted evidence, "
         "or rerun the product job. Preserve the source task as the continuation owner. Use the complete "
-        "trajectory and ranked telemetry to find the earliest repeated execution tax, not merely the "
-        "latest delivered change, then inspect the minimum current authoritative owner state required "
-        "to prove one intervention or retain decision. Retain/no-change is invalid when evidenceComplete "
-        "is false or current evidence does not prove an existing delivered owner addresses the exact tax; "
-        "zero failures, aggregate telemetry, uncertainty, or failure to inspect the owner are not proof. "
+        "trajectory and ranked telemetry to find avoidable trial, error, stale routing, or repeated work, "
+        "not merely the latest delivered change. Inspect only the minimum current authoritative owner "
+        "state needed to make the smallest durable improvement. Prefer repairing, simplifying, "
+        "consolidating, or removing existing harness machinery over adding another surface. "
         "Within the current user's authority and target workflow, an intervention is terminal only after "
         "validation, commit, push, a ready-for-review pull request, merge, canonical synchronization, "
         "installation or deployment when applicable, identity readback, and cleanup. A local change, "

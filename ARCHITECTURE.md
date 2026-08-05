@@ -86,13 +86,13 @@ closeout first. If the timer cannot be scheduled, closeout runs immediately.
 
 The capsule omits raw command/tool output and tool arguments, binds the exact source task and
 product turn, and records its digest plus the separate harness task identity. Missing rollout or
-turn evidence is explicit and invalidates a retain/no-change verdict. The source task remains
+turn evidence is explicit. The source task remains
 the continuation owner. App Server per-call `last` usage is accumulated for the closeout so resumed
 thread history is never mislabeled as harness usage. Immediate and explicit manual harness turns
 remain in the source task.
 
 Complete capsule evidence does not forbid bounded current-owner inspection. A closeout must inspect
-the minimum authoritative state needed to prove its one candidate intervention or a retain decision.
+the minimum authoritative state needed to make the smallest durable harness improvement.
 Within granted authority, a harness intervention remains nonterminal through local edits, branches,
 commits, pushed branches, and draft pull requests; normal review, merge, applicable installation,
 identity readback, and cleanup remain part of the same closeout.
