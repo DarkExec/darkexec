@@ -1563,6 +1563,17 @@ def main() -> None:
         )
         assert expected_update.returncode != 0, expected_update.stdout
         assert "DarkExec update moved" in expected_update.stderr, expected_update.stderr
+        identity_result = subprocess.run(
+            [str(ROOT / "bin/darkexec"), "identity", "--json"],
+            capture_output=True, text=True,
+            env={**env, "DARKEXEC_APP_SERVER_SOCKET": str(root / "unavailable.sock")},
+            check=False,
+        )
+        identity_payload = json.loads(identity_result.stdout)
+        assert identity_result.returncode == 1, identity_result.stderr or identity_payload
+        assert identity_payload["protocolVersion"] == 1, identity_payload
+        assert identity_payload["appServerReady"] is False, identity_payload
+        assert str(target) in identity_payload["projects"], identity_payload
     print(json.dumps({"status": "passed", "contracts": [
         "saved-project-list", "saved-target", "running-app-list-proof", "post-first-turn-app-list-proof",
         "one-executive", "one-target", "same-task-harness",
@@ -1587,7 +1598,7 @@ def main() -> None:
         "unbounded-turn-wait", "lost-completion-reconciliation",
         "append-only-harness-episode", "manual-deferred-episode-identity",
         "started-harness-interruption-preserved", "journal-failure-isolated",
-        "install-default-verification", "self-update", "pinned-self-update",
+        "install-default-verification", "self-update", "pinned-self-update", "runtime-identity",
     ]}))
 
 
