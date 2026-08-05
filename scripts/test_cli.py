@@ -1499,6 +1499,11 @@ def main() -> None:
         assert "DARKEXEC BOUNDED TRAILING CLOSEOUT" in capsule_prompt, capsule_prompt
         assert '"sourceThreadId":"' + timer_thread + '"' in capsule_prompt, capsule_prompt
         assert "private command" not in capsule_prompt and "private output" not in capsule_prompt
+        assert "minimum current authoritative owner state" in capsule_prompt, capsule_prompt
+        assert "existing delivered owner addresses the exact tax" in capsule_prompt, capsule_prompt
+        assert "ready-for-review pull request" in capsule_prompt, capsule_prompt
+        assert "draft pull request is not success" in capsule_prompt, capsule_prompt
+        assert "inspect only a named missing fact" not in capsule_prompt, capsule_prompt
         fallback_server.join(timeout=2)
         assert not fallback_server.is_alive()
         journal = [
