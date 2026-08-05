@@ -117,7 +117,8 @@ to reconstruct them. Trusted direct callers can supply the same typed `text`, `i
 assertion and local images are verified before native delivery. Each completed
 follow-up resets one generation-keyed, systemd-owned 30-minute closeout timer through
 `darkexec debounce`; after the conversation becomes idle, it rereads the target, builds a bounded
-private capsule, and sends one fresh-context trailing harness unless a manual or automatic harness
+private capsule representing every post-harness turn plus privacy-safe native execution telemetry,
+and sends one fresh-context trailing harness unless a manual or automatic harness
 already closed the latest product turn. The exact source task remains the continuation owner.
 Dependent cross-task work and consequential phase changes flush a pending closeout first. If the
 timer cannot be scheduled, closeout runs immediately. Background and direct CLI runs always harness
