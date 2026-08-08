@@ -277,7 +277,12 @@ def main() -> None:
         root = Path(temp)
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
         prompt_path = root / "config" / "harness-prompt.txt"
-        prompt_env = {**os.environ, "DARKEXEC_HARNESS_PROMPT_PATH": str(prompt_path)}
+        efficiency_prompt_path = root / "config" / "efficiency-prompt.txt"
+        prompt_env = {
+            **os.environ,
+            "DARKEXEC_HARNESS_PROMPT_PATH": str(prompt_path),
+            "DARKEXEC_EFFICIENCY_PROMPT_PATH": str(efficiency_prompt_path),
+        }
         default_prompt = json.loads(subprocess.run(
             [str(ROOT / "bin/darkexec"), "harness-prompt", "--json"],
             capture_output=True, text=True, env=prompt_env, check=True,
@@ -304,6 +309,22 @@ def main() -> None:
             capture_output=True, text=True, env=prompt_env, check=True,
         ).stdout)
         assert reset_prompt["source"] == "default" and not prompt_path.exists()
+        default_efficiency_prompt = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "efficiency-prompt", "--json"],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert default_efficiency_prompt["source"] == "default"
+        assert default_efficiency_prompt["prompt"].startswith(
+            "Now briefly review the harness pass you just performed"
+        )
+        custom_efficiency_text = "Find and fix the single largest avoidable harness cost."
+        saved_efficiency_prompt = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "efficiency-prompt", "--set-stdin", "--json"],
+            input=custom_efficiency_text, capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert saved_efficiency_prompt["prompt"] == custom_efficiency_text
+        assert efficiency_prompt_path.read_text() == custom_efficiency_text + "\n"
+        assert efficiency_prompt_path.stat().st_mode & 0o777 == 0o600
         normalize_input_items = runtime["normalize_input_items"]
         source_rollout = root / "source-rollout.jsonl"
         source_rollout.write_text("\n".join(json.dumps(item) for item in [
@@ -1023,6 +1044,43 @@ def main() -> None:
         assert continue_inputs[0] == follow_up_input, continue_inputs[0]
         continue_server.join(timeout=2)
         assert not continue_server.is_alive()
+        efficiency_socket, efficiency_ready = root / "efficiency.sock", threading.Event()
+        efficiency_prompt = "Find and fix the single largest avoidable harness cost."
+        efficiency_server = threading.Thread(
+            target=fake_app_server,
+            args=(efficiency_socket, efficiency_ready, True, None, {
+                interactive_state["target"]["threadId"]: {"cwd": str(target), "turns": [{
+                    "id": "standard-harness-turn", "status": "completed", "items": [
+                        {"id": "standard-harness-user", "type": "userMessage", "content": [{
+                            "type": "text", "text": "Let's do a harness pass following harness-ops doctrine."
+                        }]},
+                    ],
+                }]},
+            }),
+            daemon=True,
+        )
+        efficiency_server.start(); assert efficiency_ready.wait(timeout=2)
+        efficiency = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
+                "--thread", interactive_state["target"]["threadId"],
+                "--executive-thread", interactive_executive, "--prompt-stdin",
+                "--harness-efficiency", "--json",
+            ],
+            input=efficiency_prompt, capture_output=True, text=True,
+            env={
+                **run_env,
+                "DARKEXEC_APP_SERVER_SOCKET": str(efficiency_socket),
+                "DARKEXEC_HARNESS_EPISODE_ROOT": str(root / "harness-episodes"),
+            }, check=False,
+        )
+        efficiency_result = json.loads(efficiency.stdout)
+        assert efficiency.returncode == 0 and efficiency_result["status"] == "completed", efficiency_result
+        efficiency_episode = json.loads(Path(efficiency_result["harnessEpisode"]["path"]).read_text())
+        assert efficiency_episode["harnessMode"] == "efficiency", efficiency_episode
+        assert efficiency_episode["terminalIdentity"]["kind"] == "interactive_manual", efficiency_episode
+        efficiency_server.join(timeout=2)
+        assert not efficiency_server.is_alive()
         steer_socket, steer_ready, steer_turn_ready = (
             root / "steer.sock", threading.Event(), threading.Event()
         )

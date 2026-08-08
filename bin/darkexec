@@ -22,6 +22,9 @@ DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops
 HARNESS_PROMPT_PATH = Path(os.environ.get(
     "DARKEXEC_HARNESS_PROMPT_PATH", "/var/lib/darkexec/config/harness-prompt.txt"
 ))
+EFFICIENCY_PROMPT_PATH = Path(os.environ.get(
+    "DARKEXEC_EFFICIENCY_PROMPT_PATH", "/var/lib/darkexec/config/efficiency-prompt.txt"
+))
 TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "0"))
 UPDATE_REPOSITORY = os.environ.get("DARKEXEC_UPDATE_REPOSITORY", "https://github.com/DarkExec/darkexec")
 UPDATE_REF = os.environ.get("DARKEXEC_UPDATE_REF", "main")
@@ -31,6 +34,12 @@ APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
 DEFAULT_HARNESS_PROMPT = (
     "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
     f"reliable, and durable execution. Make sure we are following {DOCTRINE} doctrine."
+)
+DEFAULT_EFFICIENCY_PROMPT = (
+    "Now briefly review the harness pass you just performed—not the original product work. Identify its "
+    "single largest avoidable source of model calls, token consumption, retries, or repeated context recovery.\n\n"
+    "If one small change to the existing harness execution path would materially reduce that cost for future "
+    "harness passes, implement and validate"
 )
 MAX_HARNESS_PROMPT = 20000
 CLOSEOUT_ACTIVITY_SPAN_LIMIT = 64
@@ -52,20 +61,20 @@ def validate_harness_prompt(value: str) -> str:
     return value
 
 
-def standard_harness_prompt() -> str:
-    if not HARNESS_PROMPT_PATH.exists():
-        return DEFAULT_HARNESS_PROMPT
+def configured_prompt(path: Path, default: str, label: str) -> str:
+    if not path.exists():
+        return default
     try:
-        return validate_harness_prompt(HARNESS_PROMPT_PATH.read_text())
+        return validate_harness_prompt(path.read_text())
     except OSError as exc:
-        raise RuntimeError(f"cannot read harness prompt setting: {exc}") from exc
+        raise RuntimeError(f"cannot read {label} prompt setting: {exc}") from exc
 
 
-def set_standard_harness_prompt(value: str) -> str:
+def set_configured_prompt(path: Path, value: str, prefix: str) -> str:
     value = validate_harness_prompt(value)
-    HARNESS_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.NamedTemporaryFile(
-        "w", dir=HARNESS_PROMPT_PATH.parent, prefix=".harness-prompt.", delete=False
+        "w", dir=path.parent, prefix=prefix, delete=False
     ) as handle:
         handle.write(value + "\n")
         handle.flush()
@@ -73,32 +82,40 @@ def set_standard_harness_prompt(value: str) -> str:
         temporary = Path(handle.name)
     try:
         temporary.chmod(0o600)
-        os.replace(temporary, HARNESS_PROMPT_PATH)
+        os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
     return value
 
 
-def harness_prompt_setting(args) -> int:
+def prompt_setting(args, path: Path, default: str, label: str) -> int:
     try:
         if args.set_stdin:
-            prompt = set_standard_harness_prompt(sys.stdin.read())
+            prompt = set_configured_prompt(path, sys.stdin.read(), f".{label}-prompt.")
             source = "custom"
         elif args.reset:
-            HARNESS_PROMPT_PATH.unlink(missing_ok=True)
-            prompt = DEFAULT_HARNESS_PROMPT
+            path.unlink(missing_ok=True)
+            prompt = default
             source = "default"
         else:
-            prompt = standard_harness_prompt()
-            source = "custom" if HARNESS_PROMPT_PATH.exists() else "default"
+            prompt = configured_prompt(path, default, label)
+            source = "custom" if path.exists() else "default"
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     result = {
         "schemaVersion": 1, "prompt": prompt, "source": source,
-        "isDefault": prompt == DEFAULT_HARNESS_PROMPT,
+        "isDefault": prompt == default,
     }
     print(json.dumps(result) if args.json else prompt)
     return 0
+
+
+def standard_harness_prompt() -> str:
+    return configured_prompt(HARNESS_PROMPT_PATH, DEFAULT_HARNESS_PROMPT, "harness")
+
+
+def efficiency_harness_prompt() -> str:
+    return configured_prompt(EFFICIENCY_PROMPT_PATH, DEFAULT_EFFICIENCY_PROMPT, "efficiency")
 
 
 class DispatchInterrupted(Exception):
@@ -1569,7 +1586,11 @@ def continue_target(args) -> int:
     if not executive_thread_id:
         raise SystemExit("continue requires --executive-thread or CODEX_THREAD_ID")
     begin_execution(executive_thread_id, target, "continue", args.thread)
-    manual_harness_mode = None if args.source_executive_turn else harness_prompt_mode(prompt)
+    manual_harness_mode = (
+        "efficiency" if args.harness_efficiency
+        else None if args.source_executive_turn
+        else harness_prompt_mode(prompt)
+    )
     manual_product: dict = {}
     manual_generation = None
     result = {
@@ -2967,6 +2988,7 @@ def main() -> int:
     continuation_input = continuation.add_mutually_exclusive_group()
     continuation_input.add_argument("--source-executive-turn", action="store_true")
     continuation_input.add_argument("--input-json")
+    continuation.add_argument("--harness-efficiency", action="store_true")
     continuation.add_argument("--prompt-stdin", action="store_true", required=True)
     continuation.add_argument("--json", action="store_true")
     stop = sub.add_parser("stop")
@@ -3018,11 +3040,16 @@ def main() -> int:
     fire.add_argument("--generation", type=int, required=True)
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
-    prompt_setting = sub.add_parser("harness-prompt")
-    prompt_action = prompt_setting.add_mutually_exclusive_group()
+    harness_prompt_parser = sub.add_parser("harness-prompt")
+    prompt_action = harness_prompt_parser.add_mutually_exclusive_group()
     prompt_action.add_argument("--set-stdin", action="store_true")
     prompt_action.add_argument("--reset", action="store_true")
-    prompt_setting.add_argument("--json", action="store_true")
+    harness_prompt_parser.add_argument("--json", action="store_true")
+    efficiency_prompt_setting = sub.add_parser("efficiency-prompt")
+    efficiency_prompt_action = efficiency_prompt_setting.add_mutually_exclusive_group()
+    efficiency_prompt_action.add_argument("--set-stdin", action="store_true")
+    efficiency_prompt_action.add_argument("--reset", action="store_true")
+    efficiency_prompt_setting.add_argument("--json", action="store_true")
     global_resolve = sub.add_parser("resolve-global")
     global_resolve.add_argument("--job-id", required=True)
     global_resolve.add_argument("--candidates-json", required=True)
@@ -3081,7 +3108,9 @@ def main() -> int:
         print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))
         return 0
     if args.command == "harness-prompt":
-        return harness_prompt_setting(args)
+        return prompt_setting(args, HARNESS_PROMPT_PATH, DEFAULT_HARNESS_PROMPT, "harness")
+    if args.command == "efficiency-prompt":
+        return prompt_setting(args, EFFICIENCY_PROMPT_PATH, DEFAULT_EFFICIENCY_PROMPT, "efficiency")
     if args.command == "update":
         return update_install(args)
     path = find_receipt_path(args.job_id, args.thread)
