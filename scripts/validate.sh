@@ -37,6 +37,8 @@ grep -Fq 'darkexec status --thread "$CODEX_THREAD_ID" --wait --json' "$root/shar
 grep -Fq 'reports `abandoned` instead of waiting forever' "$root/share/workspace/README.md"
 grep -Fqx '[[ -e "$host_doctrine" ]] || ln -sfn "$workspace/harness-ops.md" "$host_doctrine"' "$root/scripts/install.sh"
 grep -Fqx 'TURN_TIMEOUT = int(os.environ.get("DARKEXEC_TURN_TIMEOUT", "0"))' "$root/bin/darkexec"
+grep -Fq 'docs/passes/harness/PASS.md' "$root/bin/darkexec"
+grep -Fq 'docs/passes/efficiency/PASS.md' "$root/bin/darkexec"
 grep -Fqx 'EXECUTION_ROOT = Path(os.environ.get("DARKEXEC_EXECUTION_ROOT", "/var/lib/darkexec/executives"))' "$root/bin/darkexec"
 grep -Fqx '"$release/scripts/verify_install_contract.py" "$release/bin/darkexec" >/dev/null' "$root/scripts/install.sh"
 grep -Fqx 'execution_root="${DARKEXEC_EXECUTION_ROOT:-/var/lib/darkexec/executives}"' "$root/scripts/install.sh"
