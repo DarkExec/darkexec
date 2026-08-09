@@ -278,10 +278,19 @@ def main() -> None:
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
         prompt_path = root / "config" / "harness-prompt.txt"
         efficiency_prompt_path = root / "config" / "efficiency-prompt.txt"
+        harness_project_prompt_root = root / "config" / "harness-prompts"
+        efficiency_project_prompt_root = root / "config" / "efficiency-prompts"
+        prompt_project = root / "prompt-project"
+        prompt_project.mkdir()
+        prompt_config = root / "prompt-config.toml"
+        prompt_config.write_text(f'[projects."{prompt_project}"]\ntrust_level = "trusted"\n')
         prompt_env = {
             **os.environ,
             "DARKEXEC_HARNESS_PROMPT_PATH": str(prompt_path),
             "DARKEXEC_EFFICIENCY_PROMPT_PATH": str(efficiency_prompt_path),
+            "DARKEXEC_HARNESS_PROJECT_PROMPT_ROOT": str(harness_project_prompt_root),
+            "DARKEXEC_EFFICIENCY_PROJECT_PROMPT_ROOT": str(efficiency_project_prompt_root),
+            "DARKEXEC_CONFIG": str(prompt_config),
         }
         default_prompt = json.loads(subprocess.run(
             [str(ROOT / "bin/darkexec"), "harness-prompt", "--json"],
@@ -295,10 +304,36 @@ def main() -> None:
         ).stdout)
         assert saved_prompt == {
             "schemaVersion": 1, "prompt": custom_text,
-            "source": "custom", "isDefault": False,
+            "source": "custom", "isDefault": False, "targetPath": None,
         }, saved_prompt
         assert prompt_path.read_text() == custom_text + "\n"
         assert prompt_path.stat().st_mode & 0o777 == 0o600
+        inherited_prompt = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "harness-prompt", "--target", str(prompt_project), "--json"],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert inherited_prompt["prompt"] == custom_text
+        assert inherited_prompt["source"] == "inherited" and inherited_prompt["isDefault"] is True
+        project_text = "Use the project-specific harness workflow."
+        project_prompt = json.loads(subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "harness-prompt", "--target", str(prompt_project),
+                "--set-stdin", "--json",
+            ],
+            input=project_text, capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert project_prompt["prompt"] == project_text and project_prompt["source"] == "project"
+        assert project_prompt["targetPath"] == str(prompt_project)
+        assert prompt_path.read_text() == custom_text + "\n"
+        reset_project_prompt = json.loads(subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "harness-prompt", "--target", str(prompt_project),
+                "--reset", "--json",
+            ],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert reset_project_prompt["prompt"] == custom_text
+        assert reset_project_prompt["source"] == "inherited"
         empty_prompt = subprocess.run(
             [str(ROOT / "bin/darkexec"), "harness-prompt", "--set-stdin", "--json"],
             input="  ", capture_output=True, text=True, env=prompt_env, check=False,
@@ -325,6 +360,23 @@ def main() -> None:
         assert saved_efficiency_prompt["prompt"] == custom_efficiency_text
         assert efficiency_prompt_path.read_text() == custom_efficiency_text + "\n"
         assert efficiency_prompt_path.stat().st_mode & 0o777 == 0o600
+        project_efficiency_text = "Review this project's largest avoidable harness cost."
+        subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "efficiency-prompt", "--target", str(prompt_project),
+                "--set-stdin", "--json",
+            ],
+            input=project_efficiency_text, capture_output=True, text=True, env=prompt_env, check=True,
+        )
+        resolved_efficiency_prompt = json.loads(subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "efficiency-prompt", "--target", str(prompt_project),
+                "--json",
+            ],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert resolved_efficiency_prompt["prompt"] == project_efficiency_text
+        assert resolved_efficiency_prompt["source"] == "project"
         normalize_input_items = runtime["normalize_input_items"]
         source_rollout = root / "source-rollout.jsonl"
         source_rollout.write_text("\n".join(json.dumps(item) for item in [
