@@ -297,6 +297,7 @@ def main() -> None:
             capture_output=True, text=True, env=prompt_env, check=True,
         ).stdout)
         assert default_prompt["source"] == "default" and default_prompt["isDefault"] is True
+        assert "docs/passes/harness/PASS.md" in default_prompt["prompt"]
         custom_text = "Review this completed session and make one durable harness improvement."
         saved_prompt = json.loads(subprocess.run(
             [str(ROOT / "bin/darkexec"), "harness-prompt", "--set-stdin", "--json"],
@@ -352,6 +353,7 @@ def main() -> None:
         assert default_efficiency_prompt["prompt"].startswith(
             "Now briefly review the harness pass you just performed"
         )
+        assert "docs/passes/efficiency/PASS.md" in default_efficiency_prompt["prompt"]
         custom_efficiency_text = "Find and fix the single largest avoidable harness cost."
         saved_efficiency_prompt = json.loads(subprocess.run(
             [str(ROOT / "bin/darkexec"), "efficiency-prompt", "--set-stdin", "--json"],
