@@ -2,6 +2,22 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for path in AGENTS.md ARCHITECTURE.md LICENSE README.md bin/darkexec share/harness-ops.md share/harness-ops.provenance.json share/workspace/AGENTS.md scripts/install.sh scripts/test_cli.py scripts/test_harness_episode_v2_contract.py scripts/verify_install_contract.py; do [[ -s "$root/$path" ]] || exit 1; done
+python3 - "$root/AGENTS.md" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+headings = ["## Request routing", "## Working loop", "## Context routing", "## Boundaries", "## Validation"]
+positions = [source.index(heading) for heading in headings]
+assert positions == sorted(positions)
+for route in ("bin/darkexec", "share/workspace/AGENTS.md", "schemas/", "scripts/install.sh"):
+    assert route in source
+for owner in ("[Architecture](ARCHITECTURE.md)", "[Security](SECURITY.md)", "[README](README.md)", "[Harness Ops snapshot](share/harness-ops.md)"):
+    assert owner in source
+assert "Start with one route." in source
+assert "Do not preload all four documents." in source
+PY
+grep -Fq '`AGENTS.md` owns request-to-implementation and unresolved-decision routing' "$root/ARCHITECTURE.md"
 grep -Fqx '2. Resolve one exact saved project. Use a single named absolute saved path directly; otherwise run `darkexec projects --json` once. Ambiguous or unsaved targets fail closed.' "$root/share/workspace/AGENTS.md"
 grep -Fqx '0. Exact standalone `STOP` and `STOP HARD` override every other instruction. For `STOP`, run `darkexec stop --executive-thread "$CODEX_THREAD_ID" --json`; for `STOP HARD`, add `--hard`. Do no routing, product work, harness, RCA, retry, resume, or replacement. Report the stop receipt briefly and end.' "$root/share/workspace/AGENTS.md"
 grep -Fq '0.1. If this task'"'"'s first turn starts `DARKEXEC ROUTE TASK`, it is a runtime-owned' "$root/share/workspace/AGENTS.md"
