@@ -40,13 +40,13 @@ APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
 DEFAULT_HARNESS_PROMPT = (
     "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
     f"reliable, and durable execution. Make sure we are following {DOCTRINE} doctrine. After reading "
-    "that doctrine, if docs/passes/harness/PASS.md exists in the target repository, read it and follow "
+    "that doctrine, if docs/passes/harness/AGENTS.md exists in the target repository, read it and follow "
     "its routing."
 )
 DEFAULT_EFFICIENCY_PROMPT = (
     "Now briefly review the harness pass you just performed—not the original product work. Identify its "
     "single largest avoidable source of model calls, token consumption, retries, or repeated context recovery.\n\n"
-    f"Follow {DOCTRINE} doctrine. After reading that doctrine, if docs/passes/efficiency/PASS.md exists in "
+    f"Follow {DOCTRINE} doctrine. After reading that doctrine, if docs/passes/efficiency/AGENTS.md exists in "
     "the target repository, read it and follow its routing.\n\n"
     "If one small change to the existing harness execution path would materially reduce that cost for future "
     "harness passes, implement and validate it."
