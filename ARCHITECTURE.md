@@ -2,6 +2,8 @@
 
 DarkExec is a thin executive bridge from a natural request to one accountable target-owned Codex task. An interactive executive conversation keeps that exact target for dependent follow-ups in the same saved project; it never discovers or resumes continuity across executive tasks.
 
+`AGENTS.md` owns request-to-implementation and unresolved-decision routing for runtime development; deeper documents retain their existing semantic owners and do not enter the default working set.
+
 ```text
 interactive: installed workspace -> exact saved project -> verbatim target task
                                                     -> attached same-turn steering
