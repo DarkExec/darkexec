@@ -42,6 +42,7 @@ DEFAULT_EFFICIENCY_PROMPT = (
     "harness passes, implement and validate"
 )
 MAX_HARNESS_PROMPT = 20000
+MAX_HARNESS_NOTE = 2000
 CLOSEOUT_ACTIVITY_SPAN_LIMIT = 64
 READ_ONLY_HARNESS_PROMPT = (
     "FIRE DRILL harness proof only. Review this task's completed trajectory without using tools, inspecting "
@@ -59,6 +60,16 @@ def validate_harness_prompt(value: str) -> str:
     if len(value) > MAX_HARNESS_PROMPT:
         raise ValueError(f"harness prompt exceeds {MAX_HARNESS_PROMPT} characters")
     return value
+
+
+def prepend_harness_note(prompt: str, note: str) -> str:
+    note = note.strip()
+    if not note:
+        return prompt
+    if len(note) > MAX_HARNESS_NOTE:
+        raise ValueError(f"harness note exceeds {MAX_HARNESS_NOTE} characters")
+    separator = " " if note.endswith((".", "!", "?", ":", ";")) else ". "
+    return validate_harness_prompt(f"{note}{separator}{prompt}")
 
 
 def configured_prompt(path: Path, default: str, label: str) -> str:
@@ -2483,6 +2494,15 @@ def closeout_now(args) -> int:
             result = {"status": state.get("status"), "threadId": args.thread}
             print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
             return 1
+        if args.note_stdin:
+            try:
+                state["harnessPrompt"] = prepend_harness_note(
+                    state["harnessPrompt"], sys.stdin.read()
+                )
+            except (KeyError, ValueError) as exc:
+                result = {"status": "rejected", "threadId": args.thread, "error": str(exc)}
+                print(json.dumps(result) if args.json else f"{args.thread}: rejected ({exc})")
+                return 1
         stop_timer(state.get("timerUnit"))
         state.update({
             "status": "pending", "timerUnit": None, "remainingSeconds": None,
@@ -3031,6 +3051,7 @@ def main() -> int:
     cancel.add_argument("--json", action="store_true")
     close_now = sub.add_parser("debounce-now")
     close_now.add_argument("--thread", required=True)
+    close_now.add_argument("--note-stdin", action="store_true")
     close_now.add_argument("--json", action="store_true")
     debounce_read = sub.add_parser("debounce-status")
     debounce_read.add_argument("--thread", required=True)

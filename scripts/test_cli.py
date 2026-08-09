@@ -1648,6 +1648,7 @@ def main() -> None:
         ).stdout)
         assert now_armed["status"] == "pending", now_armed
         now_socket, now_ready = root / "closeout-now.sock", threading.Event()
+        now_inputs = []
         now_server = threading.Thread(
             target=fake_app_server,
             args=(now_socket, now_ready, True, None, {
@@ -1657,12 +1658,14 @@ def main() -> None:
                         "content": [{"type": "text", "text": "Latest product work"}],
                     }],
                 }]},
-            }),
+            }, now_inputs),
             daemon=True,
         )
         now_server.start(); assert now_ready.wait(timeout=2)
         now_result = subprocess.run(
-            [str(ROOT / "bin/darkexec"), "debounce-now", "--thread", now_thread, "--json"],
+            [str(ROOT / "bin/darkexec"), "debounce-now", "--thread", now_thread,
+             "--note-stdin", "--json"],
+            input="Prioritize the refresh interruption reported by the operator",
             capture_output=True, text=True,
             env={**timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(now_socket)}, check=False,
         )
@@ -1670,6 +1673,9 @@ def main() -> None:
         assert now_result.returncode == 0 and now_status["status"] == "completed", now_status
         now_server.join(timeout=2)
         assert not now_server.is_alive()
+        assert now_inputs[0][0]["text"].startswith(
+            "Prioritize the refresh interruption reported by the operator. Let's do a harness pass"
+        ), now_inputs
         update_source = root / "update-source"
         (update_source / "scripts").mkdir(parents=True)
         fake_install = update_source / "scripts" / "install.sh"
