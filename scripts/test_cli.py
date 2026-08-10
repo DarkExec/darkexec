@@ -1481,6 +1481,69 @@ def main() -> None:
         )
         assert pending_status.returncode == 0
         assert json.loads(pending_status.stdout)["status"] == "pending", pending_status.stdout
+        detached_closeout_thread = "00000000-0000-4000-8000-000000000012"
+        detached_arm = [
+            str(ROOT / "bin/darkexec"), "debounce", "--target", str(target),
+            "--thread", detached_closeout_thread, "--turn", "product-detached",
+            "--seconds", "1800", "--harness-mode", "standard", "--json",
+        ]
+        detached_armed = subprocess.run(
+            detached_arm, capture_output=True, text=True, env=timer_env, check=False,
+        )
+        assert detached_armed.returncode == 0, detached_armed.stderr or detached_armed.stdout
+        detached_request = "00000000-0000-4000-8000-000000000013"
+        detached_command = [
+            str(ROOT / "bin/darkexec"), "debounce-now", "--thread",
+            detached_closeout_thread, "--detach", "--request-id", detached_request,
+            "--note-stdin", "--json",
+        ]
+        detached_closeout = subprocess.run(
+            detached_command, input="Keep this note once", capture_output=True, text=True,
+            env=timer_env, check=False,
+        )
+        detached_closeout_result = json.loads(detached_closeout.stdout)
+        assert detached_closeout.returncode == 0, detached_closeout.stderr or detached_closeout.stdout
+        assert detached_closeout_result == {
+            "status": "pending", "threadId": detached_closeout_thread,
+            "generation": 1, "requestId": detached_request, "accepted": True,
+        }, detached_closeout_result
+        duplicate_closeout = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "debounce-now", "--thread",
+                detached_closeout_thread, "--detach", "--request-id",
+                "00000000-0000-4000-8000-000000000014", "--note-stdin", "--json",
+            ],
+            input="Do not append this duplicate note", capture_output=True, text=True,
+            env=timer_env, check=False,
+        )
+        duplicate_result = json.loads(duplicate_closeout.stdout)
+        assert duplicate_closeout.returncode == 0 and duplicate_result["accepted"] is True
+        assert duplicate_result["requestId"] == detached_request, duplicate_result
+        detached_state_path = (
+            Path(timer_env["DARKEXEC_SESSION_ROOT"])
+            / f"{hashlib.sha256(detached_closeout_thread.encode()).hexdigest()}.json"
+        )
+        detached_state = json.loads(detached_state_path.read_text())
+        assert detached_state["closeoutRequestId"] == detached_request, detached_state
+        assert detached_state["harnessStatus"] == "queued", detached_state
+        assert detached_state["harnessPrompt"].startswith("Keep this note once. Let's do a harness pass")
+        assert "Do not append this duplicate note" not in detached_state["harnessPrompt"]
+        manual_schedules = [
+            line for line in scheduler_log.read_text().splitlines()
+            if f"--thread {detached_closeout_thread}" in line and "-manual" in line
+        ]
+        assert len(manual_schedules) == 1, manual_schedules
+        assert f"--request-id {detached_request}" in manual_schedules[0], manual_schedules[0]
+        wrong_detached_fire = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread",
+                detached_closeout_thread, "--generation", "1", "--request-id",
+                "00000000-0000-4000-8000-000000000099",
+            ],
+            capture_output=True, text=True, env=timer_env, check=False,
+        )
+        assert wrong_detached_fire.returncode == 0
+        assert json.loads(wrong_detached_fire.stdout)["status"] == "stale"
         stale = subprocess.run(
             [str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread", timer_thread, "--generation", "1"],
             capture_output=True, text=True, env=timer_env, check=False,

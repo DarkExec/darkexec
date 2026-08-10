@@ -2059,6 +2059,33 @@ def schedule_timer(state: dict, executable: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def schedule_closeout_now(
+    state: dict, executable: Path, request_id: str,
+) -> tuple[bool, str, str]:
+    runner = os.environ.get("DARKEXEC_SYSTEMD_RUN") or shutil.which("systemd-run")
+    if not runner:
+        return False, "systemd-run is unavailable", ""
+    digest = hashlib.sha256(state["threadId"].encode()).hexdigest()[:12]
+    unit = f"darkexec-closeout-{digest}-g{state['generation']}-manual"
+    command = [
+        runner, f"--unit={unit}", "--collect", "--quiet",
+        f"--setenv=DARKEXEC_SESSION_ROOT={SESSION_ROOT}",
+        f"--setenv=DARKEXEC_CONFIG={CONFIG}",
+        f"--setenv=DARKEXEC_APP_SERVER_SOCKET={APP_SERVER_SOCKET}",
+        f"--setenv=DARKEXEC_WORKSPACE={WORKSPACE}",
+        str(executable), "_debounce-fire", "--thread", state["threadId"],
+        "--generation", str(state["generation"]), "--request-id", request_id,
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        return (
+            False,
+            completed.stderr.strip() or completed.stdout.strip() or "systemd-run failed",
+            unit,
+        )
+    return True, "", unit
+
+
 def inspect_closeout(
     thread: dict, product_turn_id: str
 ) -> tuple[str, str, str | None, str | None]:
@@ -2145,13 +2172,21 @@ def emit_closeout_episode(
     )
 
 
-def fire_debounce(thread_id: str, generation: int, executable: Path) -> dict:
+def fire_debounce(
+    thread_id: str, generation: int, executable: Path,
+    request_id: str | None = None,
+) -> dict:
     path = session_path(thread_id)
     if not path.exists():
         return {"status": "stale", "threadId": thread_id, "reason": "session state is absent"}
     lock = path.with_suffix(".lock").open("a+")
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     state = load_receipt(path)
+    if request_id and state.get("closeoutRequestId") != request_id:
+        return {
+            "status": "stale", "threadId": thread_id, "generation": generation,
+            "requestId": request_id,
+        }
     if int(state.get("generation") or 0) != generation or state.get("status") != "pending":
         return {"status": "stale", "threadId": thread_id, "generation": generation}
     target = Path(state["targetPath"])
@@ -2532,9 +2567,24 @@ def closeout_now(args) -> int:
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = load_receipt(path)
+        if args.detach and state.get("closeoutRequestId"):
+            result = {
+                "status": state.get("status"), "threadId": args.thread,
+                "generation": state.get("generation"),
+                "requestId": state["closeoutRequestId"], "accepted": True,
+            }
+            print(json.dumps(result) if args.json else f"{args.thread}: accepted")
+            return 0
         if state.get("status") not in {"pending", "paused"}:
             result = {"status": state.get("status"), "threadId": args.thread}
             print(json.dumps(result) if args.json else f"{args.thread}: {result['status']}")
+            return 1
+        if args.detach and not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", args.request_id or ""):
+            result = {
+                "status": "rejected", "threadId": args.thread,
+                "error": "detached closeout requires a valid request id",
+            }
+            print(json.dumps(result) if args.json else f"{args.thread}: rejected")
             return 1
         if args.note_stdin:
             try:
@@ -2545,13 +2595,39 @@ def closeout_now(args) -> int:
                 result = {"status": "rejected", "threadId": args.thread, "error": str(exc)}
                 print(json.dumps(result) if args.json else f"{args.thread}: rejected ({exc})")
                 return 1
-        stop_timer(state.get("timerUnit"))
+        prior_timer = state.get("timerUnit")
+        generation = int(state.get("generation") or 0)
+        if args.detach:
+            scheduled, error, unit = schedule_closeout_now(
+                state, Path(sys.argv[0]).resolve(), args.request_id,
+            )
+            if not scheduled:
+                result = {
+                    "status": "rejected", "threadId": args.thread,
+                    "generation": generation, "error": error,
+                }
+                print(json.dumps(result) if args.json else f"{args.thread}: rejected ({error})")
+                return 1
+            state.update({
+                "status": "pending", "timerUnit": unit, "remainingSeconds": None,
+                "dueAt": now(), "updatedAt": now(),
+                "harnessStatus": "queued", "closeoutRequestId": args.request_id,
+            })
+            atomic_write(path, state)
+            stop_timer(prior_timer)
+            result = {
+                "status": "pending", "threadId": args.thread,
+                "generation": generation, "requestId": args.request_id,
+                "accepted": True,
+            }
+            print(json.dumps(result) if args.json else f"{args.thread}: accepted")
+            return 0
+        stop_timer(prior_timer)
         state.update({
             "status": "pending", "timerUnit": None, "remainingSeconds": None,
             "dueAt": now(), "updatedAt": now(),
         })
         atomic_write(path, state)
-        generation = int(state.get("generation") or 0)
     finally:
         lock.close()
     result = fire_debounce(args.thread, generation, Path(sys.argv[0]).resolve())
@@ -3096,6 +3172,8 @@ def main() -> int:
     close_now = sub.add_parser("debounce-now")
     close_now.add_argument("--thread", required=True)
     close_now.add_argument("--note-stdin", action="store_true")
+    close_now.add_argument("--detach", action="store_true")
+    close_now.add_argument("--request-id")
     close_now.add_argument("--json", action="store_true")
     debounce_read = sub.add_parser("debounce-status")
     debounce_read.add_argument("--thread", required=True)
@@ -3103,6 +3181,7 @@ def main() -> int:
     fire = sub.add_parser("_debounce-fire")
     fire.add_argument("--thread", required=True)
     fire.add_argument("--generation", type=int, required=True)
+    fire.add_argument("--request-id")
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
     harness_prompt_parser = sub.add_parser("harness-prompt")
@@ -3167,7 +3246,9 @@ def main() -> int:
     if args.command == "debounce-status":
         return debounce_status(args)
     if args.command == "_debounce-fire":
-        result = fire_debounce(args.thread, args.generation, Path(sys.argv[0]).resolve())
+        result = fire_debounce(
+            args.thread, args.generation, Path(sys.argv[0]).resolve(), args.request_id,
+        )
         print(json.dumps(result))
         return 0 if result.get("status") in {"completed", "manual_harness_seen", "superseded", "stale", "pending"} else 1
     if args.command == "projects":
