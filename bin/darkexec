@@ -1746,15 +1746,36 @@ def continue_target(args) -> int:
     return 0 if result.get("status") == "completed" else 1
 
 
+def user_message_text(item: dict) -> str:
+    return "\n".join(
+        str(content["text"])
+        for content in item.get("content", [])
+        if content.get("type") == "text" and content.get("text")
+    )
+
+
+def user_messages(turn: dict) -> list[dict]:
+    return [
+        item for item in turn.get("items", [])
+        if item.get("type") == "userMessage" and user_message_text(item)
+    ]
+
+
 def user_text(turn: dict) -> str:
-    chunks = []
-    for item in turn.get("items", []):
-        if item.get("type") != "userMessage":
-            continue
-        for content in item.get("content", []):
-            if content.get("type") == "text" and content.get("text"):
-                chunks.append(str(content["text"]))
-    return "\n".join(chunks)
+    return "\n".join(user_message_text(item) for item in user_messages(turn))
+
+
+def turn_message_time(turn_id: str, ordinal: int) -> str | None:
+    compact = str(turn_id).replace("-", "")
+    if len(compact) != 32 or compact[12] != "7":
+        return None
+    try:
+        milliseconds = int(compact[:12], 16)
+    except ValueError:
+        return None
+    timestamp = datetime.fromtimestamp(milliseconds / 1000, timezone.utc)
+    timestamp += timedelta(microseconds=ordinal)
+    return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def harness_prompt_mode(prompt: str) -> str | None:
@@ -2920,12 +2941,36 @@ def target_status(args) -> int:
     )
     if baseline is None:
         raise SystemExit(f"recorded product turn {args.after_turn} was not found")
+    steering_messages = []
+    if args.include_input:
+        for turn in turns:
+            messages = user_messages(turn)
+            if not messages or harness_prompt_mode(user_message_text(messages[0])):
+                continue
+            for ordinal, item in enumerate(messages[1:], start=1):
+                message_id = item.get("id")
+                turn_id = turn.get("id")
+                if not message_id or not turn_id:
+                    raise SystemExit("native steering message omitted its identity")
+                steering = {
+                    "messageId": str(message_id),
+                    "turnId": str(turn_id),
+                    "inputText": user_message_text(item)[:20000],
+                    "ordinal": ordinal,
+                }
+                created_at = turn_message_time(str(turn_id), ordinal)
+                if created_at:
+                    steering["createdAt"] = created_at
+                steering_messages.append(steering)
+                if len(steering_messages) > 100:
+                    raise SystemExit("more than 100 native steering messages require reconciliation")
     newer = None
     newer_turns = []
     for turn in turns[baseline + 1:]:
-        prompt = user_text(turn)
-        if not prompt:
+        messages = user_messages(turn)
+        if not messages:
             continue
+        prompt = user_message_text(messages[0])
         newer = {
             "turnId": turn.get("id"),
             "turnStatus": turn.get("status") or "unknown",
@@ -2951,6 +2996,8 @@ def target_status(args) -> int:
     }
     if args.include_input or args.include_result:
         result["newerTurns"] = newer_turns
+    if args.include_input:
+        result["steeringMessages"] = steering_messages
     print(json.dumps(result) if args.json else (
         f"{args.thread}: {result['status']} "
         f"turn={(newer or {}).get('turnId') or '-'} "
