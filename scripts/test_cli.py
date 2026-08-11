@@ -982,6 +982,8 @@ def main() -> None:
         }, target_status_payload
         assert "PRIVATE DIRECT FOLLOW-UP" not in target_status_result.stdout
         assert "PRIVATE DIRECT RESULT" not in target_status_result.stdout
+        assert "PRIVATE BASELINE STEERING" not in target_status_result.stdout
+        assert "PRIVATE DIRECT STEERING" not in target_status_result.stdout
         target_status_server.join(timeout=2)
         assert not target_status_server.is_alive()
         target_input_socket, target_input_ready = root / "target-input.sock", threading.Event()
@@ -993,10 +995,16 @@ def main() -> None:
                         {"id": "baseline-user", "type": "userMessage", "content": [
                             {"type": "text", "text": "Original product work"},
                         ]},
+                        {"id": "baseline-steer", "type": "userMessage", "content": [
+                            {"type": "text", "text": "PRIVATE BASELINE STEERING"},
+                        ]},
                     ]},
                     {"id": "direct-turn", "status": "completed", "items": [
                         {"id": "direct-user", "type": "userMessage", "content": [
                             {"type": "text", "text": "PRIVATE DIRECT FOLLOW-UP"},
+                        ]},
+                        {"id": "direct-steer", "type": "userMessage", "content": [
+                            {"type": "text", "text": "PRIVATE DIRECT STEERING"},
                         ]},
                         {"id": "direct-agent", "type": "agentMessage",
                          "text": "PRIVATE DIRECT RESULT"},
@@ -1025,6 +1033,22 @@ def main() -> None:
             target_input_payload["newerTurn"]["resultText"] == "PRIVATE DIRECT RESULT"
         ), target_input_payload
         assert target_input_payload["newerTurns"] == [target_input_payload["newerTurn"]]
+        assert [
+            {
+                "messageId": item["messageId"], "turnId": item["turnId"],
+                "inputText": item["inputText"], "ordinal": item["ordinal"],
+            }
+            for item in target_input_payload["steeringMessages"]
+        ] == [
+            {
+                "messageId": "baseline-steer", "turnId": "baseline-turn",
+                "inputText": "PRIVATE BASELINE STEERING", "ordinal": 1,
+            },
+            {
+                "messageId": "direct-steer", "turnId": "direct-turn",
+                "inputText": "PRIVATE DIRECT STEERING", "ordinal": 1,
+            },
+        ], target_input_payload
         target_input_server.join(timeout=2)
         assert not target_input_server.is_alive()
         direct_image = root / "direct-image.png"
