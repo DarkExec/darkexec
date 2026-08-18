@@ -1478,6 +1478,8 @@ def main() -> None:
             "DARKEXEC_SYSTEMCTL": str(fake_systemctl),
             "DARKEXEC_SCHEDULER_LOG": str(scheduler_log),
             "DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT": "1",
+            "DARKEXEC_HARNESS_PROMPT_PATH": str(root / "timer-harness-prompt.txt"),
+            "DARKEXEC_EFFICIENCY_PROMPT_PATH": str(root / "timer-efficiency-prompt.txt"),
         }
         arm = [
             str(ROOT / "bin/darkexec"), "debounce", "--target", str(target),
@@ -1550,8 +1552,8 @@ def main() -> None:
         detached_state = json.loads(detached_state_path.read_text())
         assert detached_state["closeoutRequestId"] == detached_request, detached_state
         assert detached_state["harnessStatus"] == "queued", detached_state
-        assert detached_state["harnessPrompt"].startswith("Keep this note once. Let's do a harness pass")
-        assert "Do not append this duplicate note" not in detached_state["harnessPrompt"]
+        assert detached_state["harnessNote"] == "Keep this note once", detached_state
+        assert "harnessPrompt" not in detached_state, detached_state
         manual_schedules = [
             line for line in scheduler_log.read_text().splitlines()
             if f"--thread {detached_closeout_thread}" in line and "-manual" in line
@@ -1702,6 +1704,64 @@ def main() -> None:
         assert "harnessCapsuleSha256" not in fallback_state, fallback_state
         fallback_server.join(timeout=2)
         assert not fallback_server.is_alive()
+        for index, (mode, setting_path) in enumerate((
+            ("standard", Path(timer_env["DARKEXEC_HARNESS_PROMPT_PATH"])),
+            ("efficiency", Path(timer_env["DARKEXEC_EFFICIENCY_PROMPT_PATH"])),
+        ), start=20):
+            current_thread = f"00000000-0000-4000-8000-0000000000{index}"
+            product_turn = f"product-current-{mode}"
+            setting_path.write_text(f"OLD {mode.upper()} PROMPT\n")
+            current_arm = subprocess.run(
+                [
+                    str(ROOT / "bin/darkexec"), "debounce", "--target", str(target),
+                    "--thread", current_thread, "--turn", product_turn,
+                    "--seconds", "1800", "--harness-mode", mode, "--json",
+                ],
+                capture_output=True, text=True, env=timer_env, check=False,
+            )
+            assert current_arm.returncode == 0, current_arm.stderr or current_arm.stdout
+            current_state_path = (
+                Path(timer_env["DARKEXEC_SESSION_ROOT"])
+                / f"{hashlib.sha256(current_thread.encode()).hexdigest()}.json"
+            )
+            assert "harnessPrompt" not in json.loads(current_state_path.read_text())
+            current_prompt = f"CURRENT {mode.upper()} PROMPT"
+            setting_path.write_text(current_prompt + "\n")
+            current_inputs = []
+            current_socket, current_ready = root / f"current-{mode}.sock", threading.Event()
+            current_server = threading.Thread(
+                target=fake_app_server,
+                args=(current_socket, current_ready, True, None, {
+                    current_thread: {"cwd": str(target), "turns": [{
+                        "id": product_turn, "status": "completed", "items": [{
+                            "id": f"u-{mode}", "type": "userMessage",
+                            "content": [{"type": "text", "text": "Completed product work"}],
+                        }],
+                    }]},
+                }, current_inputs),
+                daemon=True,
+            )
+            current_server.start(); assert current_ready.wait(timeout=2)
+            current_fire = subprocess.run(
+                [
+                    str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread",
+                    current_thread, "--generation", "1",
+                ],
+                capture_output=True, text=True,
+                env={**timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(current_socket)},
+                check=False,
+            )
+            current_result = json.loads(current_fire.stdout)
+            assert current_fire.returncode == 0 and current_result["status"] == "completed", current_result
+            submitted_current_prompt = next(
+                item["text"] for item in current_inputs[-1] if item.get("type") == "text"
+            )
+            assert submitted_current_prompt == current_prompt, submitted_current_prompt
+            assert f"OLD {mode.upper()} PROMPT" not in submitted_current_prompt
+            current_server.join(timeout=2)
+            assert not current_server.is_alive()
+        Path(timer_env["DARKEXEC_HARNESS_PROMPT_PATH"]).unlink()
+        Path(timer_env["DARKEXEC_EFFICIENCY_PROMPT_PATH"]).unlink()
         journal = [
             json.loads(path.read_text())
             for path in (root / "harness-episodes").glob("*.json")

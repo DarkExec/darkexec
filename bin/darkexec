@@ -82,6 +82,19 @@ def prepend_harness_note(prompt: str, note: str) -> str:
     return validate_harness_prompt(f"{note}{separator}{prompt}")
 
 
+def current_closeout_prompt(state: dict, target: Path) -> str:
+    mode = state.get("harnessMode")
+    if mode == "read-only":
+        prompt = READ_ONLY_HARNESS_PROMPT
+    elif mode == "standard":
+        prompt = standard_harness_prompt(target)
+    elif mode == "efficiency":
+        prompt = efficiency_harness_prompt(target)
+    else:
+        raise RuntimeError(f"unsupported debounced harness mode: {mode}")
+    return prepend_harness_note(prompt, state.get("harnessNote") or "")
+
+
 def configured_prompt(path: Path, default: str, label: str) -> str:
     if not path.exists():
         return default
@@ -2275,9 +2288,6 @@ def fire_debounce(
                     "status": status, "threadId": thread_id, "reason": reason,
                     "harnessTurnId": harness_turn_id, "harnessResult": harness_result,
                 }
-            state["harnessStatus"] = "starting"
-            state["harnessThreadId"] = thread_id
-            atomic_write(path, state)
             turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
             product_index = next(
                 index for index, turn in enumerate(turns)
@@ -2304,6 +2314,9 @@ def fire_debounce(
                     if source_evidence["evidenceComplete"] else None
                 ),
             })
+            state["harnessPrompt"] = current_closeout_prompt(state, target)
+            state["harnessStatus"] = "starting"
+            state["harnessThreadId"] = thread_id
             atomic_write(path, state)
             def harness_started(_thread_id: str, turn_id: str) -> None:
                 state.update({
@@ -2352,7 +2365,7 @@ def fire_debounce(
         state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
         atomic_write(path, state)
         return {"status": "interrupted", "threadId": thread_id, "error": state["error"]}
-    except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
         state.update({"status": "failed", "error": f"debounced closeout failed: {exc}", "updatedAt": now()})
         started = bool(state.get("harnessTurnId"))
         state["harnessStatus"] = "failed" if started else "not_started"
@@ -2424,11 +2437,6 @@ def arm_debounce(args) -> int:
         "schemaVersion": 1, "threadId": args.thread, "targetPath": str(target),
         "productTurnId": args.turn, "generation": generation,
         "debounceSeconds": args.seconds, "harnessMode": args.harness_mode,
-        "harnessPrompt": (
-            READ_ONLY_HARNESS_PROMPT
-            if args.harness_mode == "read-only"
-            else standard_harness_prompt(target)
-        ),
         "status": "paused" if paused else "pending", "createdAt": prior.get("createdAt") or now(),
         "updatedAt": now(),
         "dueAt": None if paused else (
@@ -2609,10 +2617,11 @@ def closeout_now(args) -> int:
             return 1
         if args.note_stdin:
             try:
-                state["harnessPrompt"] = prepend_harness_note(
-                    state["harnessPrompt"], sys.stdin.read()
-                )
-            except (KeyError, ValueError) as exc:
+                note = sys.stdin.read().strip()
+                if len(note) > MAX_HARNESS_NOTE:
+                    raise ValueError(f"harness note exceeds {MAX_HARNESS_NOTE} characters")
+                state["harnessNote"] = note
+            except ValueError as exc:
                 result = {"status": "rejected", "threadId": args.thread, "error": str(exc)}
                 print(json.dumps(result) if args.json else f"{args.thread}: rejected ({exc})")
                 return 1
@@ -3205,7 +3214,9 @@ def main() -> int:
     debounce.add_argument("--thread", required=True)
     debounce.add_argument("--turn", required=True)
     debounce.add_argument("--seconds", type=int, default=1800)
-    debounce.add_argument("--harness-mode", choices=("read-only", "standard"), required=True)
+    debounce.add_argument(
+        "--harness-mode", choices=("read-only", "standard", "efficiency"), required=True,
+    )
     debounce.add_argument("--json", action="store_true")
     pause = sub.add_parser("debounce-pause")
     pause.add_argument("--thread", required=True)
