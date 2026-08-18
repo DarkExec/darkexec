@@ -18,7 +18,15 @@ EXECUTION_ROOT = Path(os.environ.get("DARKEXEC_EXECUTION_ROOT", "/var/lib/darkex
 CONTROL_ROOT = Path(os.environ.get("DARKEXEC_CONTROL_ROOT", "/var/lib/darkexec/controls"))
 WORKSPACE = Path(os.environ.get("DARKEXEC_WORKSPACE", "/srv/darkexec"))
 CONFIG = Path(os.environ.get("DARKEXEC_CONFIG", "/root/.codex/config.toml"))
-DOCTRINE = Path(os.environ.get("DARKEXEC_DOCTRINE", str(WORKSPACE / "harness-ops.md")))
+HOST_DOCTRINE = Path(os.environ.get("DARKEXEC_HOST_DOCTRINE", "/srv/harness-ops.md"))
+DOCTRINE = Path(os.environ.get(
+    "DARKEXEC_DOCTRINE",
+    str(HOST_DOCTRINE if HOST_DOCTRINE.exists() else WORKSPACE / "harness-ops.md"),
+))
+DOCTRINE_REFRESH = os.environ.get(
+    "DARKEXEC_DOCTRINE_REFRESH", "/srv/harness-ops/scripts/refresh.sh"
+).strip()
+DOCTRINE_REFRESH_TIMEOUT = int(os.environ.get("DARKEXEC_DOCTRINE_REFRESH_TIMEOUT", "120"))
 HARNESS_PROMPT_PATH = Path(os.environ.get(
     "DARKEXEC_HARNESS_PROMPT_PATH", "/var/lib/darkexec/config/harness-prompt.txt"
 ))
@@ -224,6 +232,45 @@ def doctrine_sha256() -> str | None:
         return None
 
 
+def refresh_harness_doctrine() -> dict:
+    """Refresh an optional managed binding without changing harness prompt text."""
+    if not DOCTRINE_REFRESH or not Path(DOCTRINE_REFRESH).is_file():
+        return {
+            "status": "pinned",
+            "revision": None,
+            "harnessOpsSha256": doctrine_sha256(),
+        }
+    try:
+        completed = subprocess.run(
+            [DOCTRINE_REFRESH, "--json"], capture_output=True, text=True, check=False,
+            timeout=DOCTRINE_REFRESH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"harness doctrine refresh exceeded {DOCTRINE_REFRESH_TIMEOUT} seconds"
+        ) from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        raise RuntimeError(f"harness doctrine refresh failed: {detail}")
+    try:
+        receipt = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("harness doctrine refresh returned invalid JSON") from exc
+    revision = receipt.get("revision")
+    checksum = receipt.get("harnessOpsSha256")
+    if (
+        receipt.get("status") not in {"current", "updated"}
+        or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)
+        or not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+    ):
+        raise RuntimeError("harness doctrine refresh returned an invalid receipt")
+    return {
+        "status": receipt["status"],
+        "revision": revision,
+        "harnessOpsSha256": checksum,
+    }
+
+
 def harness_episode_id(identity: dict) -> tuple[str, str]:
     digest = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
     return f"darkexec-harness-{digest[:32]}", digest
@@ -290,6 +337,7 @@ def emit_harness_episode(
     configuration_revision = hashlib.sha256(
         canonical_json(configuration or {"lifecycle": lifecycle, "harnessMode": harness_mode}).encode()
     ).hexdigest()
+    doctrine_refresh = harness.get("doctrineRefresh") or {}
     payload = {
         "schema": "darkexec.harness-episode/v1",
         "schemaVersion": 1,
@@ -304,7 +352,9 @@ def emit_harness_episode(
         "harnessLifecycle": lifecycle,
         "generation": generation,
         "runtimeRevision": runtime_revision(),
-        "doctrineSha256": doctrine_sha256(),
+        "doctrineSha256": doctrine_refresh.get("harnessOpsSha256") or doctrine_sha256(),
+        "doctrineRevision": doctrine_refresh.get("revision"),
+        "doctrineRefreshStatus": doctrine_refresh.get("status"),
         "configurationRevision": configuration_revision,
         "terminalIdentity": source,
         "target": {
@@ -1357,6 +1407,10 @@ def dispatch(args) -> int:
                 receipt["target"]["harness"] = {"status": "deferred"}
                 save(path, receipt, "completed")
             else:
+                doctrine_refresh = (
+                    None if args.read_only_harness else refresh_harness_doctrine()
+                )
+                receipt["target"]["harness"]["doctrineRefresh"] = doctrine_refresh
                 save(path, receipt, "harness_running")
                 harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt(target)
                 def harness_started(_thread_id: str, turn_id: str) -> None:
@@ -1368,6 +1422,7 @@ def dispatch(args) -> int:
                     "turnId": harness.get("turnId"),
                     "usage": harness.get("usage"), "modelCallCount": harness.get("modelCallCount"),
                     "resultText": harness.get("resultText"), "error": harness.get("error") or None,
+                    "doctrineRefresh": doctrine_refresh,
                 }
                 if not harness.get("ok"):
                     receipt["error"] = harness.get("error") or "Same-task harness turn failed."
@@ -1568,8 +1623,13 @@ def run_target(args) -> int:
                 result["status"] = "failed"
                 result["error"] = target_result.get("error") or "Target task failed."
             else:
+                doctrine_refresh = (
+                    None if args.read_only_harness else refresh_harness_doctrine()
+                )
                 harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt(target)
-                result["harness"] = {"status": "running"}
+                result["harness"] = {
+                    "status": "running", "doctrineRefresh": doctrine_refresh,
+                }
                 if executive_thread_id:
                     update_execution(executive_thread_id, {"phase": "harness_starting"})
                 def harness_started(_thread_id: str, turn_id: str) -> None:
@@ -1587,13 +1647,14 @@ def run_target(args) -> int:
                     "usage": harness.get("usage"),
                     "modelCallCount": harness.get("modelCallCount"),
                     "error": harness.get("error") or None,
+                    "doctrineRefresh": doctrine_refresh,
                 }
                 result["status"] = "completed" if harness.get("ok") else "failed"
                 if not harness.get("ok"):
                     result["error"] = harness.get("error") or "Same-task harness turn failed."
     except DispatchInterrupted as exc:
         result["status"] = "interrupted"
-        if (result.get("harness") or {}).get("turnId"):
+        if (result.get("harness") or {}).get("status") == "running":
             result["harness"]["status"] = "interrupted"
             result["harness"]["error"] = str(exc)
         result["error"] = str(exc)
@@ -1601,7 +1662,7 @@ def run_target(args) -> int:
         interrupted_exit = 128 + exc.signum
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
         result["status"] = "failed"
-        if (result.get("harness") or {}).get("turnId"):
+        if (result.get("harness") or {}).get("status") == "running":
             result["harness"]["status"] = "failed"
             result["harness"]["error"] = str(exc)
         result["error"] = f"Native Codex App transport failed: {exc}"
@@ -1684,6 +1745,8 @@ def continue_target(args) -> int:
                     closeout_state = load_receipt(closeout_path)
                     if closeout_state.get("productTurnId") == manual_product.get("turnId"):
                         manual_generation = closeout_state.get("generation")
+                if manual_harness_mode in {"standard", "efficiency"}:
+                    result["doctrineRefresh"] = refresh_harness_doctrine()
             update_execution(executive_thread_id, {
                 "phase": "target_starting",
                 "target": {
@@ -1736,6 +1799,7 @@ def continue_target(args) -> int:
             "usage": (result.get("target") or {}).get("usage"),
             "modelCallCount": (result.get("target") or {}).get("modelCallCount"),
             "error": result.get("error"),
+            "doctrineRefresh": result.get("doctrineRefresh"),
         }
         episode_path, episode_error = emit_harness_episode(
             lifecycle="manual", target_path=str(target), harness_mode=manual_harness_mode,
@@ -2188,6 +2252,7 @@ def emit_closeout_episode(
             "modelCallCount": harness_model_calls,
             "resultText": harness_result,
             "error": error,
+            "doctrineRefresh": state.get("doctrineRefresh"),
         },
         generation=state.get("generation"),
         source={
@@ -2314,6 +2379,8 @@ def fire_debounce(
                     if source_evidence["evidenceComplete"] else None
                 ),
             })
+            if state["harnessMode"] in {"standard", "efficiency"}:
+                state["doctrineRefresh"] = refresh_harness_doctrine()
             state["harnessPrompt"] = current_closeout_prompt(state, target)
             state["harnessStatus"] = "starting"
             state["harnessThreadId"] = thread_id

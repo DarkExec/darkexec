@@ -275,7 +275,34 @@ def fake_app_server(
 def main() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
+        os.environ["DARKEXEC_DOCTRINE_REFRESH"] = ""
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
+        refresh_doctrine = runtime["refresh_harness_doctrine"]
+        pinned_refresh = refresh_doctrine()
+        assert pinned_refresh["status"] == "pinned", pinned_refresh
+        refresh_fixture = root / "refresh-fixture"
+        refresh_fixture.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' '{\"status\":\"current\","
+            "\"revision\":\"1111111111111111111111111111111111111111\","
+            "\"harnessOpsSha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"}'\n"
+        )
+        refresh_fixture.chmod(0o700)
+        refresh_doctrine.__globals__["DOCTRINE_REFRESH"] = str(refresh_fixture)
+        managed_refresh = refresh_doctrine()
+        assert managed_refresh == {
+            "status": "current",
+            "revision": "1" * 40,
+            "harnessOpsSha256": "2" * 64,
+        }, managed_refresh
+        refresh_fixture.write_text("#!/usr/bin/env bash\nprintf '%s\\n' '{}'")
+        refresh_fixture.chmod(0o700)
+        try:
+            refresh_doctrine()
+            raise AssertionError("invalid doctrine refresh receipt was accepted")
+        except RuntimeError as exc:
+            assert "invalid receipt" in str(exc), exc
+        refresh_doctrine.__globals__["DOCTRINE_REFRESH"] = ""
         prompt_path = root / "config" / "harness-prompt.txt"
         efficiency_prompt_path = root / "config" / "efficiency-prompt.txt"
         harness_project_prompt_root = root / "config" / "harness-prompts"
