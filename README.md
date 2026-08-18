@@ -181,7 +181,7 @@ darkexec debounce-cancel --thread TARGET_TASK_ID --json
 printf '%s' 'Optional context for this pass' | darkexec debounce-now --thread TARGET_TASK_ID --note-stdin --json
 ```
 
-Pause stops the timer and survives later follow-ups; each follow-up refreshes its paused remaining window. Resume continues the saved window. Cancel removes the current closeout but deliberately does not disable future closeout, so the next completed follow-up arms a new timer. Closeout-now stops the timer and runs that generation's exact harness pass immediately. Optional bounded text supplied with `--note-stdin` is prepended to that captured prompt for this pass only.
+Pause stops the timer and survives later follow-ups; each follow-up refreshes its paused remaining window. Resume continues the saved window. Cancel removes the current closeout but deliberately does not disable future closeout, so the next completed follow-up arms a new timer. Closeout-now stops the timer and runs that generation's exact harness pass immediately. The pass resolves the current project prompt when execution starts, including when the closeout was armed before a prompt setting changed. Optional bounded text supplied with `--note-stdin` is prepended to that current prompt for this pass only.
 
 Authenticated control planes that already project `debounce-status` may add `--detach --request-id REQUEST_ID`. DarkExec atomically accepts that generation once, starts its existing systemd-owned closeout service, and returns `pending` immediately; repeated requests return the original accepted request identity without adding the note again. The caller must keep projecting the runtime-owned receipt through terminal state.
 
