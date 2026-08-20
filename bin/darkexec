@@ -3052,6 +3052,9 @@ def target_status(args) -> int:
             "turnStatus": turn.get("status") or "unknown",
             "turnKind": "harness" if harness_prompt_mode(prompt) else "product",
         }
+        created_at = turn_message_time(str(turn.get("id") or ""), 0)
+        if created_at:
+            newer["createdAt"] = created_at
         if args.include_input:
             newer["inputText"] = prompt[:20000]
         if args.include_result and newer["turnStatus"] in {

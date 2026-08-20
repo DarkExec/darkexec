@@ -980,7 +980,7 @@ def main() -> None:
                             {"type": "text", "text": "Original product work"},
                         ]},
                     ]},
-                    {"id": "direct-turn", "status": "inProgress", "items": [
+                    {"id": "01a01cf5-9a0e-73f2-ae20-b892e9381cff", "status": "inProgress", "items": [
                         {"id": "direct-user", "type": "userMessage", "content": [
                             {"type": "text", "text": "PRIVATE DIRECT FOLLOW-UP"},
                         ]},
@@ -1005,7 +1005,9 @@ def main() -> None:
         assert target_status_result.returncode == 0, target_status_result.stderr
         assert target_status_payload["status"] == "newer_turn", target_status_payload
         assert target_status_payload["newerTurn"] == {
-            "turnId": "direct-turn", "turnStatus": "inProgress", "turnKind": "product",
+            "turnId": "01a01cf5-9a0e-73f2-ae20-b892e9381cff",
+            "turnStatus": "inProgress", "turnKind": "product",
+            "createdAt": "2026-08-20T02:17:32.942000Z",
         }, target_status_payload
         assert "PRIVATE DIRECT FOLLOW-UP" not in target_status_result.stdout
         assert "PRIVATE DIRECT RESULT" not in target_status_result.stdout
