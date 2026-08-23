@@ -3099,6 +3099,15 @@ def target_status(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir() or not saved_project(target):
         raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    closeout_harness_turn_id = None
+    closeout_path = session_path(args.thread)
+    if closeout_path.exists():
+        try:
+            closeout = load_receipt(closeout_path)
+            if closeout.get("threadId") == args.thread:
+                closeout_harness_turn_id = closeout.get("harnessTurnId")
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     try:
         with AppServer() as app:
             turns = app.require_turns_since(args.thread, target, args.after_turn)
@@ -3108,7 +3117,11 @@ def target_status(args) -> int:
     if args.include_input:
         for turn in turns:
             messages = user_messages(turn)
-            if not messages or harness_prompt_mode(user_message_text(messages[0])):
+            if (
+                not messages
+                or turn.get("id") == closeout_harness_turn_id
+                or harness_prompt_mode(user_message_text(messages[0]))
+            ):
                 continue
             for ordinal, item in enumerate(messages[1:], start=1):
                 message_id = item.get("id")
@@ -3134,10 +3147,14 @@ def target_status(args) -> int:
         if not messages:
             continue
         prompt = user_message_text(messages[0])
+        harness_turn = (
+            turn.get("id") == closeout_harness_turn_id
+            or bool(harness_prompt_mode(prompt))
+        )
         newer = {
             "turnId": turn.get("id"),
             "turnStatus": turn.get("status") or "unknown",
-            "turnKind": "harness" if harness_prompt_mode(prompt) else "product",
+            "turnKind": "harness" if harness_turn else "product",
         }
         created_at = turn_message_time(str(turn.get("id") or ""), 0)
         if created_at:
