@@ -46,7 +46,7 @@ No hosted control plane. No mystery worker fleet. It runs on your machine, insid
 git clone https://github.com/DarkExec/darkexec && sudo darkexec/scripts/install.sh
 ```
 
-The installer validates the checkout, creates a commit-addressed release, rejects any release whose effective default turn timeout is not unbounded, and prints `turnTimeoutDefault: 0` with the one next action:
+The installer preflights every intended filesystem destination before validation or release changes, validates the checkout, creates a commit-addressed release, rejects any release whose effective default turn timeout is not unbounded, and prints `turnTimeoutDefault: 0` with the one next action:
 
 > Open `/srv/darkexec` in Codex App and send the outcome you want.
 
