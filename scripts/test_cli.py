@@ -294,6 +294,14 @@ def main() -> None:
         os.environ["DARKEXEC_DOCTRINE_REFRESH"] = ""
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
         refresh_doctrine = runtime["refresh_harness_doctrine"]
+        incident_prompt = (
+            "you can go ahead and make all the changes to toolburn you wanted, and also move passes "
+            "into DarkExec/harness-ops, then change the harness prompt because efficiency passes can "
+            "help toolburn make the harness passes more economical"
+        )
+        assert runtime["harness_prompt_mode"](incident_prompt) is None
+        assert runtime["harness_prompt_mode"](runtime["standard_harness_prompt"]()) == "standard"
+        assert runtime["harness_prompt_mode"](runtime["READ_ONLY_HARNESS_PROMPT"]) == "read-only"
         pinned_refresh = refresh_doctrine()
         assert pinned_refresh["status"] == "pinned", pinned_refresh
         refresh_fixture = root / "refresh-fixture"
@@ -1167,6 +1175,34 @@ def main() -> None:
         assert continue_inputs[0] == follow_up_input, continue_inputs[0]
         continue_server.join(timeout=2)
         assert not continue_server.is_alive()
+        product_socket, product_ready, product_inputs = (
+            root / "product.sock", threading.Event(), []
+        )
+        product_server = threading.Thread(
+            target=fake_app_server,
+            args=(product_socket, product_ready, True, None, {
+                interactive_state["target"]["threadId"]: {"cwd": str(target), "turns": []},
+            }, product_inputs),
+            daemon=True,
+        )
+        product_server.start(); assert product_ready.wait(timeout=2)
+        product = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
+                "--thread", interactive_state["target"]["threadId"],
+                "--executive-thread", interactive_executive, "--prompt-stdin",
+                "--product", "--json",
+            ],
+            input=incident_prompt, capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(product_socket)}, check=False,
+        )
+        product_result = json.loads(product.stdout)
+        assert product.returncode == 0 and product_result["status"] == "completed", product_result
+        assert product_result["turnKind"] == "product", product_result
+        assert product_result["nativeTurnStarted"] is True, product_result
+        assert product_inputs[0][0]["text"] == incident_prompt, product_inputs
+        product_server.join(timeout=2)
+        assert not product_server.is_alive()
         efficiency_socket, efficiency_ready = root / "efficiency.sock", threading.Event()
         efficiency_prompt = "Find and fix the single largest avoidable harness cost."
         efficiency_server = threading.Thread(
