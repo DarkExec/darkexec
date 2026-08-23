@@ -3134,6 +3134,12 @@ def target_status(args) -> int:
                     "inputText": user_message_text(item)[:20000],
                     "ordinal": ordinal,
                 }
+                client_intent_id = item.get("clientId")
+                if (
+                    isinstance(client_intent_id, str)
+                    and 0 < len(client_intent_id) <= 200
+                ):
+                    steering["clientIntentId"] = client_intent_id
                 created_at = turn_message_time(str(turn_id), ordinal)
                 if created_at:
                     steering["createdAt"] = created_at
