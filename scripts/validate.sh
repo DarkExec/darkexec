@@ -59,5 +59,11 @@ PY
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test_cli.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test_refresh_harness_ops.py"
 bash -n "$root/scripts/install.sh" "$root/scripts/validate.sh"
-python3 -m py_compile "$root/scripts/refresh_harness_ops.py"
+python3 - "$root/scripts/refresh_harness_ops.py" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+compile(path.read_text(), str(path), "exec")
+PY
 git -C "$root" diff --check
