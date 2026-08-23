@@ -12,6 +12,7 @@ def main() -> int:
     runtime = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / 'bin/darkexec')
     os.environ.pop('DARKEXEC_TURN_TIMEOUT', None)
     os.environ.pop('DARKEXEC_EXECUTION_ROOT', None)
+    os.environ.pop('DARKEXEC_DOCTRINE_REFRESH', None)
     values = runpy.run_path(str(runtime), run_name='darkexec_install_contract')
     turn_timeout = values.get('TURN_TIMEOUT')
     if turn_timeout != 0:
@@ -25,6 +26,14 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    doctrine_refresh = values.get('DOCTRINE_REFRESH')
+    if doctrine_refresh != '/usr/local/libexec/darkexec-refresh-harness-ops':
+        print(
+            f'DarkExec install rejected: doctrine refresh is {doctrine_refresh!r}, '
+            "expected the Runtime-owned immutable distribution helper.",
+            file=sys.stderr,
+        )
+        return 1
     for function in ('continue_target', 'stop_execution'):
         if not callable(values.get(function)):
             print(f'DarkExec install rejected: missing {function} stop-control contract.', file=sys.stderr)
@@ -34,6 +43,7 @@ def main() -> int:
         'runtime': str(runtime),
         'turnTimeoutDefault': turn_timeout,
         'executionRootDefault': str(execution_root),
+        'doctrineRefreshDefault': doctrine_refresh,
         'stopControl': True,
     }, sort_keys=True))
     return 0

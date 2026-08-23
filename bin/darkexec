@@ -24,9 +24,12 @@ DOCTRINE = Path(os.environ.get(
     str(HOST_DOCTRINE if HOST_DOCTRINE.exists() else WORKSPACE / "harness-ops.md"),
 ))
 DOCTRINE_REFRESH = os.environ.get(
-    "DARKEXEC_DOCTRINE_REFRESH", "/srv/harness-ops/scripts/refresh.sh"
+    "DARKEXEC_DOCTRINE_REFRESH", "/usr/local/libexec/darkexec-refresh-harness-ops"
 ).strip()
 DOCTRINE_REFRESH_TIMEOUT = int(os.environ.get("DARKEXEC_DOCTRINE_REFRESH_TIMEOUT", "120"))
+DOCTRINE_DISTRIBUTION_ROOT = Path(os.environ.get(
+    "DARKEXEC_HARNESS_OPS_ROOT", "/var/lib/darkexec/harness-ops"
+))
 HARNESS_PROMPT_PATH = Path(os.environ.get(
     "DARKEXEC_HARNESS_PROMPT_PATH", "/var/lib/darkexec/config/harness-prompt.txt"
 ))
@@ -51,6 +54,11 @@ DEFAULT_HARNESS_PROMPT = (
     "that doctrine, if docs/passes/harness/AGENTS.md exists in the target repository, read it and follow "
     "its routing."
 )
+LEGACY_STANDARD_HARNESS_PROMPTS = {
+    "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
+    f"reliable, and durable execution. Make sure we are following {path} doctrine."
+    for path in {DOCTRINE, Path("/srv/darkexec/harness-ops.md")}
+}
 DEFAULT_EFFICIENCY_PROMPT = (
     "Now briefly review the harness pass you just performed—not the original product work. Identify its "
     "single largest avoidable source of model calls, token consumption, retries, or repeated context recovery.\n\n"
@@ -67,6 +75,12 @@ READ_ONLY_HARNESS_PROMPT = (
     "files, changing state, continuing product work, or contacting anyone. Briefly report whether the request "
     "stayed read-only and whether any harness change is warranted; make no change."
 )
+
+
+class DoctrineRefreshError(RuntimeError):
+    """A typed harness preparation failure before native delivery."""
+
+
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -232,6 +246,21 @@ def doctrine_sha256() -> str | None:
         return None
 
 
+def doctrine_distribution_status() -> dict:
+    receipt_path = DOCTRINE_DISTRIBUTION_ROOT / "current.json"
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        receipt = {}
+    return {
+        "mode": "managed" if DOCTRINE_REFRESH and Path(DOCTRINE_REFRESH).is_file() else "pinned",
+        "root": str(DOCTRINE_DISTRIBUTION_ROOT),
+        "revision": receipt.get("revision") if isinstance(receipt, dict) else None,
+        "harnessOpsSha256": doctrine_sha256(),
+        "passBundleSha256": receipt.get("passBundleSha256") if isinstance(receipt, dict) else None,
+    }
+
+
 def refresh_harness_doctrine() -> dict:
     """Refresh an optional managed binding without changing harness prompt text."""
     if not DOCTRINE_REFRESH or not Path(DOCTRINE_REFRESH).is_file():
@@ -246,29 +275,35 @@ def refresh_harness_doctrine() -> dict:
             timeout=DOCTRINE_REFRESH_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
+        raise DoctrineRefreshError(
             f"harness doctrine refresh exceeded {DOCTRINE_REFRESH_TIMEOUT} seconds"
         ) from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
-        raise RuntimeError(f"harness doctrine refresh failed: {detail}")
+        raise DoctrineRefreshError(f"harness doctrine refresh failed: {detail}")
     try:
         receipt = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("harness doctrine refresh returned invalid JSON") from exc
+        raise DoctrineRefreshError("harness doctrine refresh returned invalid JSON") from exc
     revision = receipt.get("revision")
     checksum = receipt.get("harnessOpsSha256")
+    pass_checksum = receipt.get("passBundleSha256")
     if (
         receipt.get("status") not in {"current", "updated"}
         or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)
         or not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
     ):
-        raise RuntimeError("harness doctrine refresh returned an invalid receipt")
-    return {
+        raise DoctrineRefreshError("harness doctrine refresh returned an invalid receipt")
+    result = {
         "status": receipt["status"],
         "revision": revision,
         "harnessOpsSha256": checksum,
     }
+    if pass_checksum is not None:
+        if not isinstance(pass_checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", pass_checksum):
+            raise DoctrineRefreshError("harness doctrine refresh returned an invalid pass bundle checksum")
+        result["passBundleSha256"] = pass_checksum
+    return result
 
 
 def harness_episode_id(identity: dict) -> tuple[str, str]:
@@ -1765,14 +1800,17 @@ def continue_target(args) -> int:
     manual_harness_mode = (
         "efficiency" if args.harness_efficiency
         else "standard" if args.harness_standard
+        else None if args.product
         else None if args.source_executive_turn
         else harness_prompt_mode(prompt)
     )
+    turn_kind = f"harness_{manual_harness_mode}" if manual_harness_mode else "product"
     manual_product: dict = {}
     manual_generation = None
     result = {
         "schemaVersion": 1, "executiveThreadId": executive_thread_id,
         "targetPath": str(target), "transport": "codex-app-server-control-socket",
+        "turnKind": turn_kind, "nativeTurnStarted": False,
         "target": {"threadId": args.thread}, "createdAt": now(),
     }
     interrupted_exit = None
@@ -1805,6 +1843,7 @@ def continue_target(args) -> int:
                 },
             })
             def turn_started(_thread_id: str, turn_id: str) -> None:
+                result["nativeTurnStarted"] = True
                 result["target"]["turnId"] = turn_id
                 update_execution(executive_thread_id, {
                     "phase": "target_running",
@@ -1822,6 +1861,12 @@ def continue_target(args) -> int:
             result["status"] = "completed" if turn.get("ok") else "failed"
             if not turn.get("ok"):
                 result["error"] = turn.get("error") or "Target follow-up failed."
+    except DoctrineRefreshError as exc:
+        result["status"] = "failed"
+        result["errorCode"] = "doctrine_refresh_failed"
+        result["stage"] = "harness_preparation"
+        result["retrySafe"] = True
+        result["error"] = str(exc)
     except DispatchInterrupted as exc:
         result["status"] = "interrupted"
         result["error"] = str(exc)
@@ -1906,10 +1951,9 @@ def turn_message_time(turn_id: str, ordinal: int) -> str | None:
 
 
 def harness_prompt_mode(prompt: str) -> str | None:
-    lowered = prompt.lower()
-    if prompt == READ_ONLY_HARNESS_PROMPT or "harness proof only" in lowered:
+    if prompt == READ_ONLY_HARNESS_PROMPT:
         return "read-only"
-    if prompt == standard_harness_prompt() or ("harness pass" in lowered and "harness-ops" in lowered):
+    if prompt == standard_harness_prompt() or prompt in LEGACY_STANDARD_HARNESS_PROMPTS:
         return "standard"
     return None
 
@@ -3229,6 +3273,7 @@ def identity(args) -> int:
         "protocolVersion": REMOTE_PROTOCOL_VERSION,
         "runtimeRevision": runtime_revision(),
         "workspace": str(WORKSPACE),
+        "doctrineDistribution": doctrine_distribution_status(),
         "appServerReady": socket_ready,
         "appServerError": socket_error,
         "projects": saved_projects(),
@@ -3296,6 +3341,7 @@ def main() -> int:
     continuation_input.add_argument("--source-executive-turn", action="store_true")
     continuation_input.add_argument("--input-json")
     continuation_harness = continuation.add_mutually_exclusive_group()
+    continuation_harness.add_argument("--product", action="store_true")
     continuation_harness.add_argument("--harness-efficiency", action="store_true")
     continuation_harness.add_argument("--harness-standard", action="store_true")
     continuation.add_argument("--prompt-stdin", action="store_true", required=True)
