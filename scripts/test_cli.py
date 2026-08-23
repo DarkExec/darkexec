@@ -1058,7 +1058,7 @@ def main() -> None:
                         ]},
                         {"id": "direct-steer", "type": "userMessage", "content": [
                             {"type": "text", "text": "PRIVATE DIRECT STEERING"},
-                        ]},
+                        ], "clientId": "intent-direct-steer"},
                         {"id": "direct-agent", "type": "agentMessage",
                          "text": "PRIVATE DIRECT RESULT"},
                     ]},
@@ -1090,6 +1090,10 @@ def main() -> None:
             {
                 "messageId": item["messageId"], "turnId": item["turnId"],
                 "inputText": item["inputText"], "ordinal": item["ordinal"],
+                **(
+                    {"clientIntentId": item["clientIntentId"]}
+                    if item.get("clientIntentId") else {}
+                ),
             }
             for item in target_input_payload["steeringMessages"]
         ] == [
@@ -1100,6 +1104,7 @@ def main() -> None:
             {
                 "messageId": "direct-steer", "turnId": "direct-turn",
                 "inputText": "PRIVATE DIRECT STEERING", "ordinal": 1,
+                "clientIntentId": "intent-direct-steer",
             },
         ], target_input_payload
         target_input_server.join(timeout=2)
