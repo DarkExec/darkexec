@@ -27,10 +27,11 @@ def main() -> int:
         )
         return 1
     doctrine_refresh = values.get('DOCTRINE_REFRESH')
-    if doctrine_refresh != '/usr/local/libexec/darkexec-refresh-harness-ops':
+    expected_doctrine_refresh = str(values['INSTALL_ROOT'] / 'libexec/darkexec-refresh-harness-ops')
+    if doctrine_refresh != expected_doctrine_refresh:
         print(
             f'DarkExec install rejected: doctrine refresh is {doctrine_refresh!r}, '
-            "expected the Runtime-owned immutable distribution helper.",
+            f'expected the Runtime-owned immutable distribution helper at {expected_doctrine_refresh!r}.',
             file=sys.stderr,
         )
         return 1

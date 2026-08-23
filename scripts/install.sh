@@ -3,7 +3,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; commit="$(git -C "$root" rev-parse HEAD)"
 install="${DARKEXEC_INSTALL_ROOT:-/opt/darkexec}"; release="$install/releases/$commit"; workspace="${DARKEXEC_WORKSPACE:-/srv/darkexec}"
 bin_path="${DARKEXEC_BIN_PATH:-/usr/local/bin/darkexec}"; host_doctrine="${DARKEXEC_HOST_DOCTRINE_PATH:-/srv/harness-ops.md}"
-libexec_path="${DARKEXEC_DOCTRINE_REFRESH_PATH:-/usr/local/libexec/darkexec-refresh-harness-ops}"
+libexec_path="${DARKEXEC_DOCTRINE_REFRESH_PATH:-$install/libexec/darkexec-refresh-harness-ops}"
 doctrine_root="${DARKEXEC_HARNESS_OPS_ROOT:-/var/lib/darkexec/harness-ops}"
 execution_root="${DARKEXEC_EXECUTION_ROOT:-/var/lib/darkexec/executives}"
 harness_episode_root="${DARKEXEC_HARNESS_EPISODE_ROOT:-/var/lib/darkexec/harness-episodes}"
