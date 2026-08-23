@@ -7,6 +7,23 @@ libexec_path="${DARKEXEC_DOCTRINE_REFRESH_PATH:-$install/libexec/darkexec-refres
 doctrine_root="${DARKEXEC_HARNESS_OPS_ROOT:-/var/lib/darkexec/harness-ops}"
 execution_root="${DARKEXEC_EXECUTION_ROOT:-/var/lib/darkexec/executives}"
 harness_episode_root="${DARKEXEC_HARNESS_EPISODE_ROOT:-/var/lib/darkexec/harness-episodes}"
+require_writable_directory() {
+  local intended="$1" existing="$1"
+  while [[ ! -d "$existing" && "$existing" != "/" ]]; do existing="$(dirname "$existing")"; done
+  [[ -w "$existing" ]] || { printf 'DarkExec install preflight failed: %s requires write access to %s.\n' "$intended" "$existing" >&2; exit 1; }
+}
+[[ -d "$release" ]] || require_writable_directory "$install/releases"
+require_writable_directory "$install"
+require_writable_directory "$workspace"
+require_writable_directory "$(dirname "$libexec_path")"
+require_writable_directory "$doctrine_root"
+current_host_binding="$(readlink "$host_doctrine" 2>/dev/null || true)"
+if [[ ! -e "$host_doctrine" || "$current_host_binding" == "/srv/harness-ops/harness-ops.md" || "$current_host_binding" == "$workspace/harness-ops.md" ]]; then
+  require_writable_directory "$(dirname "$host_doctrine")"
+fi
+require_writable_directory "$(dirname "$bin_path")"
+require_writable_directory "$execution_root"
+require_writable_directory "$harness_episode_root"
 "$root/scripts/validate.sh"; mkdir -p "$install/releases" "$workspace"
 [[ -d "$release" ]] || { git clone --quiet --no-local "$root" "$release"; git -C "$release" checkout --quiet --detach "$commit"; }
 "$release/scripts/verify_install_contract.py" "$release/bin/darkexec" >/dev/null
@@ -17,7 +34,6 @@ ln -sfn "$install/current/share/workspace/AGENTS.md" "$workspace/AGENTS.md"; ln 
 ln -sfn "$install/current/share/harness-ops.md" "$workspace/harness-ops.md"
 managed_doctrine="$doctrine_root/current/harness-ops.md"
 mkdir -p "$(dirname "$host_doctrine")"
-current_host_binding="$(readlink "$host_doctrine" 2>/dev/null || true)"
 if [[ ! -e "$host_doctrine" || "$current_host_binding" == "/srv/harness-ops/harness-ops.md" || "$current_host_binding" == "$workspace/harness-ops.md" ]]; then
   ln -sfn "$managed_doctrine" "$host_doctrine"
 fi

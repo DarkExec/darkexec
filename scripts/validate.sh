@@ -60,6 +60,25 @@ PY
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test_cli.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test_refresh_harness_ops.py"
 bash -n "$root/scripts/install.sh" "$root/scripts/validate.sh"
+preflight_root="$(mktemp -d)"
+trap 'rm -rf "$preflight_root"' EXIT
+set +e
+preflight_output="$(
+  DARKEXEC_INSTALL_ROOT="$preflight_root/install" \
+  DARKEXEC_WORKSPACE="$preflight_root/workspace" \
+  DARKEXEC_BIN_PATH="$preflight_root/bin/darkexec" \
+  DARKEXEC_DOCTRINE_REFRESH_PATH="$preflight_root/libexec/darkexec-refresh-harness-ops" \
+  DARKEXEC_HARNESS_OPS_ROOT="$preflight_root/state/harness-ops" \
+  DARKEXEC_EXECUTION_ROOT="$preflight_root/state/executives" \
+  DARKEXEC_HARNESS_EPISODE_ROOT="$preflight_root/state/harness-episodes" \
+  DARKEXEC_HOST_DOCTRINE_PATH="/proc/sys/darkexec-install-preflight/harness-ops.md" \
+  "$root/scripts/install.sh" 2>&1
+)"
+preflight_status=$?
+set -e
+[[ "$preflight_status" -ne 0 ]]
+grep -Fq 'DarkExec install preflight failed: /proc/sys/darkexec-install-preflight requires write access to /proc/sys.' <<<"$preflight_output"
+[[ ! -e "$preflight_root/install" && ! -e "$preflight_root/workspace" && ! -e "$preflight_root/state" ]]
 python3 - "$root/scripts/refresh_harness_ops.py" <<'PY'
 from pathlib import Path
 import sys
