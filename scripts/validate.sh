@@ -46,6 +46,7 @@ grep -Fqx 'EXECUTION_ROOT = Path(os.environ.get("DARKEXEC_EXECUTION_ROOT", "/var
 grep -Fqx '"$release/scripts/verify_install_contract.py" "$release/bin/darkexec" >/dev/null' "$root/scripts/install.sh"
 grep -Fqx 'execution_root="${DARKEXEC_EXECUTION_ROOT:-/var/lib/darkexec/executives}"' "$root/scripts/install.sh"
 "$root/scripts/verify_install_contract.py" "$root/bin/darkexec" >/dev/null
+DARKEXEC_INSTALL_ROOT=/tmp/darkexec-install-contract "$root/scripts/verify_install_contract.py" "$root/bin/darkexec" >/dev/null
 python3 - "$root" <<'PY'
 import hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])

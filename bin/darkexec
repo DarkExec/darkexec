@@ -23,8 +23,19 @@ DOCTRINE = Path(os.environ.get(
     "DARKEXEC_DOCTRINE",
     str(HOST_DOCTRINE if HOST_DOCTRINE.exists() else WORKSPACE / "harness-ops.md"),
 ))
+def default_install_root() -> Path:
+    configured = os.environ.get("DARKEXEC_INSTALL_ROOT", "").strip()
+    if configured:
+        return Path(configured)
+    executable = Path(__file__).resolve()
+    if len(executable.parents) > 3 and executable.parents[2].name == "releases":
+        return executable.parents[3]
+    return Path("/opt/darkexec")
+
+
+INSTALL_ROOT = default_install_root()
 DOCTRINE_REFRESH = os.environ.get(
-    "DARKEXEC_DOCTRINE_REFRESH", "/usr/local/libexec/darkexec-refresh-harness-ops"
+    "DARKEXEC_DOCTRINE_REFRESH", str(INSTALL_ROOT / "libexec/darkexec-refresh-harness-ops")
 ).strip()
 DOCTRINE_REFRESH_TIMEOUT = int(os.environ.get("DARKEXEC_DOCTRINE_REFRESH_TIMEOUT", "120"))
 DOCTRINE_DISTRIBUTION_ROOT = Path(os.environ.get(

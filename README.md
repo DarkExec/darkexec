@@ -217,7 +217,7 @@ DarkExec currently assumes:
 - Codex CLI and Codex App configured for the same Linux host;
 - a running Codex App control socket;
 - exact target directories saved in Codex configuration; and
-- permission to use `/opt/darkexec`, `/srv/darkexec`, `/var/lib/darkexec`, and `/usr/local/bin`, or equivalent environment overrides.
+- permission to use `/opt/darkexec`, `/srv/darkexec`, `/var/lib/darkexec`, and `/usr/local/bin`, or equivalent environment overrides. The immutable doctrine-refresh helper stays beneath the selected `DARKEXEC_INSTALL_ROOT` so a confined updater does not need a second system location.
 
 Codex App integration is an evolving boundary. Requalify after upgrades. Non-root test installs can set `DARKEXEC_INSTALL_ROOT`, `DARKEXEC_WORKSPACE`, and `DARKEXEC_BIN_PATH`.
 
