@@ -119,6 +119,22 @@ def fake_app_server(
             send_frame(connection, {"id": message["id"], "result": {"thread": {
                 **metadata, "turns": histories[thread], "status": {"type": "idle"},
             }}})
+        elif method == "thread/turns/list":
+            thread = message["params"]["threadId"]
+            if thread not in loaded:
+                send_frame(connection, {
+                    "id": message["id"],
+                    "error": {"code": -32600, "message": f"thread not found: {thread}"},
+                })
+                continue
+            ordered = list(reversed(histories[thread]))
+            start = int(message["params"].get("cursor") or 0)
+            limit = int(message["params"].get("limit") or 16)
+            data = ordered[start:start + limit]
+            next_cursor = str(start + limit) if start + limit < len(ordered) else None
+            send_frame(connection, {"id": message["id"], "result": {
+                "data": data, "nextCursor": next_cursor,
+            }})
         elif method == "thread/resume":
             thread = message["params"]["threadId"]
             if (

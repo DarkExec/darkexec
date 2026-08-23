@@ -833,6 +833,56 @@ class AppServer:
             thread["_rolloutPath"] = rollout_path
         return thread
 
+    def require_turns_since(self, thread_id: str, cwd: Path, baseline_turn_id: str) -> list[dict]:
+        listed = self.require_listed_thread(thread_id, cwd)
+        cursor = None
+        newest_first = []
+        seen_cursors = set()
+        try:
+            while True:
+                params = {
+                    "threadId": thread_id, "limit": 16,
+                    "sortDirection": "desc", "itemsView": "full",
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                page = self._request("thread/turns/list", params)
+                turns = page.get("data")
+                if not isinstance(turns, list):
+                    raise RuntimeError("App Server returned invalid target turn history")
+                for turn in turns:
+                    if not isinstance(turn, dict) or not turn.get("id"):
+                        raise RuntimeError("App Server returned an invalid target turn")
+                    newest_first.append(turn)
+                    if turn["id"] == baseline_turn_id:
+                        return list(reversed(newest_first))
+                    if len(newest_first) > 1000:
+                        raise RuntimeError("target turn history exceeded the reconciliation limit")
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    break
+                if not isinstance(cursor, str) or cursor in seen_cursors:
+                    raise RuntimeError("App Server returned an invalid target turn cursor")
+                seen_cursors.add(cursor)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "-32601" not in message and "thread not found" not in message:
+                raise
+            rollout_path = listed.get("path")
+            if rollout_path is not None and (
+                not isinstance(rollout_path, str) or not Path(rollout_path).is_absolute()
+            ):
+                raise RuntimeError(f"Task {thread_id} has an invalid persisted rollout path.")
+            thread = self.resume_thread(thread_id, rollout_path)
+            turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+            baseline = next(
+                (index for index, turn in enumerate(turns) if turn.get("id") == baseline_turn_id),
+                None,
+            )
+            if baseline is not None:
+                return turns[baseline:]
+        raise RuntimeError(f"recorded product turn {baseline_turn_id} was not found")
+
     def run_turn(
         self,
         thread_id: str,
@@ -3007,16 +3057,9 @@ def target_status(args) -> int:
         raise SystemExit(f"target is not an exact saved Codex project: {target}")
     try:
         with AppServer() as app:
-            thread = app.require_resumed_thread(args.thread, target)
+            turns = app.require_turns_since(args.thread, target, args.after_turn)
     except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
         raise SystemExit(f"cannot inspect target task: {exc}") from exc
-    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
-    baseline = next(
-        (index for index, turn in enumerate(turns) if turn.get("id") == args.after_turn),
-        None,
-    )
-    if baseline is None:
-        raise SystemExit(f"recorded product turn {args.after_turn} was not found")
     steering_messages = []
     if args.include_input:
         for turn in turns:
@@ -3042,7 +3085,7 @@ def target_status(args) -> int:
                     raise SystemExit("more than 100 native steering messages require reconciliation")
     newer = None
     newer_turns = []
-    for turn in turns[baseline + 1:]:
+    for turn in turns[1:]:
         messages = user_messages(turn)
         if not messages:
             continue
