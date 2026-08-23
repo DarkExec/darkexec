@@ -1104,6 +1104,54 @@ def main() -> None:
         ], target_input_payload
         target_input_server.join(timeout=2)
         assert not target_input_server.is_alive()
+        identity_harness_turn = "01a02e78-238e-7383-85c9-4b60760e1681"
+        session_path = (
+            Path(run_env["DARKEXEC_SESSION_ROOT"])
+            / f"{hashlib.sha256(status_target_thread.encode()).hexdigest()}.json"
+        )
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(json.dumps({
+            "threadId": status_target_thread,
+            "status": "pending",
+            "harnessTurnId": identity_harness_turn,
+        }))
+        identity_socket, identity_ready = root / "target-harness-identity.sock", threading.Event()
+        identity_server = threading.Thread(
+            target=fake_app_server,
+            args=(identity_socket, identity_ready, True, None, {
+                status_target_thread: {"cwd": str(target), "turns": [
+                    {"id": "baseline-turn", "status": "completed", "items": [
+                        {"id": "baseline-user", "type": "userMessage", "content": [
+                            {"type": "text", "text": "Original product work"},
+                        ]},
+                    ]},
+                    {"id": identity_harness_turn, "status": "inProgress", "items": [
+                        {"id": "changed-harness-user", "type": "userMessage", "content": [
+                            {"type": "text", "text": "A newly versioned harness prompt"},
+                        ]},
+                    ]},
+                ]},
+            }),
+            daemon=True,
+        )
+        identity_server.start(); assert identity_ready.wait(timeout=2)
+        identity_status = subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "target-status", "--target", str(target),
+                "--thread", status_target_thread, "--after-turn", "baseline-turn",
+                "--include-input", "--json",
+            ],
+            capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(identity_socket)},
+            check=False,
+        )
+        identity_payload = json.loads(identity_status.stdout)
+        assert identity_status.returncode == 0, identity_status.stderr
+        assert identity_payload["newerTurn"]["turnKind"] == "harness", identity_payload
+        assert identity_payload["newerTurn"]["turnId"] == identity_harness_turn, identity_payload
+        assert identity_payload["steeringMessages"] == [], identity_payload
+        identity_server.join(timeout=2)
+        assert not identity_server.is_alive()
         direct_image = root / "direct-image.png"
         direct_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         direct_manifest = root / "direct-input.json"
