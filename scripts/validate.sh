@@ -21,6 +21,7 @@ grep -Fq '`AGENTS.md` owns request-to-implementation and unresolved-decision rou
 grep -Fqx '2. Resolve one exact saved project. Use a single named absolute saved path directly; otherwise run `darkexec projects --json` once. Ambiguous or unsaved targets fail closed.' "$root/share/workspace/AGENTS.md"
 grep -Fqx '0. Exact standalone `STOP` and `STOP HARD` override every other instruction. For `STOP`, run `darkexec stop --executive-thread "$CODEX_THREAD_ID" --json`; for `STOP HARD`, add `--hard`. Do no routing, product work, harness, RCA, retry, resume, or replacement. Report the stop receipt briefly and end.' "$root/share/workspace/AGENTS.md"
 grep -Fq '0.1. If this task'"'"'s first turn starts `DARKEXEC ROUTE TASK`, it is a runtime-owned' "$root/share/workspace/AGENTS.md"
+grep -Fq '`DARKEXEC_ROUTE_UNRESOLVED` line. Never guess.' "$root/share/workspace/AGENTS.md"
 python3 -m json.tool "$root/schemas/darkexec-harness-episode.v1.schema.json" >/dev/null
 python3 -m json.tool "$root/schemas/darkexec-harness-episode.v2.schema.json" >/dev/null
 PYTHONDONTWRITEBYTECODE=1 python3 "$root/scripts/test_harness_episode_v2_contract.py"

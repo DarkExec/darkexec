@@ -49,6 +49,8 @@ def fake_app_server(
     observed_inputs: list[list[dict]] | None = None,
     stall_harness: bool = False,
     fail_harness: bool = False,
+    route_unresolved: bool = False,
+    remove_routed_target: bool = False,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -220,9 +222,14 @@ def fake_app_server(
                         ". Natural request:", 1
                     )[0]
                 )
-                selected = next(path for path in allowed if not path.endswith("darkexec"))
                 job_id = prompt.split("owns job ", 1)[1].split(".", 1)[0]
-                text = f"DARKEXEC_ROUTE_READY {job_id} {selected}"
+                if route_unresolved:
+                    text = f"DARKEXEC_ROUTE_UNRESOLVED {job_id}"
+                else:
+                    selected = next(path for path in allowed if not path.endswith("darkexec"))
+                    text = f"DARKEXEC_ROUTE_READY {job_id} {selected}"
+                    if remove_routed_target:
+                        Path(selected).rmdir()
             else:
                 text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
             history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
@@ -523,7 +530,11 @@ def main() -> None:
         target.mkdir()
         workspace.mkdir()
         config = root / "config.toml"
-        config.write_text(f'[projects."{target}"]\ntrust_level = "trusted"\n')
+        stale_target = root / "stale-target"
+        config.write_text(
+            f'[projects."{target}"]\ntrust_level = "trusted"\n'
+            f'[projects."{stale_target}"]\ntrust_level = "trusted"\n'
+        )
         route_candidates = root / "route-candidates.json"
         route_candidates.write_text(json.dumps([
             {"hostId": "host-agentfsd", "hostLabel": "AgentFSD", "targetPath": str(target)},
@@ -739,6 +750,7 @@ def main() -> None:
         routed_config.write_text(
             f'[projects."{workspace}"]\ntrust_level = "trusted"\n'
             f'[projects."{target}"]\ntrust_level = "trusted"\n'
+            f'[projects."{stale_target}"]\ntrust_level = "trusted"\n'
         )
         routed_socket, routed_ready, routed_inputs = (
             root / "routed.sock", threading.Event(), []
@@ -778,12 +790,73 @@ def main() -> None:
         assert routed_result["target"]["harness"]["status"] == "deferred", routed_result
         assert len(routed_inputs) == 3, routed_inputs
         assert routed_inputs[0][0]["text"].startswith("DARKEXEC ROUTE TASK."), routed_inputs
+        assert str(stale_target) not in routed_inputs[0][0]["text"], routed_inputs
+        assert "DARKEXEC_ROUTE_UNRESOLVED" in routed_inputs[0][0]["text"], routed_inputs
         assert routed_inputs[1] == [
             {"type": "text", "text": "Choose the owner and inspect it."}
         ], routed_inputs
         assert "Same-task harness: deferred" in routed_inputs[2][0]["text"], routed_inputs
         routed_server.join(timeout=2)
         assert not routed_server.is_alive()
+
+        unresolved_socket, unresolved_ready = root / "unresolved.sock", threading.Event()
+        unresolved_server = threading.Thread(
+            target=fake_app_server,
+            args=(unresolved_socket, unresolved_ready),
+            kwargs={"route_unresolved": True}, daemon=True,
+        )
+        unresolved_server.start(); assert unresolved_ready.wait(timeout=2)
+        unresolved_command = list(routed_command)
+        unresolved_command[unresolved_command.index("incident-routed-deferred")] = "incident-route-unresolved"
+        unresolved = subprocess.run(
+            unresolved_command, input="Choose between two equally plausible owners.",
+            capture_output=True, text=True,
+            env={
+                **env, "DARKEXEC_CONFIG": str(routed_config),
+                "DARKEXEC_APP_SERVER_SOCKET": str(unresolved_socket),
+            },
+            check=False,
+        )
+        unresolved_result = json.loads(unresolved.stdout)
+        assert unresolved.returncode != 0, unresolved_result
+        assert unresolved_result["status"] == "failed", unresolved_result
+        assert "could not identify one exact saved project" in unresolved_result["error"], unresolved_result
+        assert unresolved_result["target"] == {}, unresolved_result
+        unresolved_server.join(timeout=2)
+        assert not unresolved_server.is_alive()
+
+        disappearing_target = root / "disappearing-target"
+        disappearing_target.mkdir()
+        disappearing_config = root / "disappearing-config.toml"
+        disappearing_config.write_text(
+            f'[projects."{workspace}"]\ntrust_level = "trusted"\n'
+            f'[projects."{disappearing_target}"]\ntrust_level = "trusted"\n'
+        )
+        disappearing_socket, disappearing_ready = root / "disappearing.sock", threading.Event()
+        disappearing_server = threading.Thread(
+            target=fake_app_server,
+            args=(disappearing_socket, disappearing_ready),
+            kwargs={"remove_routed_target": True}, daemon=True,
+        )
+        disappearing_server.start(); assert disappearing_ready.wait(timeout=2)
+        disappearing_command = list(routed_command)
+        disappearing_command[disappearing_command.index("incident-routed-deferred")] = "incident-route-disappeared"
+        disappeared = subprocess.run(
+            disappearing_command, input="Choose the disappearing owner.",
+            capture_output=True, text=True,
+            env={
+                **env, "DARKEXEC_CONFIG": str(disappearing_config),
+                "DARKEXEC_APP_SERVER_SOCKET": str(disappearing_socket),
+            },
+            check=False,
+        )
+        disappeared_result = json.loads(disappeared.stdout)
+        assert disappeared.returncode != 0, disappeared_result
+        assert disappeared_result["status"] == "failed", disappeared_result
+        assert disappeared_result["error"] == "Resolved target is no longer an available saved project", disappeared_result
+        assert disappeared_result["target"] == {}, disappeared_result
+        disappearing_server.join(timeout=2)
+        assert not disappearing_server.is_alive()
         dispatch_image = root / "dispatch-image.png"
         dispatch_image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         dispatch_input = [
@@ -2071,6 +2144,8 @@ def main() -> None:
         "background-closeout-user-turn-suppression",
         "conflict-closed", "signal-terminalized", "follow-up-debounce-reset", "stale-generation-noop",
         "deferred-initial-harness", "executive-target-resolution",
+        "stale-route-candidate-filtering", "ambiguous-route-fail-closed",
+        "disappearing-route-target-fail-closed",
         "manual-harness-suppression",
             "schedule-failure-immediate-closeout", "same-session-trailing-closeout",
         "per-call-closeout-usage", "cold-task-resume",

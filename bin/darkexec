@@ -632,7 +632,10 @@ def saved_projects() -> list[str]:
     projects = config.get("projects") or {}
     if not isinstance(projects, dict):
         raise SystemExit("cannot read saved Codex projects: projects must be a table")
-    return sorted(path for path in projects if isinstance(path, str) and Path(path).is_absolute())
+    return sorted(
+        path for path in projects
+        if isinstance(path, str) and Path(path).is_absolute() and Path(path).is_dir()
+    )
 
 
 def usage(raw: dict | None) -> dict:
@@ -1213,6 +1216,8 @@ def closeout_executive(receipt: dict, path: Path, app: AppServer) -> None:
 
 
 def resolved_route(result_text: str, job_id: str, projects: list[str]) -> Path:
+    if result_text == f"DARKEXEC_ROUTE_UNRESOLVED {job_id}":
+        raise RuntimeError("DarkExec target resolver could not identify one exact saved project")
     prefix = f"DARKEXEC_ROUTE_READY {job_id} "
     if not result_text.startswith(prefix) or "\n" in result_text:
         raise RuntimeError("DarkExec target resolver returned an invalid acknowledgement")
@@ -1421,8 +1426,9 @@ def dispatch(args) -> int:
             f"Allowed projects: {json.dumps(route_projects)}. "
             f"Natural request: {json.dumps(prompt)}. "
             "Use only the supplied request and attachments. Do not inspect files, use tools, start "
-            "DarkExec, or perform the work. "
-            f"Reply only: DARKEXEC_ROUTE_READY {args.job_id} /exact/saved/project"
+            "DarkExec, or perform the work. Never guess when the request does not establish one owner. "
+            f"Reply only with DARKEXEC_ROUTE_READY {args.job_id} /exact/saved/project or "
+            f"DARKEXEC_ROUTE_UNRESOLVED {args.job_id}"
         )
         control_input = [{"type": "text", "text": control_prompt}]
         if direct_input is not None:
@@ -1468,6 +1474,12 @@ def dispatch(args) -> int:
                 receipt["targetPath"] = str(target)
                 receipt["resolvedTargetPath"] = str(target)
                 save(path, receipt, "target_resolved")
+
+            if not target.is_dir() or not saved_project(target):
+                receipt["error"] = "Resolved target is no longer an available saved project"
+                save(path, receipt, "failed")
+                print(json.dumps(receipt) if args.json else render_status(receipt))
+                return 1
 
             target_thread = app.start_thread(target)
             receipt["target"] = {
