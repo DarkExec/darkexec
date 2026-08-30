@@ -258,3 +258,9 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md), review the [security policy](SECURITY.m
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Thinking level and speed
+
+`dispatch`, `run`, and `continue` accept `--thinking-level low|medium|high|xhigh|max|ultra` and `--speed standard|fast`. These optional flags override the target turn and subsequent native turns without changing the control task or global Codex configuration. Omission preserves native settings; `standard` explicitly clears Fast mode. Available thinking levels depend on the active Codex model; the GPT-5.6 Sol catalog advertises all six. Fast mode uses more quota. Same-turn steering cannot change execution options; use them on the next continuation. Dispatch deduplication includes the selected options.
+
+`set-execution-options --target PATH --thread ID --thinking-level LEVEL --speed standard|fast --json` saves an exact session override without starting or interrupting a turn. It verifies the task against the native project listing and stores choices privately under the session root. Every later target turn, including closeout and calls from workers started before an App upgrade, reads that override. Omit one flag to leave that dimension under native/explicit caller control.
