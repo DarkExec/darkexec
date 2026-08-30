@@ -1730,6 +1730,7 @@ def main() -> None:
             "DARKEXEC_SCHEDULER_LOG": str(scheduler_log),
             "DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT": "1",
             "DARKEXEC_HARNESS_PROMPT_PATH": str(root / "timer-harness-prompt.txt"),
+            "DARKEXEC_HARNESS_PROJECT_PROMPT_ROOT": str(root / "timer-project-prompts"),
             "DARKEXEC_EFFICIENCY_PROMPT_PATH": str(root / "timer-efficiency-prompt.txt"),
         }
         arm = [
@@ -1782,7 +1783,7 @@ def main() -> None:
         assert detached_closeout.returncode == 0, detached_closeout.stderr or detached_closeout.stdout
         assert detached_closeout_result == {
             "status": "pending", "threadId": detached_closeout_thread,
-            "generation": 1, "requestId": detached_request, "accepted": True,
+            "generation": 1, "requestId": detached_request, "accepted": True, "harnessMode": "standard",
         }, detached_closeout_result
         duplicate_closeout = subprocess.run(
             [
@@ -1821,6 +1822,82 @@ def main() -> None:
         )
         assert wrong_detached_fire.returncode == 0
         assert json.loads(wrong_detached_fire.stdout)["status"] == "stale"
+        # Explicit standard selection must survive legacy mode, paused state, duplicate
+        # clicks, and a timer/manual race. Automatic callers retain the drill.
+        for index, (paused, explicit_standard) in enumerate(((False, True), (True, True), (False, False)), start=40):
+            selection_thread = f"00000000-0000-4000-8000-0000000000{index}"
+            selection_turn = f"selection-product-{index}"
+            selection_path = Path(timer_env["DARKEXEC_SESSION_ROOT"]) / f"{hashlib.sha256(selection_thread.encode()).hexdigest()}.json"
+            selection_arm = subprocess.run([
+                str(ROOT / "bin/darkexec"), "debounce", "--target", str(target),
+                "--thread", selection_thread, "--turn", selection_turn,
+                "--seconds", "1800", "--harness-mode", "read-only", "--json",
+            ], capture_output=True, text=True, env=timer_env)
+            assert selection_arm.returncode == 0, selection_arm.stderr
+            if paused:
+                pause_selection = subprocess.run([
+                    str(ROOT / "bin/darkexec"), "debounce-pause", "--thread", selection_thread, "--json",
+                ], capture_output=True, text=True, env=timer_env)
+                assert pause_selection.returncode == 0, pause_selection.stderr
+            selection_request = f"selection-request-{index}"
+            selection_command = [
+                str(ROOT / "bin/darkexec"), "debounce-now", "--thread", selection_thread,
+                "--detach", "--request-id", selection_request, "--json",
+            ] + (["--harness-standard"] if explicit_standard else [])
+            for _ in range(2):
+                accepted = subprocess.run(selection_command, capture_output=True, text=True, env=timer_env)
+                assert accepted.returncode == 0, accepted.stderr or accepted.stdout
+                acceptance = json.loads(accepted.stdout)
+                assert acceptance["accepted"] is True, acceptance
+                assert acceptance["harnessMode"] == ("standard" if explicit_standard else "read-only"), acceptance
+            if not explicit_standard:
+                before_conflict = selection_path.read_bytes()
+                conflict = subprocess.run(selection_command + ["--harness-standard"], capture_output=True, text=True, env=timer_env)
+                assert conflict.returncode == 1, conflict.stdout
+                assert json.loads(conflict.stdout)["status"] == "rejected", conflict.stdout
+                assert selection_path.read_bytes() == before_conflict
+            selection_schedules = [line for line in scheduler_log.read_text().splitlines()
+                                   if f"--thread {selection_thread}" in line and "-manual" in line]
+            assert len(selection_schedules) == 1, selection_schedules
+            # Prompt settings are resolved when execution starts, not when queued.
+            project_setting = Path(timer_env["DARKEXEC_HARNESS_PROJECT_PROMPT_ROOT"]) / f"{hashlib.sha256(str(target).encode()).hexdigest()}.txt"
+            project_setting.parent.mkdir(parents=True, exist_ok=True)
+            expected_prompt = "CURRENT PROJECT HARNESS PROMPT"
+            project_setting.write_text(expected_prompt)
+            selection_inputs = []
+            selection_socket, selection_ready = root / f"selection-{index}.sock", threading.Event()
+            selection_server = threading.Thread(target=fake_app_server, args=(
+                selection_socket, selection_ready, True, None, {
+                    selection_thread: {"cwd": str(target), "turns": [{
+                        "id": selection_turn, "status": "completed", "items": [{
+                            "id": "selection-user", "type": "userMessage",
+                            "content": [{"type": "text", "text": "Completed product work"}],
+                        }],
+                    }]},
+                }, selection_inputs,
+            ), daemon=True)
+            selection_server.start(); assert selection_ready.wait(timeout=2)
+            fire_command = [str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread", selection_thread, "--generation", "1"]
+            fire_env = {**timer_env, "DARKEXEC_APP_SERVER_SOCKET": str(selection_socket)}
+            # Both paths race for the existing lock; precisely one may dispatch.
+            racers = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fire_env)
+                      for command in (fire_command, fire_command + ["--request-id", selection_request])]
+            race_results = []
+            for racer in racers:
+                stdout, stderr = racer.communicate(timeout=10)
+                assert racer.returncode == 0, stderr or stdout
+                race_results.append(json.loads(stdout)["status"])
+            assert sorted(race_results) == ["completed", "stale"], race_results
+            selection_server.join(timeout=2)
+            assert not selection_server.is_alive()
+            assert len(selection_inputs) == 1, selection_inputs
+            assert selection_inputs[0] == [{"type": "text", "text": expected_prompt if explicit_standard else runtime["READ_ONLY_HARNESS_PROMPT"]}], selection_inputs
+            selection_state = json.loads(selection_path.read_text())
+            assert selection_state["harnessThreadId"] == selection_thread, selection_state
+            if not explicit_standard:
+                conflict = subprocess.run(selection_command + ["--harness-standard"], capture_output=True, text=True, env=timer_env)
+                assert conflict.returncode == 1 and json.loads(conflict.stdout)["status"] == "rejected", conflict.stdout
+            project_setting.unlink()
         stale = subprocess.run(
             [str(ROOT / "bin/darkexec"), "_debounce-fire", "--thread", timer_thread, "--generation", "1"],
             capture_output=True, text=True, env=timer_env, check=False,
