@@ -178,8 +178,10 @@ darkexec debounce-status --thread TARGET_TASK_ID --json
 darkexec debounce-pause --thread TARGET_TASK_ID --json
 darkexec debounce-resume --thread TARGET_TASK_ID --json
 darkexec debounce-cancel --thread TARGET_TASK_ID --json
-printf '%s' 'Optional context for this pass' | darkexec debounce-now --thread TARGET_TASK_ID --note-stdin --json
+printf '%s' 'Optional context for this pass' | darkexec debounce-now --thread TARGET_TASK_ID --harness-standard --note-stdin --json
 ```
+
+`debounce-now --harness-standard` explicitly selects the current configured standard Harness prompt under the closeout lock, even when the waiting closeout was a fire drill. Its acceptance and status receipts include `harnessMode`. An already-accepted different mode is rejected rather than reported as a standard pass. Without the flag, automatic callers retain the scheduled mode. The closeout selection does not restrict product execution authority.
 
 Pause stops the timer and survives later follow-ups; each follow-up refreshes its paused remaining window. Resume continues the saved window. Cancel removes the current closeout but deliberately does not disable future closeout, so the next completed follow-up arms a new timer. Closeout-now stops the timer and runs that generation's exact harness pass immediately. The pass first checks the managed Harness Ops distribution for a validated fast-forward and atomically activates its immutable revision, then resolves the current project prompt when execution starts, including when the closeout was armed before a prompt setting changed. The refresh receipt is journaled and never added to the prompt. Optional bounded text supplied with `--note-stdin` is prepended to that current prompt for this pass only.
 

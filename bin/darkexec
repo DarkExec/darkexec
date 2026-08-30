@@ -2578,6 +2578,7 @@ def fire_debounce(
             return {
                 "status": state["status"], "threadId": thread_id,
                 "harnessThreadId": state.get("harnessThreadId"),
+                "harnessMode": state["harnessMode"],
                 "harnessTurnId": state.get("harnessTurnId"),
                 "harnessResult": state.get("harnessResult"),
                 "error": state.get("error"),
@@ -2828,10 +2829,18 @@ def closeout_now(args) -> int:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = load_receipt(path)
         if args.detach and state.get("closeoutRequestId"):
+            if args.harness_standard and state.get("harnessMode") != "standard":
+                result = {
+                    "status": "rejected", "threadId": args.thread,
+                    "error": "A different closeout is already accepted; wait for it to finish before requesting a standard Harness pass.",
+                }
+                print(json.dumps(result) if args.json else result["error"])
+                return 1
             result = {
                 "status": state.get("status"), "threadId": args.thread,
                 "generation": state.get("generation"),
                 "requestId": state["closeoutRequestId"], "accepted": True,
+                "harnessMode": state.get("harnessMode"),
             }
             print(json.dumps(result) if args.json else f"{args.thread}: accepted")
             return 0
@@ -2856,6 +2865,10 @@ def closeout_now(args) -> int:
                 result = {"status": "rejected", "threadId": args.thread, "error": str(exc)}
                 print(json.dumps(result) if args.json else f"{args.thread}: rejected ({exc})")
                 return 1
+        if args.harness_standard:
+            # Select the requested pass under the same lock used by timer execution.
+            # Unflagged automatic callers retain the scheduled mode.
+            state["harnessMode"] = "standard"
         prior_timer = state.get("timerUnit")
         generation = int(state.get("generation") or 0)
         if args.detach:
@@ -2879,7 +2892,7 @@ def closeout_now(args) -> int:
             result = {
                 "status": "pending", "threadId": args.thread,
                 "generation": generation, "requestId": args.request_id,
-                "accepted": True,
+                "accepted": True, "harnessMode": state["harnessMode"],
             }
             print(json.dumps(result) if args.json else f"{args.thread}: accepted")
             return 0
@@ -2933,7 +2946,7 @@ def debounce_status(args) -> int:
             key: state.get(key) for key in (
                 "schemaVersion", "threadId", "targetPath", "productTurnId", "generation",
                 "status", "dueAt", "timerUnit", "harnessTurnId", "harnessResult",
-                "error", "updatedAt",
+                "error", "updatedAt", "harnessMode",
             )
         }
         result["remainingSeconds"] = pending_seconds(state)
@@ -3489,6 +3502,8 @@ def main() -> int:
     cancel.add_argument("--json", action="store_true")
     close_now = sub.add_parser("debounce-now")
     close_now.add_argument("--thread", required=True)
+    close_now.add_argument("--harness-standard", action="store_true",
+                           help="Explicitly run the current configured standard Harness pass instead of the scheduled mode")
     close_now.add_argument("--note-stdin", action="store_true")
     close_now.add_argument("--detach", action="store_true")
     close_now.add_argument("--request-id")
