@@ -939,13 +939,23 @@ class AppServer:
         on_started=None,
         input_items: list[dict] | None = None,
         steer_key: str | None = None,
+        execution_options: dict | None = None,
     ) -> dict:
         turn_input = input_items if input_items is not None else [{"type": "text", "text": prompt}]
+        options_path = turn_options_path(thread_id)
+        saved_options = {}
+        if options_path.exists():
+            record = load_receipt(options_path)
+            if record.get("threadId") != thread_id:
+                raise RuntimeError("execution options do not match target task")
+            saved_options = record["options"]
+        # A saved session choice wins over a worker's older assignment snapshot.
+        turn_options = {**(execution_options or {}), **saved_options}
         self.request_id += 1
         request_id = self.request_id
         self._send({
             "jsonrpc": "2.0", "id": request_id, "method": "turn/start",
-            "params": {"threadId": thread_id, "input": turn_input},
+            "params": {"threadId": thread_id, "input": turn_input, **turn_options},
         })
         deadline = time.monotonic() + TURN_TIMEOUT if TURN_TIMEOUT > 0 else None
         turn_id = None
@@ -1355,6 +1365,36 @@ def resolve_global(args) -> int:
     return 0 if receipt.get("status") == "completed" else 1
 
 
+def turn_options_path(thread_id: str) -> Path:
+    return SESSION_ROOT / "execution-options" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
+
+
+def set_execution_options(args) -> int:
+    target = Path(args.target).resolve()
+    if not saved_project(target):
+        raise SystemExit("target is not an exact saved Codex project")
+    # Listing verifies identity without resuming or changing an in-flight turn.
+    with AppServer() as app:
+        app.require_listed_thread(args.thread, target)
+    options = execution_options(args)
+    record = {"threadId": args.thread, "targetPath": str(target), "options": options}
+    atomic_write(turn_options_path(args.thread), record)
+    print(json.dumps({"status": "saved", **record}))
+    return 0
+
+
+def execution_options(args) -> dict:
+    """Omitted flags preserve native defaults; standard explicitly clears Fast mode."""
+    options = {}
+    effort = getattr(args, "thinking_level", None)
+    speed = getattr(args, "speed", None)
+    if effort is not None:
+        options["effort"] = effort
+    if speed is not None:
+        options["serviceTier"] = "fast" if speed == "fast" else None
+    return options
+
+
 def dispatch(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir():
@@ -1378,6 +1418,9 @@ def dispatch(args) -> int:
         ).encode()
     if args.resolve_target:
         request_material += b"\0resolve-target"
+    options = execution_options(args)
+    if options:
+        request_material += b"\0" + json.dumps(options, sort_keys=True).encode()
     request_sha = hashlib.sha256(request_material).hexdigest()
     harness_mode = "read-only" if args.read_only_harness else "standard"
     initial_harness_mode = "debounce" if args.defer_initial_harness else "immediate"
@@ -1415,6 +1458,7 @@ def dispatch(args) -> int:
         "targetResolution": "executive" if args.resolve_target else "exact",
         "transport": "codex-app-server-control-socket",
         "harnessMode": harness_mode, "initialHarnessMode": initial_harness_mode,
+        "executionOptions": options,
         "createdAt": now(), "executive": {}, "target": {},
     }
     save(path, receipt, "registering")
@@ -1495,6 +1539,7 @@ def dispatch(args) -> int:
                 target_thread["id"], prompt, on_started=target_started,
                 input_items=direct_input,
                 steer_key=executive_thread["id"],
+                execution_options=options,
             )
             listed_target = app.require_listed_thread(target_thread["id"], target)
             receipt["target"].update({
@@ -1718,6 +1763,7 @@ def run_target(args) -> int:
             target_result = app.run_turn(
                 thread["id"], prompt, on_started=target_started, input_items=source_input,
                 steer_key=executive_thread_id,
+                execution_options=execution_options(args),
             )
             listed_thread = app.require_listed_thread(thread["id"], target)
             result["target"].update({
@@ -1875,6 +1921,7 @@ def continue_target(args) -> int:
             turn = app.run_turn(
                 args.thread, prompt, on_started=turn_started, input_items=source_input,
                 steer_key=executive_thread_id,
+                execution_options=execution_options(args),
             )
             result["target"].update({
                 "source": thread.get("source"), "appVisible": True,
@@ -3392,6 +3439,14 @@ def main() -> int:
     continuation_harness.add_argument("--harness-standard", action="store_true")
     continuation.add_argument("--prompt-stdin", action="store_true", required=True)
     continuation.add_argument("--json", action="store_true")
+    configure_execution = sub.add_parser("set-execution-options")
+    configure_execution.add_argument("--target", required=True)
+    configure_execution.add_argument("--thread", required=True)
+    configure_execution.add_argument("--json", action="store_true")
+    configure_execution.add_argument("--request-id")
+    for command_parser in (launch, run, continuation, configure_execution):
+        command_parser.add_argument("--thinking-level", choices=("low", "medium", "high", "xhigh", "max", "ultra"))
+        command_parser.add_argument("--speed", choices=("standard", "fast"))
     stop = sub.add_parser("stop")
     stop.add_argument("--executive-thread")
     stop.add_argument("--hard", action="store_true")
@@ -3514,6 +3569,8 @@ def main() -> int:
         )
         print(json.dumps(result))
         return 0 if result.get("status") in {"completed", "manual_harness_seen", "superseded", "stale", "pending"} else 1
+    if args.command == "set-execution-options":
+        return set_execution_options(args)
     if args.command == "projects":
         paths = saved_projects()
         print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))

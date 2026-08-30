@@ -51,6 +51,7 @@ def fake_app_server(
     fail_harness: bool = False,
     route_unresolved: bool = False,
     remove_routed_target: bool = False,
+    observed_options: list[dict] | None = None,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -157,6 +158,8 @@ def fake_app_server(
             turns += 1
             thread = message["params"]["threadId"]
             turn_input = message["params"]["input"]
+            if observed_options is not None:
+                observed_options.append({key: message["params"][key] for key in ("effort", "serviceTier") if key in message["params"]})
             if observed_inputs is not None:
                 observed_inputs.append(turn_input)
             prompt = next(
@@ -573,7 +576,8 @@ def main() -> None:
 
         socket_path = root / "app.sock"
         ready = threading.Event()
-        server = threading.Thread(target=fake_app_server, args=(socket_path, ready), daemon=True)
+        observed_options = []
+        server = threading.Thread(target=fake_app_server, args=(socket_path, ready), kwargs={"observed_options": observed_options}, daemon=True)
         server.start()
         assert ready.wait(timeout=2)
         env = {
@@ -597,10 +601,15 @@ def main() -> None:
         command = [
             str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
             "--job-id", "incident-1", "--prompt-stdin", "--read-only-harness", "--json",
+            "--thinking-level", "max", "--speed", "fast",
         ]
         first = subprocess.run(command, input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert first.returncode == 0, first.stderr or first.stdout
         result = json.loads(first.stdout)
+        assert observed_options[0] == {}, observed_options
+        assert observed_options[1] == {"effort": "max", "serviceTier": "fast"}, observed_options
+        conflict_options = subprocess.run([*command[:-1], "standard"], input="Natural request.", capture_output=True, text=True, env=env, check=False)
+        assert conflict_options.returncode != 0 and "different request" in conflict_options.stderr
         assert result["status"] == "completed", result
         assert result["transport"] == "codex-app-server-control-socket", result
         assert result["executive"]["threadId"].endswith("1"), result
@@ -1271,6 +1280,7 @@ def main() -> None:
             {"type": "localImage", "path": "/tmp/follow-up.png"},
         ]
         continue_inputs = []
+        continue_options = []
         continue_server = threading.Thread(
             target=fake_app_server,
             args=(continue_socket, continue_ready, True, None, {
@@ -1283,6 +1293,7 @@ def main() -> None:
                 }]},
                 interactive_state["target"]["threadId"]: {"cwd": str(target), "turns": []},
             }, continue_inputs),
+            kwargs={"observed_options": continue_options},
             daemon=True,
         )
         continue_server.start(); assert continue_ready.wait(timeout=2)
@@ -1290,17 +1301,50 @@ def main() -> None:
             [
                 str(ROOT / "bin/darkexec"), "continue", "--target", str(target),
                 "--thread", interactive_state["target"]["threadId"], "--prompt-stdin",
-                "--source-executive-turn", "--json",
+                "--source-executive-turn", "--thinking-level", "low", "--speed", "standard", "--json",
             ],
             input="Dependent follow-up.", capture_output=True, text=True,
             env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(continue_socket)}, check=False,
         )
         continued_result = json.loads(continued.stdout)
+        assert continue_options == [{"effort": "low", "serviceTier": None}], continue_options
         assert continued.returncode == 0 and continued_result["status"] == "completed", continued_result
         assert continued_result["target"]["resultText"] == "TARGET_OK:Dependent follow-up.", continued_result
         assert continue_inputs[0] == follow_up_input, continue_inputs[0]
         continue_server.join(timeout=2)
         assert not continue_server.is_alive()
+        # Persist choices without starting a turn, then use them from a caller
+        # that predates execution flags (including a pinned App worker).
+        saved_thread = interactive_state["target"]["threadId"]
+        options_socket, options_ready = root / "options.sock", threading.Event()
+        options_turns = []
+        options_server = threading.Thread(target=fake_app_server,
+            args=(options_socket, options_ready),
+            kwargs={"seeded_threads": {saved_thread: {"cwd": str(target), "turns": []}}, "observed_options": options_turns}, daemon=True)
+        options_server.start(); assert options_ready.wait(timeout=2)
+        saved = subprocess.run([str(ROOT / "bin/darkexec"), "set-execution-options",
+            "--target", str(target), "--thread", saved_thread,
+            "--thinking-level", "high", "--speed", "fast", "--json"],
+            capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(options_socket)}, check=False)
+        assert saved.returncode == 0, saved.stderr or saved.stdout
+        assert json.loads(saved.stdout)["status"] == "saved"
+        assert options_turns == []
+        options_server.join(timeout=2)
+        inherited_socket, inherited_ready = root / "inherited.sock", threading.Event()
+        inherited_options = []
+        inherited_server = threading.Thread(target=fake_app_server,
+            args=(inherited_socket, inherited_ready),
+            kwargs={"seeded_threads": {saved_thread: {"cwd": str(target), "turns": []}}, "observed_options": inherited_options}, daemon=True)
+        inherited_server.start(); assert inherited_ready.wait(timeout=2)
+        inherited = subprocess.run([str(ROOT / "bin/darkexec"), "continue",
+            "--target", str(target), "--thread", saved_thread,
+            "--product", "--prompt-stdin", "--json"], input="Use saved options.",
+            capture_output=True, text=True,
+            env={**run_env, "DARKEXEC_APP_SERVER_SOCKET": str(inherited_socket)}, check=False)
+        assert inherited.returncode == 0, inherited.stderr or inherited.stdout
+        assert inherited_options == [{"effort": "high", "serviceTier": "fast"}], inherited_options
+        inherited_server.join(timeout=2)
         product_socket, product_ready, product_inputs = (
             root / "product.sock", threading.Event(), []
         )
