@@ -329,6 +329,21 @@ def main() -> None:
             "revision": "1" * 40,
             "harnessOpsSha256": "2" * 64,
         }, managed_refresh
+        refresh_fixture.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' '{\"status\":\"cached\","
+            "\"revision\":\"1111111111111111111111111111111111111111\","
+            "\"harnessOpsSha256\":\"2222222222222222222222222222222222222222222222222222222222222222\","
+            "\"passBundleSha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"}'\n"
+        )
+        refresh_fixture.chmod(0o700)
+        cached_refresh = refresh_doctrine()
+        assert cached_refresh == {
+            "status": "cached",
+            "revision": "1" * 40,
+            "harnessOpsSha256": "2" * 64,
+            "passBundleSha256": "3" * 64,
+        }, cached_refresh
         refresh_fixture.write_text("#!/usr/bin/env bash\nprintf '%s\\n' '{}'")
         refresh_fixture.chmod(0o700)
         try:
