@@ -73,6 +73,41 @@ def current_receipt(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def verified_cached_receipt(root: Path) -> dict | None:
+    """Return the active immutable release only when its receipt still proves it."""
+    receipt = current_receipt(root / "current.json")
+    revision = receipt.get("revision")
+    doctrine_checksum = receipt.get("harnessOpsSha256")
+    bundle_checksum = receipt.get("passBundleSha256")
+    if (
+        receipt.get("schemaVersion") != 1
+        or not isinstance(revision, str) or not REVISION.fullmatch(revision)
+        or not isinstance(doctrine_checksum, str) or len(doctrine_checksum) != 64
+        or not isinstance(bundle_checksum, str) or len(bundle_checksum) != 64
+    ):
+        return None
+    release = root / "releases" / revision
+    current = root / "current"
+    try:
+        if current.resolve(strict=True) != release.resolve(strict=True):
+            return None
+        if sha256(release / "harness-ops.md") != doctrine_checksum:
+            return None
+        if pass_bundle_sha256(release) != bundle_checksum:
+            return None
+    except OSError:
+        return None
+    return {
+        "schemaVersion": 1,
+        "status": "cached",
+        "revision": revision,
+        "harnessOpsSha256": doctrine_checksum,
+        "passBundleSha256": bundle_checksum,
+        "activatedAt": receipt.get("activatedAt"),
+        "history": receipt.get("history", []),
+    }
+
+
 def refresh(root: Path, remote: str) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     os.chmod(root, 0o755)
@@ -82,16 +117,22 @@ def refresh(root: Path, remote: str) -> dict:
     with lock_path.open("a+") as lock:
         os.chmod(lock_path, 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
+        cached = verified_cached_receipt(root)
         repository = root / "repository.git"
         if not repository.exists():
             run(["git", "clone", "--quiet", "--mirror", remote, str(repository)])
         configured_remote = run(["git", f"--git-dir={repository}", "remote", "get-url", "origin"])
         if configured_remote != remote:
             raise RuntimeError("managed Harness Ops remote does not match the root-owned configuration")
-        run([
-            "git", f"--git-dir={repository}", "fetch", "--quiet", "--prune", "origin",
-            "+refs/heads/main:refs/darkexec/candidate",
-        ])
+        try:
+            run([
+                "git", f"--git-dir={repository}", "fetch", "--quiet", "--prune", "origin",
+                "+refs/heads/main:refs/darkexec/candidate",
+            ])
+        except RuntimeError:
+            if cached:
+                return cached
+            raise
         revision = run([
             "git", f"--git-dir={repository}", "rev-parse", "refs/darkexec/candidate",
         ])

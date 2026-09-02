@@ -51,6 +51,13 @@ def refresh(cache: Path, source: Path) -> subprocess.CompletedProcess:
     )
 
 
+def make_tree_writable(path: Path) -> None:
+    for child in sorted(path.rglob("*"), reverse=True):
+        if not child.is_symlink():
+            child.chmod(0o755 if child.is_dir() else 0o644)
+    path.chmod(0o755)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -67,6 +74,32 @@ def main() -> None:
         assert (cache / "releases" / first).stat().st_mode & 0o222 == 0
         current = json.loads(refresh(cache, source).stdout)
         assert current["status"] == "current" and current["revision"] == first, current
+        source.rename(root / "source-unavailable")
+        cached = refresh(cache, source)
+        cached_receipt = json.loads(cached.stdout)
+        assert cached.returncode == 0 and cached_receipt["status"] == "cached", cached_receipt
+        assert cached_receipt["revision"] == first, cached_receipt
+        (root / "source-unavailable").rename(source)
+        doctrine = cache / "releases" / first / "harness-ops.md"
+        make_tree_writable(cache / "releases" / first)
+        doctrine.write_text("# Tampered doctrine\n")
+        source.rename(root / "source-unavailable")
+        rejected_cache = refresh(cache, source)
+        assert rejected_cache.returncode != 0, rejected_cache.stdout
+        (root / "source-unavailable").rename(source)
+        doctrine.write_text("# Doctrine one\n")
+        bundle = cache / "releases" / first / "passes" / "harness" / "AGENTS.md"
+        bundle.write_text("# Tampered Harness\n")
+        source.rename(root / "source-unavailable")
+        rejected_bundle = refresh(cache, source)
+        assert rejected_bundle.returncode != 0, rejected_bundle.stdout
+        (root / "source-unavailable").rename(source)
+        bundle.write_text("# Harness\n")
+        repository = cache / "repository.git"
+        run(["git", f"--git-dir={repository}", "remote", "set-url", "origin", str(root / "wrong")], root)
+        mismatched_remote = refresh(cache, source)
+        assert mismatched_remote.returncode != 0 and "remote does not match" in mismatched_remote.stdout
+        run(["git", f"--git-dir={repository}", "remote", "set-url", "origin", str(source)], root)
         (source / "harness-ops.md").write_text("# Doctrine two\n")
         second = commit(source, "second")
         advanced = json.loads(refresh(cache, source).stdout)

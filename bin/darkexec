@@ -300,7 +300,7 @@ def refresh_harness_doctrine() -> dict:
     checksum = receipt.get("harnessOpsSha256")
     pass_checksum = receipt.get("passBundleSha256")
     if (
-        receipt.get("status") not in {"current", "updated"}
+        receipt.get("status") not in {"cached", "current", "updated"}
         or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)
         or not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum)
     ):
