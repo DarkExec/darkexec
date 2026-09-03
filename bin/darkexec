@@ -59,6 +59,16 @@ UPDATE_REF = os.environ.get("DARKEXEC_UPDATE_REF", "main")
 REMOTE_PROTOCOL_VERSION = 1
 APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
                                         "/root/.codex/app-server-control/app-server-control.sock"))
+ANTIGRAVITY = os.environ.get("DARKEXEC_ANTIGRAVITY", "/root/.local/bin/agy")
+MODEL_CATALOG = {
+    "codex/gpt-5.6-sol": {"provider": "codex", "native": "gpt-5.6-sol"},
+    "codex/gpt-5.6-terra": {"provider": "codex", "native": "gpt-5.6-terra"},
+    "codex/gpt-5.6-luna": {"provider": "codex", "native": "gpt-5.6-luna"},
+    "codex/gpt-5.5": {"provider": "codex", "native": "gpt-5.5"},
+    "codex/gpt-5.4": {"provider": "codex", "native": "gpt-5.4"},
+    "codex/gpt-5.3-codex": {"provider": "codex", "native": "gpt-5.3-codex"},
+    "antigravity/gemini-3.8-flash": {"provider": "antigravity", "native": "gemini-3.8-flash"},
+}
 DEFAULT_HARNESS_PROMPT = (
     "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
     f"reliable, and durable execution. Make sure we are following {DOCTRINE} doctrine. After reading "
@@ -1369,13 +1379,111 @@ def turn_options_path(thread_id: str) -> Path:
     return SESSION_ROOT / "execution-options" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
 
 
+def provider_session_path(thread_id: str) -> Path:
+    return SESSION_ROOT / "providers" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
+
+
+def selected_model(args) -> tuple[str, dict]:
+    model = getattr(args, "model", None) or "codex/gpt-5.6-sol"
+    if model not in MODEL_CATALOG:
+        raise SystemExit(f"unknown model: {model}")
+    return model, MODEL_CATALOG[model]
+
+
+def antigravity_turn(
+    target: Path, prompt: str, model: str, effort: str | None,
+    conversation_id: str | None = None,
+) -> dict:
+    effort = effort or "medium"
+    if effort not in {"low", "medium", "high"}:
+        raise RuntimeError(f"Gemini 3.8 Flash does not support {effort} thinking")
+    native_model = f"{MODEL_CATALOG[model]['native']}-{effort}"
+    command = [
+        ANTIGRAVITY, "--print", prompt, "--output-format", "json",
+        "--print-timeout", "24h", "--model", native_model, "--effort", effort,
+        "--mode", "accept-edits", "--dangerously-skip-permissions",
+    ]
+    if conversation_id:
+        command.extend(["--conversation", conversation_id])
+    process = subprocess.Popen(
+        command, cwd=target, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    previous_handlers = {}
+    def forward_signal(signum, _frame) -> None:
+        acknowledged = False
+        try:
+            os.killpg(process.pid, signum)
+            process.wait(timeout=5)
+            acknowledged = True
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+                acknowledged = True
+        raise DispatchInterrupted(signum, acknowledged)
+    try:
+        previous_handlers = {
+            signum: signal.signal(signum, forward_signal)
+            for signum in (signal.SIGTERM, signal.SIGINT)
+        }
+        stdout, stderr = process.communicate()
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(stderr.strip() or "Antigravity returned no valid JSON") from exc
+    ok = process.returncode == 0 and payload.get("status") == "SUCCESS"
+    native_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    return {
+        "ok": ok,
+        "threadId": payload.get("conversation_id") or conversation_id,
+        "turnId": f"agy-{payload.get('num_turns', 0)}",
+        "resultText": str(payload.get("response") or "")[:12000],
+        "usage": {
+            "input": int(native_usage.get("input_tokens") or 0),
+            "cacheRead": int(native_usage.get("cache_read_tokens") or 0),
+            "output": int(native_usage.get("output_tokens") or 0),
+            "reasoningOutput": int(native_usage.get("thinking_tokens") or 0),
+            "total": int(native_usage.get("total_tokens") or 0),
+        },
+        "modelCallCount": 1,
+        "error": "" if ok else str(payload.get("response") or stderr or "Antigravity task failed"),
+        "model": model,
+        "nativeModel": native_model,
+    }
+
+
+def save_provider_session(
+    thread_id: str, target: Path, model: str, effort: str, cumulative_usage: dict | None = None,
+) -> None:
+    atomic_write(provider_session_path(thread_id), {
+        "threadId": thread_id, "targetPath": str(target), "provider": "antigravity",
+        "model": model, "effort": effort, "cumulativeUsage": cumulative_usage or {},
+        "updatedAt": now(),
+    })
+
+
+def read_provider_session(thread_id: str) -> dict | None:
+    path = provider_session_path(thread_id)
+    return load_receipt(path) if path.exists() else None
+
+
 def set_execution_options(args) -> int:
     target = Path(args.target).resolve()
     if not saved_project(target):
         raise SystemExit("target is not an exact saved Codex project")
-    # Listing verifies identity without resuming or changing an in-flight turn.
-    with AppServer() as app:
-        app.require_listed_thread(args.thread, target)
+    _, capability = selected_model(args)
+    provider_session = read_provider_session(args.thread)
+    if capability["provider"] == "antigravity":
+        if not provider_session or provider_session.get("targetPath") != str(target):
+            raise SystemExit("target is not a matching Antigravity session")
+    else:
+        # Listing verifies identity without resuming or changing an in-flight turn.
+        with AppServer() as app:
+            app.require_listed_thread(args.thread, target)
     options = execution_options(args)
     record = {"threadId": args.thread, "targetPath": str(target), "options": options}
     atomic_write(turn_options_path(args.thread), record)
@@ -1388,6 +1496,9 @@ def execution_options(args) -> dict:
     options = {}
     effort = getattr(args, "thinking_level", None)
     speed = getattr(args, "speed", None)
+    model, capability = selected_model(args)
+    if capability["provider"] == "codex" and getattr(args, "model", None):
+        options["model"] = capability["native"]
     if effort is not None:
         options["effort"] = effort
     if speed is not None:
@@ -1418,6 +1529,7 @@ def dispatch(args) -> int:
         ).encode()
     if args.resolve_target:
         request_material += b"\0resolve-target"
+    model, model_capability = selected_model(args)
     options = execution_options(args)
     if options:
         request_material += b"\0" + json.dumps(options, sort_keys=True).encode()
@@ -1456,7 +1568,11 @@ def dispatch(args) -> int:
         "schemaVersion": 1, "jobId": args.job_id, "requestSha256": request_sha,
         "requestedTargetPath": str(target), "targetPath": str(target),
         "targetResolution": "executive" if args.resolve_target else "exact",
-        "transport": "codex-app-server-control-socket",
+        "transport": (
+            "antigravity-cli-subscription" if model_capability["provider"] == "antigravity"
+            else "codex-app-server-control-socket"
+        ),
+        "model": model,
         "harnessMode": harness_mode, "initialHarnessMode": initial_harness_mode,
         "executionOptions": options,
         "createdAt": now(), "executive": {}, "target": {},
@@ -1525,64 +1641,126 @@ def dispatch(args) -> int:
                 print(json.dumps(receipt) if args.json else render_status(receipt))
                 return 1
 
-            target_thread = app.start_thread(target)
-            receipt["target"] = {
-                "threadId": target_thread["id"], "source": target_thread.get("source"),
-                "appVisible": False, "listedCwd": None,
-                "harness": {"status": "not_started"},
-            }
-            save(path, receipt, "target_running")
-            def target_started(_thread_id: str, turn_id: str) -> None:
-                receipt["target"]["turnId"] = turn_id
+            if model_capability["provider"] == "antigravity":
                 save(path, receipt, "target_running")
-            target_result = app.run_turn(
-                target_thread["id"], prompt, on_started=target_started,
-                input_items=direct_input,
-                steer_key=executive_thread["id"],
-                execution_options=options,
-            )
-            listed_target = app.require_listed_thread(target_thread["id"], target)
-            receipt["target"].update({
-                "source": listed_target.get("source"), "appVisible": True,
-                "listedCwd": listed_target.get("cwd"),
-                "initialUsage": target_result.get("usage"),
-                "modelCallCount": target_result.get("modelCallCount"),
-                "resultText": target_result.get("resultText"),
-            })
-            if not target_result.get("ok"):
-                receipt["error"] = target_result.get("error") or "Target task failed before a durable result."
-                save(path, receipt, "failed")
-                closeout_executive(receipt, path, app)
-                print(json.dumps(receipt) if args.json else render_status(receipt))
-                return 1
-
-            if args.defer_initial_harness:
-                receipt["target"]["harness"] = {"status": "deferred"}
-                save(path, receipt, "completed")
-            else:
-                doctrine_refresh = (
-                    None if args.read_only_harness else refresh_harness_doctrine()
+                provider_prompt = next(
+                    (item["text"] for item in (direct_input or []) if item.get("type") == "text"),
+                    prompt,
                 )
-                receipt["target"]["harness"]["doctrineRefresh"] = doctrine_refresh
-                save(path, receipt, "harness_running")
-                harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt(target)
-                def harness_started(_thread_id: str, turn_id: str) -> None:
-                    receipt["target"]["harness"]["turnId"] = turn_id
-                    save(path, receipt, "harness_running")
-                harness = app.run_turn(target_thread["id"], harness_prompt, on_started=harness_started)
-                receipt["target"]["harness"] = {
-                    "status": "completed" if harness.get("ok") else "failed",
-                    "turnId": harness.get("turnId"),
-                    "usage": harness.get("usage"), "modelCallCount": harness.get("modelCallCount"),
-                    "resultText": harness.get("resultText"), "error": harness.get("error") or None,
-                    "doctrineRefresh": doctrine_refresh,
+                target_result = antigravity_turn(
+                    target, provider_prompt, model, getattr(args, "thinking_level", None)
+                )
+                if not target_result.get("threadId"):
+                    raise RuntimeError("Antigravity omitted its conversation identity")
+                save_provider_session(
+                    target_result["threadId"], target, model,
+                    getattr(args, "thinking_level", None) or "medium",
+                    target_result["usage"],
+                )
+                receipt["target"] = {
+                    "threadId": target_result["threadId"], "turnId": target_result["turnId"],
+                    "source": "antigravity", "appVisible": False, "listedCwd": str(target),
+                    "initialUsage": target_result["usage"],
+                    "modelCallCount": target_result["modelCallCount"],
+                    "resultText": target_result["resultText"],
+                    "model": model, "nativeModel": target_result["nativeModel"],
+                    "harness": {"status": "deferred" if args.defer_initial_harness else "not_started"},
                 }
-                if not harness.get("ok"):
-                    receipt["error"] = harness.get("error") or "Same-task harness turn failed."
+                if not target_result["ok"]:
+                    receipt["error"] = target_result["error"]
                     save(path, receipt, "failed")
-                else:
+                elif args.defer_initial_harness:
                     save(path, receipt, "completed")
-            closeout_executive(receipt, path, app)
+                else:
+                    doctrine_refresh = None if args.read_only_harness else refresh_harness_doctrine()
+                    harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt(target)
+                    harness = antigravity_turn(
+                        target, harness_prompt, model, getattr(args, "thinking_level", None),
+                        target_result["threadId"],
+                    )
+                    harness["usage"] = usage_delta(harness["usage"], target_result["usage"])
+                    save_provider_session(
+                        target_result["threadId"], target, model,
+                        getattr(args, "thinking_level", None) or "medium",
+                        usage_add(target_result["usage"], harness["usage"]),
+                    )
+                    receipt["target"]["harness"] = {
+                        "status": "completed" if harness["ok"] else "failed",
+                        "turnId": harness["turnId"], "usage": harness["usage"],
+                        "modelCallCount": harness["modelCallCount"],
+                        "resultText": harness["resultText"], "error": harness["error"] or None,
+                        "doctrineRefresh": doctrine_refresh,
+                    }
+                    if harness["ok"]:
+                        save(path, receipt, "completed")
+                    else:
+                        receipt["error"] = harness["error"]
+                        save(path, receipt, "failed")
+                closeout_executive(receipt, path, app)
+                # The provider target is complete; skip the Codex target branch below.
+                target_thread = None
+            else:
+                target_thread = app.start_thread(target)
+            if target_thread is None:
+                pass
+            else:
+                receipt["target"] = {
+                    "threadId": target_thread["id"], "source": target_thread.get("source"),
+                    "appVisible": False, "listedCwd": None,
+                    "harness": {"status": "not_started"},
+                }
+                save(path, receipt, "target_running")
+                def target_started(_thread_id: str, turn_id: str) -> None:
+                    receipt["target"]["turnId"] = turn_id
+                    save(path, receipt, "target_running")
+                target_result = app.run_turn(
+                    target_thread["id"], prompt, on_started=target_started,
+                    input_items=direct_input,
+                    steer_key=executive_thread["id"],
+                    execution_options=options,
+                )
+                listed_target = app.require_listed_thread(target_thread["id"], target)
+                receipt["target"].update({
+                    "source": listed_target.get("source"), "appVisible": True,
+                    "listedCwd": listed_target.get("cwd"),
+                    "initialUsage": target_result.get("usage"),
+                    "modelCallCount": target_result.get("modelCallCount"),
+                    "resultText": target_result.get("resultText"),
+                })
+                if not target_result.get("ok"):
+                    receipt["error"] = target_result.get("error") or "Target task failed before a durable result."
+                    save(path, receipt, "failed")
+                    closeout_executive(receipt, path, app)
+                    print(json.dumps(receipt) if args.json else render_status(receipt))
+                    return 1
+
+                if args.defer_initial_harness:
+                    receipt["target"]["harness"] = {"status": "deferred"}
+                    save(path, receipt, "completed")
+                else:
+                    doctrine_refresh = (
+                        None if args.read_only_harness else refresh_harness_doctrine()
+                    )
+                    receipt["target"]["harness"]["doctrineRefresh"] = doctrine_refresh
+                    save(path, receipt, "harness_running")
+                    harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt(target)
+                    def harness_started(_thread_id: str, turn_id: str) -> None:
+                        receipt["target"]["harness"]["turnId"] = turn_id
+                        save(path, receipt, "harness_running")
+                    harness = app.run_turn(target_thread["id"], harness_prompt, on_started=harness_started)
+                    receipt["target"]["harness"] = {
+                        "status": "completed" if harness.get("ok") else "failed",
+                        "turnId": harness.get("turnId"),
+                        "usage": harness.get("usage"), "modelCallCount": harness.get("modelCallCount"),
+                        "resultText": harness.get("resultText"), "error": harness.get("error") or None,
+                        "doctrineRefresh": doctrine_refresh,
+                    }
+                    if not harness.get("ok"):
+                        receipt["error"] = harness.get("error") or "Same-task harness turn failed."
+                        save(path, receipt, "failed")
+                    else:
+                        save(path, receipt, "completed")
+                closeout_executive(receipt, path, app)
     except DispatchInterrupted as exc:
         receipt["error"] = str(exc)
         receipt["targetInterruptAcknowledged"] = exc.target_interrupt_acknowledged
@@ -1723,6 +1901,9 @@ def run_target(args) -> int:
         raise SystemExit(f"target is not a directory: {target}")
     if not saved_project(target):
         raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    _, capability = selected_model(args)
+    if capability["provider"] != "codex":
+        raise SystemExit("Antigravity targets require a dispatch assignment")
     prompt = sys.stdin.read()
     if not prompt.strip():
         raise SystemExit("run requires a non-empty prompt on stdin")
@@ -1883,6 +2064,48 @@ def continue_target(args) -> int:
         "target": {"threadId": args.thread}, "createdAt": now(),
     }
     interrupted_exit = None
+    provider_session = read_provider_session(args.thread)
+    if provider_session:
+        model, capability = selected_model(args)
+        if capability["provider"] != "antigravity":
+            raise SystemExit("Changing providers requires a new assignment")
+        if provider_session.get("targetPath") != str(target):
+            raise SystemExit("Antigravity session target does not match")
+        result["transport"] = "antigravity-cli-subscription"
+        try:
+            provider_input = manifest_input(getattr(args, "input_json", None), prompt)
+            provider_prompt = next(
+                (item["text"] for item in (provider_input or []) if item.get("type") == "text"),
+                prompt,
+            )
+            if manual_harness_mode in {"standard", "efficiency"}:
+                result["doctrineRefresh"] = refresh_harness_doctrine()
+            turn = antigravity_turn(target, provider_prompt, model, getattr(args, "thinking_level", None), args.thread)
+            cumulative_usage = turn["usage"]
+            turn["usage"] = usage_delta(cumulative_usage, provider_session.get("cumulativeUsage") or {})
+            result["nativeTurnStarted"] = True
+            result["target"].update({
+                "turnId": turn["turnId"], "source": "antigravity", "appVisible": False,
+                "listedCwd": str(target), "resultText": turn["resultText"],
+                "usage": turn["usage"], "modelCallCount": turn["modelCallCount"],
+                "model": model, "nativeModel": turn["nativeModel"],
+            })
+            result["status"] = "completed" if turn["ok"] else "failed"
+            if not turn["ok"]:
+                result["error"] = turn["error"]
+            save_provider_session(args.thread, target, model, getattr(args, "thinking_level", None) or "medium", cumulative_usage)
+        except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError, DoctrineRefreshError) as exc:
+            result["status"] = "failed"
+            result["error"] = f"Antigravity CLI transport failed: {exc}"
+        update_execution(executive_thread_id, {
+            "status": result["status"], "phase": "idle",
+            "runner": {"pid": None, "startTicks": None},
+            "target": {"threadId": args.thread, "turnId": result["target"].get("turnId")},
+            "error": result.get("error"),
+        })
+        result["updatedAt"] = now()
+        print(json.dumps(result) if args.json else f"{result['status']} target={args.thread} turn={result['target'].get('turnId') or '-'}")
+        return 0 if result["status"] == "completed" else 1
     try:
         with AppServer() as app:
             source_input = requested_input(app, args, executive_thread_id, prompt)
@@ -2466,6 +2689,39 @@ def fire_debounce(
         state["harnessEpisode"] = {"path": episode_path, "error": episode_error}
         atomic_write(path, state)
         return {"status": "failed", "threadId": thread_id, "error": state["error"]}
+    provider_session = read_provider_session(thread_id)
+    if provider_session:
+        try:
+            if state["harnessMode"] in {"standard", "efficiency"}:
+                state["doctrineRefresh"] = refresh_harness_doctrine()
+            options_path = turn_options_path(thread_id)
+            options = load_receipt(options_path).get("options", {}) if options_path.exists() else {}
+            result = antigravity_turn(
+                target, current_closeout_prompt(state, target), provider_session["model"],
+                options.get("effort") or provider_session.get("effort") or "medium", thread_id,
+            )
+            cumulative_usage = result["usage"]
+            result["usage"] = usage_delta(cumulative_usage, provider_session.get("cumulativeUsage") or {})
+            save_provider_session(
+                thread_id, target, provider_session["model"],
+                options.get("effort") or provider_session.get("effort") or "medium",
+                cumulative_usage,
+            )
+            state.update({
+                "status": "completed" if result["ok"] else "failed",
+                "harnessStatus": "completed" if result["ok"] else "failed",
+                "harnessThreadId": thread_id, "harnessTurnId": result["turnId"],
+                "harnessResult": result["resultText"], "harnessUsage": result["usage"],
+                "harnessModelCallCount": result["modelCallCount"],
+                "error": result["error"] or None, "updatedAt": now(), "timerUnit": None,
+            })
+        except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+            state.update({"status": "failed", "harnessStatus": "failed", "error": f"debounced Antigravity closeout failed: {exc}", "updatedAt": now(), "timerUnit": None})
+        atomic_write(path, state)
+        return {key: state.get(key) for key in (
+            "status", "threadId", "harnessThreadId", "harnessMode", "harnessTurnId",
+            "harnessResult", "error",
+        )}
     thread: dict = {"turns": []}
     try:
         with AppServer() as app:
@@ -2617,7 +2873,8 @@ def arm_debounce(args) -> int:
         raise SystemExit(f"target is not an exact saved Codex project: {target}")
     path = session_path(args.thread)
     prior = load_receipt(path) if path.exists() else {}
-    if os.environ.get("DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT") != "1":
+    provider_session = read_provider_session(args.thread)
+    if not provider_session and os.environ.get("DARKEXEC_DEBOUNCE_SKIP_PREFLIGHT") != "1":
         try:
             with AppServer() as app:
                 thread = app.require_resumed_thread(args.thread, target)
@@ -3182,6 +3439,17 @@ def target_status(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir() or not saved_project(target):
         raise SystemExit(f"target is not an exact saved Codex project: {target}")
+    provider_session = read_provider_session(args.thread)
+    if provider_session:
+        if provider_session.get("targetPath") != str(target):
+            raise SystemExit("Antigravity session target does not match")
+        result = {"schemaVersion": 1, "threadId": args.thread, "targetPath": str(target), "baselineTurnId": args.after_turn, "status": "unchanged", "newerTurn": None}
+        if args.include_input or args.include_result:
+            result["newerTurns"] = []
+        if args.include_input:
+            result["steeringMessages"] = []
+        print(json.dumps(result) if args.json else f"{args.thread}: unchanged turn=- turn_status=-")
+        return 0
     closeout_harness_turn_id = None
     closeout_path = session_path(args.thread)
     if closeout_path.exists():
@@ -3458,6 +3726,7 @@ def main() -> int:
     configure_execution.add_argument("--json", action="store_true")
     configure_execution.add_argument("--request-id")
     for command_parser in (launch, run, continuation, configure_execution):
+        command_parser.add_argument("--model", choices=tuple(MODEL_CATALOG))
         command_parser.add_argument("--thinking-level", choices=("low", "medium", "high", "xhigh", "max", "ultra"))
         command_parser.add_argument("--speed", choices=("standard", "fast"))
     stop = sub.add_parser("stop")
@@ -3517,6 +3786,8 @@ def main() -> int:
     fire.add_argument("--request-id")
     projects = sub.add_parser("projects")
     projects.add_argument("--json", action="store_true")
+    models = sub.add_parser("models")
+    models.add_argument("--json", action="store_true")
     harness_prompt_parser = sub.add_parser("harness-prompt")
     prompt_action = harness_prompt_parser.add_mutually_exclusive_group()
     prompt_action.add_argument("--set-stdin", action="store_true")
@@ -3589,6 +3860,19 @@ def main() -> int:
     if args.command == "projects":
         paths = saved_projects()
         print(json.dumps({"schemaVersion": 1, "projects": paths}) if args.json else "\n".join(paths))
+        return 0
+    if args.command == "models":
+        catalog = [
+            {"id": "codex/gpt-5.6-sol", "provider": "codex", "label": "GPT-5.6 Sol", "description": "Reliable agentic workhorse", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "low"},
+            {"id": "codex/gpt-5.6-terra", "provider": "codex", "label": "GPT-5.6 Terra", "description": "Balanced agentic coding model", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.6-luna", "provider": "codex", "label": "GPT-5.6 Luna", "description": "Fast and affordable agentic coding model", "thinkingLevels": ["low", "medium", "high", "xhigh", "max"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.5", "provider": "codex", "label": "GPT-5.5", "description": "Proven general coding model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.4", "provider": "codex", "label": "GPT-5.4", "description": "Strong everyday coding model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.3-codex", "provider": "codex", "label": "GPT-5.3 Codex", "description": "Legacy Codex model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard"], "defaultThinkingLevel": "high"},
+            {"id": "antigravity/gemini-3.8-flash", "provider": "antigravity", "label": "Gemini 3.8 Flash", "description": "Google subscription via Antigravity CLI", "thinkingLevels": ["low", "medium", "high"], "speeds": ["standard"], "defaultThinkingLevel": "high"},
+        ]
+        payload = {"schemaVersion": 1, "defaultModel": "codex/gpt-5.6-sol", "models": catalog}
+        print(json.dumps(payload) if args.json else "\n".join(item["id"] for item in catalog))
         return 0
     if args.command == "harness-prompt":
         return prompt_setting(
