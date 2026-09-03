@@ -450,12 +450,17 @@ def main() -> None:
         assert remote_result["remoteProjectId"] == "fixture-project", remote_result
         start_payload = next(payload for method, payload in observed_remote if method == "StartCascade")
         send_payload = next(payload for method, payload in observed_remote if method == "SendUserCascadeMessage")
+        turbo_payload = next(payload for method, payload in observed_remote if method == "JetboxWriteState")
         assert start_payload["requestedModel"] == "MODEL_FIXTURE_HIGH", start_payload
         run_command = send_payload["cascadeConfig"]["plannerConfig"]["toolConfig"]["runCommand"]
-        permissions = send_payload["cascadeConfig"]["plannerConfig"]["toolConfig"]["permissionConfig"]
+        turbo_settings = turbo_payload["userConfig"]["userSettings"]
         assert run_command["autoCommandConfig"]["autoExecutionPolicy"] == "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER", run_command
         assert run_command["enableTerminalSandbox"] is False, run_command
-        assert permissions["effectivePermissionPreset"] == "AGENT_PERMISSION_PRESET_TURBO", permissions
+        assert turbo_settings == {
+            "enableTerminalSandbox": False,
+            "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+            "nonWorkspaceFileAccessPolicy": "AGENT_SETTING_POLICY_ALLOW",
+        }, turbo_settings
         incident_prompt = (
             "you can go ahead and make all the changes to toolburn you wanted, and also move passes "
             "into DarkExec/harness-ops, then change the harness prompt because efficiency passes can "

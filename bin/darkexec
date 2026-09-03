@@ -1505,6 +1505,16 @@ def antigravity_remote_model(endpoint: dict, native_model: str) -> str:
     raise RuntimeError(f"Antigravity Remote Control does not offer {native_model}")
 
 
+def antigravity_remote_enable_turbo(endpoint: dict) -> None:
+    antigravity_rpc(endpoint, "JetboxWriteState", {
+        "userConfig": {"userSettings": {
+            "enableTerminalSandbox": False,
+            "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+            "nonWorkspaceFileAccessPolicy": "AGENT_SETTING_POLICY_ALLOW",
+        }},
+    })
+
+
 def antigravity_stream(endpoint: dict, conversation_id: str, start_index: int) -> tuple[object, object]:
     payload = {
         "conversationId": conversation_id, "subscriberId": str(uuid.uuid4()),
@@ -1542,6 +1552,9 @@ def antigravity_remote_turn(
     endpoint: dict, target: Path, prompt: str, native_model: str,
     conversation_id: str | None = None,
 ) -> dict:
+    # Remote Control resolves these permissions from daemon preferences rather than CascadeConfig.
+    # Apply the same three settings as its Turbo preset before every DarkExec turn.
+    antigravity_remote_enable_turbo(endpoint)
     project_id = antigravity_remote_project(target)
     model_enum = antigravity_remote_model(endpoint, native_model)
     baseline = 0
@@ -1569,7 +1582,6 @@ def antigravity_remote_turn(
                         "autoCommandConfig": {"autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER"},
                         "enableTerminalSandbox": False,
                     },
-                    "permissionConfig": {"effectivePermissionPreset": "AGENT_PERMISSION_PRESET_TURBO"},
                 },
                 "requestedModel": {"model": model_enum}, "knowledgeConfig": {},
                 "useAiCredits": False, "supportsLatexRendering": True,
