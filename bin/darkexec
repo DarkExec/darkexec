@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import argparse, base64, fcntl, hashlib, json, re
-import os, select, shutil, signal, socket, struct, subprocess, sys
+import argparse, base64, fcntl, hashlib, http.client, json, re
+import os, select, shutil, signal, socket, struct, subprocess, sys, urllib.parse, uuid
 import tempfile, time, tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +60,7 @@ REMOTE_PROTOCOL_VERSION = 1
 APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
                                         "/root/.codex/app-server-control/app-server-control.sock"))
 ANTIGRAVITY = os.environ.get("DARKEXEC_ANTIGRAVITY", "/root/.local/bin/agy")
+ANTIGRAVITY_REMOTE_SERVICE = "/exa.language_server_pb.LanguageServerService/"
 MODEL_CATALOG = {
     "codex/gpt-5.6-sol": {"provider": "codex", "native": "gpt-5.6-sol"},
     "codex/gpt-5.6-terra": {"provider": "codex", "native": "gpt-5.6-terra"},
@@ -1390,14 +1391,286 @@ def selected_model(args) -> tuple[str, dict]:
     return model, MODEL_CATALOG[model]
 
 
-def antigravity_turn(
-    target: Path, prompt: str, model: str, effort: str | None,
+def grpc_web_frame(payload: dict) -> bytes:
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    return b"\0" + struct.pack("!I", len(body)) + body
+
+
+def read_grpc_web_frame(response) -> tuple[int, bytes] | None:
+    header = response.read(5)
+    if not header:
+        return None
+    if len(header) != 5:
+        raise RuntimeError("Antigravity Remote Control returned a truncated frame header")
+    length = struct.unpack("!I", header[1:])[0]
+    body = response.read(length)
+    if len(body) != length:
+        raise RuntimeError("Antigravity Remote Control returned a truncated frame")
+    return header[0], body
+
+
+def antigravity_remote_requested() -> bool:
+    mode = os.environ.get("DARKEXEC_ANTIGRAVITY_REMOTE", "auto").strip().lower()
+    if mode in {"off", "false", "0"}:
+        return False
+    if mode in {"required", "on", "true", "1"} or os.environ.get("DARKEXEC_ANTIGRAVITY_REMOTE_URL"):
+        return True
+    config = Path(os.environ.get("DARKEXEC_ANTIGRAVITY_CONFIG", "/root/.gemini/config/config.json"))
+    try:
+        settings = json.loads(config.read_text()).get("userSettings") or {}
+    except (OSError, json.JSONDecodeError):
+        return False
+    return settings.get("remoteControlEnabled") is True
+
+
+def antigravity_remote_endpoint() -> dict | None:
+    if not antigravity_remote_requested():
+        return None
+    configured = os.environ.get("DARKEXEC_ANTIGRAVITY_REMOTE_URL", "").strip()
+    candidates = [configured] if configured else [f"http://127.0.0.1:{port}" for port in range(4400, 4500)]
+    for candidate in candidates:
+        parsed = urllib.parse.urlparse(candidate)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise RuntimeError("Antigravity Remote Control endpoint must be local HTTP")
+        port = parsed.port or 80
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=0.3 if not configured else 2)
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            body = response.read(1024 * 1024).decode(errors="replace")
+        except OSError:
+            continue
+        finally:
+            connection.close()
+        match = re.search(r'"productName":"antigravity-cli".*?"csrfToken":"([^"]+)"', body)
+        if response.status == 200 and match:
+            return {"host": parsed.hostname, "port": port, "csrf": match.group(1)}
+    raise RuntimeError("Antigravity Remote Control is enabled but its local daemon is unavailable")
+
+
+def antigravity_rpc(endpoint: dict, method: str, payload: dict, timeout: float = 30) -> list[dict]:
+    connection = http.client.HTTPConnection(endpoint["host"], endpoint["port"], timeout=timeout)
+    connection.request("POST", ANTIGRAVITY_REMOTE_SERVICE + method, grpc_web_frame(payload), {
+        "content-type": "application/grpc-web+json", "x-grpc-web": "1",
+        "x-codeium-csrf-token": endpoint["csrf"], "x-user-agent": "CONNECT_ES_USER_AGENT",
+    })
+    response = connection.getresponse()
+    if response.status != 200:
+        detail = response.read(4096).decode(errors="replace")
+        connection.close()
+        raise RuntimeError(f"Antigravity Remote Control {method} failed ({response.status}): {detail}")
+    messages = []
+    try:
+        while frame := read_grpc_web_frame(response):
+            flag, body = frame
+            if flag == 0 and body:
+                messages.append(json.loads(body))
+            elif flag & 0x80 and b"grpc-status: 0" not in body:
+                raise RuntimeError(f"Antigravity Remote Control {method} failed: {body.decode(errors='replace')}")
+    finally:
+        connection.close()
+    return messages
+
+
+def antigravity_remote_project(target: Path) -> str:
+    project_root = Path(os.environ.get("DARKEXEC_ANTIGRAVITY_PROJECT_ROOT", "/root/.gemini/config/projects"))
+    expected = target.resolve()
+    for path in sorted(project_root.glob("*.json")):
+        try:
+            project = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        resources = ((project.get("projectResources") or {}).get("resources") or [])
+        for resource in resources:
+            folder_uri = ((resource.get("gitFolder") or {}).get("folderUri")
+                          or (resource.get("folder") or {}).get("folderUri"))
+            if not folder_uri:
+                continue
+            parsed = urllib.parse.urlparse(folder_uri)
+            if parsed.scheme == "file" and Path(urllib.parse.unquote(parsed.path)).resolve() == expected:
+                return str(project["id"])
+    raise RuntimeError(
+        f"Antigravity Remote Control has no project for {target}; open that folder once in Remote Control"
+    )
+
+
+def antigravity_remote_model(endpoint: dict, native_model: str) -> str:
+    messages = antigravity_rpc(endpoint, "GetCascadeModelConfigData", {})
+    configs = (messages[-1].get("clientModelConfigs") if messages else None) or []
+    for config in configs:
+        if config.get("modelId") == native_model:
+            selected = config.get("modelOrAlias") or {}
+            if selected.get("model"):
+                return str(selected["model"])
+    raise RuntimeError(f"Antigravity Remote Control does not offer {native_model}")
+
+
+def antigravity_stream(endpoint: dict, conversation_id: str, start_index: int) -> tuple[object, object]:
+    payload = {
+        "conversationId": conversation_id, "subscriberId": str(uuid.uuid4()),
+        "initialStepsPageBounds": {"startIndex": start_index},
+        "trajectoryVerbosity": "CLIENT_TRAJECTORY_VERBOSITY_PROD_UI",
+        "initialGeneratorMetadatasPageBounds": {"startIndex": -1},
+        "initialExecutorMetadatasPageBounds": {"startIndex": -1},
+        "disableRehydration": True, "enableLatencyTelemetry": False,
+    }
+    connection = http.client.HTTPConnection(endpoint["host"], endpoint["port"], timeout=300)
+    connection.request("POST", ANTIGRAVITY_REMOTE_SERVICE + "StreamAgentStateUpdates", grpc_web_frame(payload), {
+        "content-type": "application/grpc-web+json", "x-grpc-web": "1",
+        "x-codeium-csrf-token": endpoint["csrf"], "x-user-agent": "CONNECT_ES_USER_AGENT",
+    })
+    response = connection.getresponse()
+    if response.status != 200:
+        detail = response.read(4096).decode(errors="replace")
+        connection.close()
+        raise RuntimeError(f"Antigravity Remote Control stream failed ({response.status}): {detail}")
+    return connection, response
+
+
+def antigravity_remote_snapshot(endpoint: dict, conversation_id: str) -> dict:
+    connection, response = antigravity_stream(endpoint, conversation_id, -64)
+    try:
+        frame = read_grpc_web_frame(response)
+        if not frame or frame[0] != 0:
+            raise RuntimeError(f"Antigravity conversation {conversation_id} is unavailable")
+        return json.loads(frame[1]).get("update") or {}
+    finally:
+        connection.close()
+
+
+def antigravity_remote_turn(
+    endpoint: dict, target: Path, prompt: str, native_model: str,
     conversation_id: str | None = None,
 ) -> dict:
-    effort = effort or "medium"
-    if effort not in {"low", "medium", "high"}:
-        raise RuntimeError(f"Gemini 3.8 Flash does not support {effort} thinking")
-    native_model = f"{MODEL_CATALOG[model]['native']}-{effort}"
+    project_id = antigravity_remote_project(target)
+    model_enum = antigravity_remote_model(endpoint, native_model)
+    baseline = 0
+    if conversation_id:
+        snapshot = antigravity_remote_snapshot(endpoint, conversation_id)
+        metadata = (snapshot.get("mainTrajectoryUpdate") or {}).get("metadata") or {}
+        if metadata.get("projectId") != project_id:
+            raise RuntimeError("Antigravity Remote Control conversation project does not match the target")
+        baseline = int((((snapshot.get("mainTrajectoryUpdate") or {}).get("stepsUpdate") or {}).get("totalLength")) or 0)
+    else:
+        conversation_id = str(uuid.uuid4())
+        reply = antigravity_rpc(endpoint, "StartCascade", {
+            "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT", "cascadeId": conversation_id,
+            "requestedModel": model_enum,
+            "projectEnvConfig": {"projectId": project_id, "defaultProjectEnvironment": {}},
+        })
+        if not reply or reply[-1].get("cascadeId") != conversation_id:
+            raise RuntimeError("Antigravity Remote Control did not create the requested conversation")
+    send_payload = {
+        "cascadeId": conversation_id, "items": [{"text": prompt}],
+        "cascadeConfig": {
+            "plannerConfig": {
+                "toolConfig": {
+                    "runCommand": {
+                        "autoCommandConfig": {"autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER"},
+                        "enableTerminalSandbox": False,
+                    },
+                    "permissionConfig": {"effectivePermissionPreset": "AGENT_PERMISSION_PRESET_TURBO"},
+                },
+                "requestedModel": {"model": model_enum}, "knowledgeConfig": {},
+                "useAiCredits": False, "supportsLatexRendering": True,
+            },
+            "executorConfig": {"useCoreDirect": True}, "conversationHistoryConfig": {},
+        },
+        "customAgentSpec": {"builtinAgent": {"defaultAgent": {"isGoogle": False, "isInteractive": True}}},
+        "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_WHEN_IDLE",
+    }
+    antigravity_rpc(endpoint, "SendUserCascadeMessage", send_payload)
+    previous_handlers = {}
+    def cancel_remote(signum, _frame) -> None:
+        acknowledged = False
+        try:
+            antigravity_rpc(endpoint, "ForceStopCascadeTree", {"cascadeId": conversation_id}, timeout=5)
+            acknowledged = True
+        except (OSError, RuntimeError):
+            pass
+        raise DispatchInterrupted(signum, acknowledged)
+    previous_handlers = {
+        signum: signal.signal(signum, cancel_remote)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    steps: dict[int, dict] = {}
+    last_update = {}
+    deadline = time.monotonic() + 24 * 60 * 60
+    try:
+        while time.monotonic() < deadline:
+            connection, response = antigravity_stream(endpoint, conversation_id, max(-64, baseline - 2))
+            try:
+                while frame := read_grpc_web_frame(response):
+                    flag, body = frame
+                    if flag != 0:
+                        continue
+                    last_update = json.loads(body).get("update") or {}
+                    step_update = ((last_update.get("mainTrajectoryUpdate") or {}).get("stepsUpdate") or {})
+                    for index, step in zip(step_update.get("indices") or [], step_update.get("steps") or []):
+                        steps[int(index)] = step
+                    current = {index: step for index, step in steps.items() if index >= baseline}
+                    saw_user = any(step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT" for step in current.values())
+                    terminal_planner = any(
+                        step.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+                        and step.get("status") == "CORTEX_STEP_STATUS_DONE"
+                        for step in current.values()
+                    )
+                    terminal_failure = bool(last_update.get("error")) or any(
+                        step.get("status") in {
+                            "CORTEX_STEP_STATUS_FAILED", "CORTEX_STEP_STATUS_CANCELLED",
+                        }
+                        for step in current.values()
+                    )
+                    if last_update.get("fullyIdle") and saw_user and (terminal_planner or terminal_failure):
+                        break
+                else:
+                    continue
+                break
+            except (OSError, socket.timeout):
+                continue
+            finally:
+                connection.close()
+        else:
+            raise TimeoutError("Antigravity Remote Control turn exceeded 24 hours")
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    current_steps = [steps[index] for index in sorted(steps) if index >= baseline]
+    responses = [
+        ((step.get("plannerResponse") or {}).get("modifiedResponse")
+         or (step.get("plannerResponse") or {}).get("response") or "")
+        for step in current_steps
+        if step.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+        and step.get("status") == "CORTEX_STEP_STATUS_DONE"
+    ]
+    usages = [
+        (step.get("metadata") or {}).get("modelUsage") or {}
+        for step in current_steps
+        if (step.get("metadata") or {}).get("modelUsage")
+    ]
+    usage = {
+        "input_tokens": sum(int(item.get("inputTokens") or 0) for item in usages),
+        "cache_read_tokens": sum(int(item.get("cacheReadTokens") or 0) for item in usages),
+        "output_tokens": sum(int(item.get("outputTokens") or 0) for item in usages),
+        "thinking_tokens": sum(int(item.get("thinkingOutputTokens") or 0) for item in usages),
+    }
+    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    error = last_update.get("error") or ""
+    return {
+        "conversation_id": conversation_id,
+        "status": "SUCCESS" if responses and not error else "FAILED",
+        "response": responses[-1] if responses else str(error),
+        "num_turns": sum(
+            1 for step in steps.values() if step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT"
+        ),
+        "usage": usage, "remote_visible": True, "remote_project_id": project_id,
+    }
+
+
+def antigravity_cli_turn(
+    target: Path, prompt: str, native_model: str, effort: str,
+    conversation_id: str | None,
+) -> dict:
     command = [
         ANTIGRAVITY, "--print", prompt, "--output-format", "json",
         "--print-timeout", "24h", "--model", native_model, "--effort", effort,
@@ -1435,7 +1708,25 @@ def antigravity_turn(
         payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(stderr.strip() or "Antigravity returned no valid JSON") from exc
-    ok = process.returncode == 0 and payload.get("status") == "SUCCESS"
+    return payload | {"process_returncode": process.returncode, "process_stderr": stderr}
+
+
+def antigravity_turn(
+    target: Path, prompt: str, model: str, effort: str | None,
+    conversation_id: str | None = None,
+) -> dict:
+    effort = effort or "medium"
+    if effort not in {"low", "medium", "high"}:
+        raise RuntimeError(f"Gemini 3.8 Flash does not support {effort} thinking")
+    native_model = f"{MODEL_CATALOG[model]['native']}-{effort}"
+    endpoint = antigravity_remote_endpoint()
+    payload = (
+        antigravity_remote_turn(endpoint, target, prompt, native_model, conversation_id)
+        if endpoint else antigravity_cli_turn(target, prompt, native_model, effort, conversation_id)
+    )
+    process_returncode = payload.get("process_returncode", 0)
+    process_stderr = payload.get("process_stderr", "")
+    ok = process_returncode == 0 and payload.get("status") == "SUCCESS"
     native_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     return {
         "ok": ok,
@@ -1450,9 +1741,11 @@ def antigravity_turn(
             "total": int(native_usage.get("total_tokens") or 0),
         },
         "modelCallCount": 1,
-        "error": "" if ok else str(payload.get("response") or stderr or "Antigravity task failed"),
+        "error": "" if ok else str(payload.get("response") or process_stderr or "Antigravity task failed"),
         "model": model,
         "nativeModel": native_model,
+        "remoteVisible": bool(payload.get("remote_visible")),
+        "remoteProjectId": payload.get("remote_project_id"),
     }
 
 
@@ -1659,7 +1952,8 @@ def dispatch(args) -> int:
                 )
                 receipt["target"] = {
                     "threadId": target_result["threadId"], "turnId": target_result["turnId"],
-                    "source": "antigravity", "appVisible": False, "listedCwd": str(target),
+                    "source": "antigravity", "appVisible": target_result["remoteVisible"],
+                    "remoteProjectId": target_result["remoteProjectId"], "listedCwd": str(target),
                     "initialUsage": target_result["usage"],
                     "modelCallCount": target_result["modelCallCount"],
                     "resultText": target_result["resultText"],
@@ -2085,7 +2379,8 @@ def continue_target(args) -> int:
             turn["usage"] = usage_delta(cumulative_usage, provider_session.get("cumulativeUsage") or {})
             result["nativeTurnStarted"] = True
             result["target"].update({
-                "turnId": turn["turnId"], "source": "antigravity", "appVisible": False,
+                "turnId": turn["turnId"], "source": "antigravity",
+                "appVisible": turn["remoteVisible"], "remoteProjectId": turn["remoteProjectId"],
                 "listedCwd": str(target), "resultText": turn["resultText"],
                 "usage": turn["usage"], "modelCallCount": turn["modelCallCount"],
                 "model": model, "nativeModel": turn["nativeModel"],

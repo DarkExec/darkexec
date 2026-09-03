@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline contract test for dispatch, status, idempotency, and same-task harness."""
 
-import base64, fcntl, hashlib, json, os, runpy, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import base64, fcntl, hashlib, http.server, json, os, runpy, signal, socket, struct, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +39,82 @@ def receive_frame(connection) -> dict | None:
     if opcode == 8:
         return None
     return json.loads(body)
+
+
+def grpc_web_message(payload: dict) -> bytes:
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    return b"\0" + struct.pack("!I", len(body)) + body
+
+
+def grpc_web_trailer() -> bytes:
+    body = b"grpc-status: 0\r\n"
+    return b"\x80" + struct.pack("!I", len(body)) + body
+
+
+def fake_antigravity_server(observed: list[tuple[str, dict]]):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, _format, *_args):
+            pass
+
+        def do_GET(self):
+            body = b'{"productName":"antigravity-cli","csrfToken":"fixture-csrf"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            request = self.rfile.read(int(self.headers["Content-Length"]))
+            length = struct.unpack("!I", request[1:5])[0]
+            payload = json.loads(request[5:5 + length])
+            method = self.path.rsplit("/", 1)[-1]
+            observed.append((method, payload))
+            if method == "GetCascadeModelConfigData":
+                messages = [{"clientModelConfigs": [{
+                    "modelId": "gemini-3.8-flash-high",
+                    "modelOrAlias": {"model": "MODEL_FIXTURE_HIGH"},
+                }]}]
+            elif method == "StartCascade":
+                messages = [{"cascadeId": payload["cascadeId"]}]
+            elif method == "SendUserCascadeMessage":
+                messages = [{}]
+            elif method == "StreamAgentStateUpdates":
+                messages = [{"update": {
+                    "fullyIdle": True,
+                    "mainTrajectoryUpdate": {
+                        "metadata": {"projectId": "fixture-project"},
+                        "stepsUpdate": {
+                            "indices": [0, 1], "totalLength": 2,
+                            "steps": [
+                                {"type": "CORTEX_STEP_TYPE_USER_INPUT", "status": "CORTEX_STEP_STATUS_DONE"},
+                                {
+                                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                                    "status": "CORTEX_STEP_STATUS_DONE",
+                                    "plannerResponse": {"response": "REMOTE_READY"},
+                                    "metadata": {"modelUsage": {
+                                        "inputTokens": 10, "cacheReadTokens": 4,
+                                        "outputTokens": 2, "thinkingOutputTokens": 3,
+                                    }},
+                                },
+                            ],
+                        },
+                    },
+                }}]
+            else:
+                messages = [{}]
+            body = b"".join(grpc_web_message(message) for message in messages) + grpc_web_trailer()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/grpc-web+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
 
 def fake_app_server(
     path: Path,
@@ -315,7 +391,9 @@ def main() -> None:
         fake_agy.chmod(0o700)
         runtime["antigravity_turn"].__globals__["ANTIGRAVITY"] = str(fake_agy)
         old_argv_path = os.environ.get("DARKEXEC_TEST_AGY_ARGV")
+        old_remote_mode = os.environ.get("DARKEXEC_ANTIGRAVITY_REMOTE")
         os.environ["DARKEXEC_TEST_AGY_ARGV"] = str(agy_argv)
+        os.environ["DARKEXEC_ANTIGRAVITY_REMOTE"] = "off"
         agy_result = runtime["antigravity_turn"](
             root, "Do the work.", "antigravity/gemini-3.8-flash", "high"
         )
@@ -323,10 +401,61 @@ def main() -> None:
             os.environ.pop("DARKEXEC_TEST_AGY_ARGV", None)
         else:
             os.environ["DARKEXEC_TEST_AGY_ARGV"] = old_argv_path
+        if old_remote_mode is None:
+            os.environ.pop("DARKEXEC_ANTIGRAVITY_REMOTE", None)
+        else:
+            os.environ["DARKEXEC_ANTIGRAVITY_REMOTE"] = old_remote_mode
         observed_agy_argv = json.loads(agy_argv.read_text())
         assert agy_result["ok"] and agy_result["nativeModel"] == "gemini-3.8-flash-high", agy_result
         assert "--dangerously-skip-permissions" in observed_agy_argv, observed_agy_argv
         assert observed_agy_argv[observed_agy_argv.index("--mode") + 1] == "accept-edits", observed_agy_argv
+
+        remote_project_root = root / "antigravity-projects"
+        remote_project_root.mkdir()
+        (remote_project_root / "fixture-project.json").write_text(json.dumps({
+            "id": "fixture-project",
+            "projectResources": {"resources": [{
+                "folder": {"folderUri": root.resolve().as_uri()},
+            }]},
+        }))
+        observed_remote = []
+        remote_server, remote_thread = fake_antigravity_server(observed_remote)
+        old_remote_url = os.environ.get("DARKEXEC_ANTIGRAVITY_REMOTE_URL")
+        old_project_root = os.environ.get("DARKEXEC_ANTIGRAVITY_PROJECT_ROOT")
+        os.environ["DARKEXEC_ANTIGRAVITY_REMOTE"] = "required"
+        os.environ["DARKEXEC_ANTIGRAVITY_REMOTE_URL"] = f"http://127.0.0.1:{remote_server.server_port}"
+        os.environ["DARKEXEC_ANTIGRAVITY_PROJECT_ROOT"] = str(remote_project_root)
+        try:
+            remote_result = runtime["antigravity_turn"](
+                root, "Run the remote task.", "antigravity/gemini-3.8-flash", "high"
+            )
+        finally:
+            remote_server.shutdown()
+            remote_server.server_close()
+            remote_thread.join(timeout=2)
+            if old_remote_mode is None:
+                os.environ.pop("DARKEXEC_ANTIGRAVITY_REMOTE", None)
+            else:
+                os.environ["DARKEXEC_ANTIGRAVITY_REMOTE"] = old_remote_mode
+            if old_remote_url is None:
+                os.environ.pop("DARKEXEC_ANTIGRAVITY_REMOTE_URL", None)
+            else:
+                os.environ["DARKEXEC_ANTIGRAVITY_REMOTE_URL"] = old_remote_url
+            if old_project_root is None:
+                os.environ.pop("DARKEXEC_ANTIGRAVITY_PROJECT_ROOT", None)
+            else:
+                os.environ["DARKEXEC_ANTIGRAVITY_PROJECT_ROOT"] = old_project_root
+        assert remote_result["ok"] and remote_result["remoteVisible"], remote_result
+        assert remote_result["resultText"] == "REMOTE_READY", remote_result
+        assert remote_result["remoteProjectId"] == "fixture-project", remote_result
+        start_payload = next(payload for method, payload in observed_remote if method == "StartCascade")
+        send_payload = next(payload for method, payload in observed_remote if method == "SendUserCascadeMessage")
+        assert start_payload["requestedModel"] == "MODEL_FIXTURE_HIGH", start_payload
+        run_command = send_payload["cascadeConfig"]["plannerConfig"]["toolConfig"]["runCommand"]
+        permissions = send_payload["cascadeConfig"]["plannerConfig"]["toolConfig"]["permissionConfig"]
+        assert run_command["autoCommandConfig"]["autoExecutionPolicy"] == "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER", run_command
+        assert run_command["enableTerminalSandbox"] is False, run_command
+        assert permissions["effectivePermissionPreset"] == "AGENT_PERMISSION_PRESET_TURBO", permissions
         incident_prompt = (
             "you can go ahead and make all the changes to toolburn you wanted, and also move passes "
             "into DarkExec/harness-ops, then change the harness prompt because efficiency passes can "
