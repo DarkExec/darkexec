@@ -1515,6 +1515,27 @@ def antigravity_remote_enable_turbo(endpoint: dict) -> None:
     })
 
 
+def antigravity_remote_session_url(endpoint: dict, conversation_id: str, project_id: str) -> str:
+    messages = antigravity_rpc(endpoint, "GetRemoteControlInfo", {})
+    info = messages[-1] if messages else {}
+    instance_id = str(info.get("instanceId") or "")
+    origin = str(info.get("companionOrigin") or "").rstrip("/")
+    parsed_origin = urllib.parse.urlparse(origin)
+    try:
+        uuid.UUID(instance_id.removesuffix("-v2"))
+    except ValueError as exc:
+        raise RuntimeError("Antigravity Remote Control returned an invalid instance identity") from exc
+    if (
+        not info.get("enabled") or not instance_id.endswith("-v2")
+        or parsed_origin.scheme != "https" or parsed_origin.netloc != "antigravity.google.com"
+        or parsed_origin.path not in {"", "/"} or parsed_origin.params
+        or parsed_origin.query or parsed_origin.fragment
+    ):
+        raise RuntimeError("Antigravity Remote Control returned an invalid companion origin")
+    remote_path = f"c/{conversation_id}?section={project_id}"
+    return f"{origin}/r/{instance_id}?{urllib.parse.urlencode({'p': remote_path})}"
+
+
 def antigravity_stream(endpoint: dict, conversation_id: str, start_index: int) -> tuple[object, object]:
     payload = {
         "conversationId": conversation_id, "subscriberId": str(uuid.uuid4()),
@@ -1573,6 +1594,7 @@ def antigravity_remote_turn(
         })
         if not reply or reply[-1].get("cascadeId") != conversation_id:
             raise RuntimeError("Antigravity Remote Control did not create the requested conversation")
+    session_url = antigravity_remote_session_url(endpoint, conversation_id, project_id)
     send_payload = {
         "cascadeId": conversation_id, "items": [{"text": prompt}],
         "cascadeConfig": {
@@ -1677,6 +1699,7 @@ def antigravity_remote_turn(
         # The final step count is monotonic across follow-ups and therefore forms a stable opaque turn ID.
         "num_turns": total_steps,
         "usage": usage, "remote_visible": True, "remote_project_id": project_id,
+        "remote_session_url": session_url,
     }
 
 
@@ -1759,6 +1782,7 @@ def antigravity_turn(
         "nativeModel": native_model,
         "remoteVisible": bool(payload.get("remote_visible")),
         "remoteProjectId": payload.get("remote_project_id"),
+        "sessionUrl": payload.get("remote_session_url"),
     }
 
 
@@ -1967,6 +1991,7 @@ def dispatch(args) -> int:
                     "threadId": target_result["threadId"], "turnId": target_result["turnId"],
                     "source": "antigravity", "appVisible": target_result["remoteVisible"],
                     "remoteProjectId": target_result["remoteProjectId"], "listedCwd": str(target),
+                    "sessionUrl": target_result["sessionUrl"],
                     "initialUsage": target_result["usage"],
                     "modelCallCount": target_result["modelCallCount"],
                     "resultText": target_result["resultText"],
@@ -2399,6 +2424,7 @@ def continue_target(args) -> int:
             result["target"].update({
                 "turnId": turn["turnId"], "source": "antigravity",
                 "appVisible": turn["remoteVisible"], "remoteProjectId": turn["remoteProjectId"],
+                "sessionUrl": turn["sessionUrl"],
                 "listedCwd": str(target), "resultText": turn["resultText"],
                 "usage": turn["usage"], "modelCallCount": turn["modelCallCount"],
                 "model": model, "nativeModel": turn["nativeModel"],

@@ -78,6 +78,12 @@ def fake_antigravity_server(observed: list[tuple[str, dict]]):
                     "modelId": "gemini-3.8-flash-high",
                     "modelOrAlias": {"model": "MODEL_FIXTURE_HIGH"},
                 }]}]
+            elif method == "GetRemoteControlInfo":
+                messages = [{
+                    "enabled": True,
+                    "instanceId": "584f9911-dd98-4533-8e4c-1a0badabc9a6-v2",
+                    "companionOrigin": "https://antigravity.google.com",
+                }]
             elif method == "StartCascade":
                 messages = [{"cascadeId": payload["cascadeId"]}]
             elif method == "SendUserCascadeMessage":
@@ -457,6 +463,10 @@ def main() -> None:
         assert remote_result["resultText"] == "REMOTE_READY_1", remote_result
         assert remote_result["turnId"] == "agy-2", remote_result
         assert remote_result["remoteProjectId"] == "fixture-project", remote_result
+        assert remote_result["sessionUrl"] == (
+            "https://antigravity.google.com/r/584f9911-dd98-4533-8e4c-1a0badabc9a6-v2"
+            f"?p=c%2F{remote_result['threadId']}%3Fsection%3Dfixture-project"
+        ), remote_result
         assert remote_followup["resultText"] == "REMOTE_READY_2", remote_followup
         assert remote_followup["turnId"] == "agy-4", remote_followup
         start_payload = next(payload for method, payload in observed_remote if method == "StartCascade")
