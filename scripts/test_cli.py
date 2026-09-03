@@ -52,6 +52,8 @@ def grpc_web_trailer() -> bytes:
 
 
 def fake_antigravity_server(observed: list[tuple[str, dict]]):
+    state = {"turn": 0}
+
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -79,20 +81,22 @@ def fake_antigravity_server(observed: list[tuple[str, dict]]):
             elif method == "StartCascade":
                 messages = [{"cascadeId": payload["cascadeId"]}]
             elif method == "SendUserCascadeMessage":
+                state["turn"] += 1
                 messages = [{}]
             elif method == "StreamAgentStateUpdates":
+                offset = max(0, (state["turn"] - 1) * 2)
                 messages = [{"update": {
                     "fullyIdle": True,
                     "mainTrajectoryUpdate": {
                         "metadata": {"projectId": "fixture-project"},
                         "stepsUpdate": {
-                            "indices": [0, 1], "totalLength": 2,
+                            "indices": [offset, offset + 1], "totalLength": offset + 2,
                             "steps": [
                                 {"type": "CORTEX_STEP_TYPE_USER_INPUT", "status": "CORTEX_STEP_STATUS_DONE"},
                                 {
                                     "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
                                     "status": "CORTEX_STEP_STATUS_DONE",
-                                    "plannerResponse": {"response": "REMOTE_READY"},
+                                    "plannerResponse": {"response": f"REMOTE_READY_{state['turn']}"},
                                     "metadata": {"modelUsage": {
                                         "inputTokens": 10, "cacheReadTokens": 4,
                                         "outputTokens": 2, "thinkingOutputTokens": 3,
@@ -429,6 +433,10 @@ def main() -> None:
             remote_result = runtime["antigravity_turn"](
                 root, "Run the remote task.", "antigravity/gemini-3.8-flash", "high"
             )
+            remote_followup = runtime["antigravity_turn"](
+                root, "Continue the remote task.", "antigravity/gemini-3.8-flash", "high",
+                remote_result["threadId"],
+            )
         finally:
             remote_server.shutdown()
             remote_server.server_close()
@@ -446,8 +454,11 @@ def main() -> None:
             else:
                 os.environ["DARKEXEC_ANTIGRAVITY_PROJECT_ROOT"] = old_project_root
         assert remote_result["ok"] and remote_result["remoteVisible"], remote_result
-        assert remote_result["resultText"] == "REMOTE_READY", remote_result
+        assert remote_result["resultText"] == "REMOTE_READY_1", remote_result
+        assert remote_result["turnId"] == "agy-2", remote_result
         assert remote_result["remoteProjectId"] == "fixture-project", remote_result
+        assert remote_followup["resultText"] == "REMOTE_READY_2", remote_followup
+        assert remote_followup["turnId"] == "agy-4", remote_followup
         start_payload = next(payload for method, payload in observed_remote if method == "StartCascade")
         send_payload = next(payload for method, payload in observed_remote if method == "SendUserCascadeMessage")
         turbo_payload = next(payload for method, payload in observed_remote if method == "JetboxWriteState")

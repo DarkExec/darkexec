@@ -1607,6 +1607,7 @@ def antigravity_remote_turn(
     }
     steps: dict[int, dict] = {}
     last_update = {}
+    total_steps = baseline
     deadline = time.monotonic() + 24 * 60 * 60
     try:
         while time.monotonic() < deadline:
@@ -1618,6 +1619,7 @@ def antigravity_remote_turn(
                         continue
                     last_update = json.loads(body).get("update") or {}
                     step_update = ((last_update.get("mainTrajectoryUpdate") or {}).get("stepsUpdate") or {})
+                    total_steps = max(total_steps, int(step_update.get("totalLength") or 0))
                     for index, step in zip(step_update.get("indices") or [], step_update.get("steps") or []):
                         steps[int(index)] = step
                     current = {index: step for index, step in steps.items() if index >= baseline}
@@ -1672,9 +1674,8 @@ def antigravity_remote_turn(
         "conversation_id": conversation_id,
         "status": "SUCCESS" if responses and not error else "FAILED",
         "response": responses[-1] if responses else str(error),
-        "num_turns": sum(
-            1 for step in steps.values() if step.get("type") == "CORTEX_STEP_TYPE_USER_INPUT"
-        ),
+        # The final step count is monotonic across follow-ups and therefore forms a stable opaque turn ID.
+        "num_turns": total_steps,
         "usage": usage, "remote_visible": True, "remote_project_id": project_id,
     }
 
@@ -1984,7 +1985,8 @@ def dispatch(args) -> int:
                         target, harness_prompt, model, getattr(args, "thinking_level", None),
                         target_result["threadId"],
                     )
-                    harness["usage"] = usage_delta(harness["usage"], target_result["usage"])
+                    if not harness["remoteVisible"]:
+                        harness["usage"] = usage_delta(harness["usage"], target_result["usage"])
                     save_provider_session(
                         target_result["threadId"], target, model,
                         getattr(args, "thinking_level", None) or "medium",
@@ -2387,8 +2389,12 @@ def continue_target(args) -> int:
             if manual_harness_mode in {"standard", "efficiency"}:
                 result["doctrineRefresh"] = refresh_harness_doctrine()
             turn = antigravity_turn(target, provider_prompt, model, getattr(args, "thinking_level", None), args.thread)
-            cumulative_usage = turn["usage"]
-            turn["usage"] = usage_delta(cumulative_usage, provider_session.get("cumulativeUsage") or {})
+            prior_usage = provider_session.get("cumulativeUsage") or {}
+            if turn["remoteVisible"]:
+                cumulative_usage = usage_add(prior_usage, turn["usage"])
+            else:
+                cumulative_usage = turn["usage"]
+                turn["usage"] = usage_delta(cumulative_usage, prior_usage)
             result["nativeTurnStarted"] = True
             result["target"].update({
                 "turnId": turn["turnId"], "source": "antigravity",
