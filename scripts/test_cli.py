@@ -435,9 +435,11 @@ def main() -> None:
         os.environ["DARKEXEC_ANTIGRAVITY_REMOTE"] = "required"
         os.environ["DARKEXEC_ANTIGRAVITY_REMOTE_URL"] = f"http://127.0.0.1:{remote_server.server_port}"
         os.environ["DARKEXEC_ANTIGRAVITY_PROJECT_ROOT"] = str(remote_project_root)
+        observed_started = []
         try:
             remote_result = runtime["antigravity_turn"](
-                root, "Run the remote task.", "antigravity/gemini-3.8-flash", "high"
+                root, "Run the remote task.", "antigravity/gemini-3.8-flash", "high",
+                on_started=observed_started.append,
             )
             remote_followup = runtime["antigravity_turn"](
                 root, "Continue the remote task.", "antigravity/gemini-3.8-flash", "high",
@@ -467,6 +469,12 @@ def main() -> None:
             "https://antigravity.google.com/r/584f9911-dd98-4533-8e4c-1a0badabc9a6-v2"
             f"?p=c%2F{remote_result['threadId']}%3Fsection%3Dfixture-project"
         ), remote_result
+        assert observed_started == [{
+            "threadId": remote_result["threadId"],
+            "source": "antigravity", "appVisible": True,
+            "remoteProjectId": "fixture-project",
+            "sessionUrl": remote_result["sessionUrl"],
+        }], observed_started
         assert remote_followup["resultText"] == "REMOTE_READY_2", remote_followup
         assert remote_followup["turnId"] == "agy-4", remote_followup
         start_payload = next(payload for method, payload in observed_remote if method == "StartCascade")
