@@ -1571,7 +1571,7 @@ def antigravity_remote_snapshot(endpoint: dict, conversation_id: str) -> dict:
 
 def antigravity_remote_turn(
     endpoint: dict, target: Path, prompt: str, native_model: str,
-    conversation_id: str | None = None,
+    conversation_id: str | None = None, on_started=None,
 ) -> dict:
     # Remote Control resolves these permissions from daemon preferences rather than CascadeConfig.
     # Apply the same three settings as its Turbo preset before every DarkExec turn.
@@ -1614,6 +1614,11 @@ def antigravity_remote_turn(
         "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_WHEN_IDLE",
     }
     antigravity_rpc(endpoint, "SendUserCascadeMessage", send_payload)
+    if on_started:
+        on_started({
+            "threadId": conversation_id, "source": "antigravity", "appVisible": True,
+            "remoteProjectId": project_id, "sessionUrl": session_url,
+        })
     previous_handlers = {}
     def cancel_remote(signum, _frame) -> None:
         acknowledged = False
@@ -1749,7 +1754,7 @@ def antigravity_cli_turn(
 
 def antigravity_turn(
     target: Path, prompt: str, model: str, effort: str | None,
-    conversation_id: str | None = None,
+    conversation_id: str | None = None, on_started=None,
 ) -> dict:
     effort = effort or "medium"
     if effort not in {"low", "medium", "high"}:
@@ -1757,7 +1762,7 @@ def antigravity_turn(
     native_model = f"{MODEL_CATALOG[model]['native']}-{effort}"
     endpoint = antigravity_remote_endpoint()
     payload = (
-        antigravity_remote_turn(endpoint, target, prompt, native_model, conversation_id)
+        antigravity_remote_turn(endpoint, target, prompt, native_model, conversation_id, on_started)
         if endpoint else antigravity_cli_turn(target, prompt, native_model, effort, conversation_id)
     )
     process_returncode = payload.get("process_returncode", 0)
@@ -1973,12 +1978,20 @@ def dispatch(args) -> int:
 
             if model_capability["provider"] == "antigravity":
                 save(path, receipt, "target_running")
+                def provider_started(started: dict) -> None:
+                    receipt["target"] = {
+                        **started, "listedCwd": str(target), "model": model,
+                        "nativeModel": f"{model_capability['native']}-{getattr(args, 'thinking_level', None) or 'medium'}",
+                        "harness": {"status": "deferred" if args.defer_initial_harness else "not_started"},
+                    }
+                    save(path, receipt, "target_running")
                 provider_prompt = next(
                     (item["text"] for item in (direct_input or []) if item.get("type") == "text"),
                     prompt,
                 )
                 target_result = antigravity_turn(
-                    target, provider_prompt, model, getattr(args, "thinking_level", None)
+                    target, provider_prompt, model, getattr(args, "thinking_level", None),
+                    on_started=provider_started,
                 )
                 if not target_result.get("threadId"):
                     raise RuntimeError("Antigravity omitted its conversation identity")
