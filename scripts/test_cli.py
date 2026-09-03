@@ -159,7 +159,7 @@ def fake_app_server(
             thread = message["params"]["threadId"]
             turn_input = message["params"]["input"]
             if observed_options is not None:
-                observed_options.append({key: message["params"][key] for key in ("effort", "serviceTier") if key in message["params"]})
+                observed_options.append({key: message["params"][key] for key in ("model", "effort", "serviceTier") if key in message["params"]})
             if observed_inputs is not None:
                 observed_inputs.append(turn_input)
             prompt = next(
@@ -304,6 +304,29 @@ def main() -> None:
         os.environ["DARKEXEC_DOCTRINE_REFRESH"] = ""
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
         refresh_doctrine = runtime["refresh_harness_doctrine"]
+        fake_agy = root / "agy"
+        agy_argv = root / "agy-argv.json"
+        fake_agy.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "json.dump(sys.argv[1:], open(os.environ['DARKEXEC_TEST_AGY_ARGV'], 'w'))\n"
+            "print(json.dumps({'conversation_id':'agy-session','status':'SUCCESS','response':'READY','num_turns':1,'usage':{'input_tokens':10,'output_tokens':2,'thinking_tokens':3,'cache_read_tokens':4,'total_tokens':15}}))\n"
+        )
+        fake_agy.chmod(0o700)
+        runtime["antigravity_turn"].__globals__["ANTIGRAVITY"] = str(fake_agy)
+        old_argv_path = os.environ.get("DARKEXEC_TEST_AGY_ARGV")
+        os.environ["DARKEXEC_TEST_AGY_ARGV"] = str(agy_argv)
+        agy_result = runtime["antigravity_turn"](
+            root, "Do the work.", "antigravity/gemini-3.8-flash", "high"
+        )
+        if old_argv_path is None:
+            os.environ.pop("DARKEXEC_TEST_AGY_ARGV", None)
+        else:
+            os.environ["DARKEXEC_TEST_AGY_ARGV"] = old_argv_path
+        observed_agy_argv = json.loads(agy_argv.read_text())
+        assert agy_result["ok"] and agy_result["nativeModel"] == "gemini-3.8-flash-high", agy_result
+        assert "--dangerously-skip-permissions" in observed_agy_argv, observed_agy_argv
+        assert observed_agy_argv[observed_agy_argv.index("--mode") + 1] == "accept-edits", observed_agy_argv
         incident_prompt = (
             "you can go ahead and make all the changes to toolburn you wanted, and also move passes "
             "into DarkExec/harness-ops, then change the harness prompt because efficiency passes can "
@@ -616,13 +639,13 @@ def main() -> None:
         command = [
             str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
             "--job-id", "incident-1", "--prompt-stdin", "--read-only-harness", "--json",
-            "--thinking-level", "max", "--speed", "fast",
+            "--model", "codex/gpt-5.6-terra", "--thinking-level", "max", "--speed", "fast",
         ]
         first = subprocess.run(command, input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert first.returncode == 0, first.stderr or first.stdout
         result = json.loads(first.stdout)
         assert observed_options[0] == {}, observed_options
-        assert observed_options[1] == {"effort": "max", "serviceTier": "fast"}, observed_options
+        assert observed_options[1] == {"model": "gpt-5.6-terra", "effort": "max", "serviceTier": "fast"}, observed_options
         conflict_options = subprocess.run([*command[:-1], "standard"], input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert conflict_options.returncode != 0 and "different request" in conflict_options.stderr
         assert result["status"] == "completed", result
