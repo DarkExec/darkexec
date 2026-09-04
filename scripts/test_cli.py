@@ -835,13 +835,13 @@ def main() -> None:
         command = [
             str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
             "--job-id", "incident-1", "--prompt-stdin", "--read-only-harness", "--json",
-            "--model", "codex/gpt-5.6-terra", "--thinking-level", "max", "--speed", "fast",
+            "--thinking-level", "max", "--speed", "fast",
         ]
         first = subprocess.run(command, input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert first.returncode == 0, first.stderr or first.stdout
         result = json.loads(first.stdout)
         assert observed_options[0] == {}, observed_options
-        assert observed_options[1] == {"model": "gpt-5.6-terra", "effort": "max", "serviceTier": "fast"}, observed_options
+        assert observed_options[1] == {"model": "gpt-6-astra", "effort": "max", "serviceTier": "fast"}, observed_options
         conflict_options = subprocess.run([*command[:-1], "standard"], input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert conflict_options.returncode != 0 and "different request" in conflict_options.stderr
         assert result["status"] == "completed", result
@@ -1179,10 +1179,12 @@ def main() -> None:
             daemon=True,
         )
         interrupted_harness_server.start(); assert interrupted_harness_ready.wait(timeout=2)
+        interrupted_executive = "interrupted-harness-executive"
         interrupted_harness_process = subprocess.Popen(
             [
                 str(ROOT / "bin/darkexec"), "run", "--target", str(target),
                 "--prompt-stdin", "--standard-harness", "--json",
+                "--executive-thread", interrupted_executive,
             ],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env={
@@ -1194,6 +1196,15 @@ def main() -> None:
         interrupted_harness_process.stdin.write("Complete product before interrupted harness.")
         interrupted_harness_process.stdin.close()
         assert interrupted_harness_started.wait(timeout=3)
+        # Wait for the client to record the turn, not just the server to send it.
+        interrupted_path = root / "executions" / f"{hashlib.sha256(interrupted_executive.encode()).hexdigest()}.json"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if interrupted_path.exists() and json.loads(interrupted_path.read_text()).get("phase") == "harness_running":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("client did not acknowledge harness start")
         interrupted_harness_process.send_signal(signal.SIGTERM)
         interrupted_harness_process.wait(timeout=5)
         interrupted_harness_result = json.loads(interrupted_harness_process.stdout.read())
