@@ -727,6 +727,17 @@ class SteerControl:
 
 class AppServer:
     def __init__(self):
+        self.request_id = 0
+        self.thread_usage: dict[str, dict] = {}
+        self.active_turn: tuple[str, str] | None = None
+        self._open_socket()
+        self.signal_handlers = {
+            signum: signal.signal(signum, self._handle_signal)
+            for signum in (signal.SIGTERM, signal.SIGINT)
+        }
+        self._initialize()
+
+    def _open_socket(self) -> None:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.connect(str(APP_SERVER_SOCKET))
         self.buffer = b""
@@ -744,13 +755,8 @@ class AppServer:
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         if b" 101 " not in headers or b"sec-websocket-accept: " + expected.lower() not in headers.lower():
             raise RuntimeError(f"App Server WebSocket upgrade failed: {headers[:500]!r}")
-        self.request_id = 0
-        self.thread_usage: dict[str, dict] = {}
-        self.active_turn: tuple[str, str] | None = None
-        self.signal_handlers = {
-            signum: signal.signal(signum, self._handle_signal)
-            for signum in (signal.SIGTERM, signal.SIGINT)
-        }
+
+    def _initialize(self) -> None:
         self._request("initialize", {
             "clientInfo": {"name": "darkexec", "version": "1"},
             "capabilities": {
@@ -762,6 +768,11 @@ class AppServer:
             },
         })
         self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+    def reconnect(self) -> None:
+        self.sock.close()
+        self._open_socket()
+        self._initialize()
 
     def __enter__(self):
         return self
@@ -999,6 +1010,43 @@ class AppServer:
                 ),
             }
 
+        def recover_started_turn(transport_error: Exception) -> dict:
+            recovery_deadline = time.monotonic() + 30
+            last_error: Exception = transport_error
+            while time.monotonic() < recovery_deadline:
+                try:
+                    self.reconnect()
+                    thread = self.read_thread(thread_id)
+                    turn = next(
+                        (
+                            candidate for candidate in thread.get("turns", [])
+                            if candidate.get("id") == turn_id
+                        ),
+                        None,
+                    )
+                    if turn is None:
+                        raise RuntimeError(
+                            f"started target turn {turn_id} was not found during transport recovery"
+                        )
+                    if turn.get("status") in {
+                        "completed", "failed", "interrupted", "cancelled",
+                    }:
+                        for item in turn.get("items", []):
+                            if item.get("type") == "agentMessage" and item.get("text"):
+                                text = str(item["text"])
+                                if not messages or messages[-1] != text:
+                                    messages.append(text)
+                        result = completed_result(turn)
+                        result["transportRecovered"] = True
+                        return result
+                except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as exc:
+                    last_error = exc
+                time.sleep(1)
+            raise RuntimeError(
+                f"App Server transport failed after target turn {turn_id} started; "
+                f"bounded reconciliation failed: {last_error}"
+            ) from transport_error
+
         try:
             if control:
                 control.open()
@@ -1139,6 +1187,10 @@ class AppServer:
                 "ok": False, "timedOut": True, "exitCode": None, "threadId": thread_id,
                 "error": f"Codex App turn exceeded {TURN_TIMEOUT} seconds.",
             }
+        except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+            if not turn_id:
+                raise
+            return recover_started_turn(exc)
         finally:
             for connection in pending_steers.values():
                 if control:
