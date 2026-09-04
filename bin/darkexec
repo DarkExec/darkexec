@@ -61,7 +61,9 @@ APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
                                         "/root/.codex/app-server-control/app-server-control.sock"))
 ANTIGRAVITY = os.environ.get("DARKEXEC_ANTIGRAVITY", "/root/.local/bin/agy")
 ANTIGRAVITY_REMOTE_SERVICE = "/exa.language_server_pb.LanguageServerService/"
+DEFAULT_MODEL = "codex/gpt-6-astra"
 MODEL_CATALOG = {
+    "codex/gpt-6-astra": {"provider": "codex", "native": "gpt-6-astra"},
     "codex/gpt-5.6-sol": {"provider": "codex", "native": "gpt-5.6-sol"},
     "codex/gpt-5.6-terra": {"provider": "codex", "native": "gpt-5.6-terra"},
     "codex/gpt-5.6-luna": {"provider": "codex", "native": "gpt-5.6-luna"},
@@ -1437,7 +1439,7 @@ def provider_session_path(thread_id: str) -> Path:
 
 
 def selected_model(args) -> tuple[str, dict]:
-    model = getattr(args, "model", None) or "codex/gpt-5.6-sol"
+    model = getattr(args, "model", None) or DEFAULT_MODEL
     if model not in MODEL_CATALOG:
         raise SystemExit(f"unknown model: {model}")
     return model, MODEL_CATALOG[model]
@@ -1878,13 +1880,13 @@ def set_execution_options(args) -> int:
     return 0
 
 
-def execution_options(args) -> dict:
-    """Omitted flags preserve native defaults; standard explicitly clears Fast mode."""
+def execution_options(args, *, new_task: bool = False) -> dict:
+    """New tasks use our model default; continuations inherit omitted settings."""
     options = {}
     effort = getattr(args, "thinking_level", None)
     speed = getattr(args, "speed", None)
     model, capability = selected_model(args)
-    if capability["provider"] == "codex" and getattr(args, "model", None):
+    if capability["provider"] == "codex" and (new_task or getattr(args, "model", None)):
         options["model"] = capability["native"]
     if effort is not None:
         options["effort"] = effort
@@ -1917,7 +1919,7 @@ def dispatch(args) -> int:
     if args.resolve_target:
         request_material += b"\0resolve-target"
     model, model_capability = selected_model(args)
-    options = execution_options(args)
+    options = execution_options(args, new_task=True)
     if options:
         request_material += b"\0" + json.dumps(options, sort_keys=True).encode()
     request_sha = hashlib.sha256(request_material).hexdigest()
@@ -2342,7 +2344,7 @@ def run_target(args) -> int:
             target_result = app.run_turn(
                 thread["id"], prompt, on_started=target_started, input_items=source_input,
                 steer_key=executive_thread_id,
-                execution_options=execution_options(args),
+                execution_options=execution_options(args, new_task=True),
             )
             listed_thread = app.require_listed_thread(thread["id"], target)
             result["target"].update({
@@ -4300,15 +4302,16 @@ def main() -> int:
         return 0
     if args.command == "models":
         catalog = [
-            {"id": "codex/gpt-5.6-sol", "provider": "codex", "label": "GPT-5.6 Sol", "description": "Reliable agentic workhorse", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "low"},
+            {"id": "codex/gpt-6-astra", "provider": "codex", "label": "GPT-6 Astra", "description": "Complex reasoning and coding", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.6-sol", "provider": "codex", "label": "GPT-5.6 Sol", "description": "General coding and agent tasks", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "low"},
             {"id": "codex/gpt-5.6-terra", "provider": "codex", "label": "GPT-5.6 Terra", "description": "Balanced agentic coding model", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
             {"id": "codex/gpt-5.6-luna", "provider": "codex", "label": "GPT-5.6 Luna", "description": "Fast and affordable agentic coding model", "thinkingLevels": ["low", "medium", "high", "xhigh", "max"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
-            {"id": "codex/gpt-5.5", "provider": "codex", "label": "GPT-5.5", "description": "Proven general coding model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
-            {"id": "codex/gpt-5.4", "provider": "codex", "label": "GPT-5.4", "description": "Strong everyday coding model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.5", "provider": "codex", "label": "GPT-5.5", "description": "General coding", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-5.4", "provider": "codex", "label": "GPT-5.4", "description": "General coding", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
             {"id": "codex/gpt-5.3-codex", "provider": "codex", "label": "GPT-5.3 Codex", "description": "Legacy Codex model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard"], "defaultThinkingLevel": "high"},
             {"id": "antigravity/gemini-3.8-flash", "provider": "antigravity", "label": "Gemini 3.8 Flash", "description": "Google subscription via Antigravity CLI", "thinkingLevels": ["low", "medium", "high"], "speeds": ["standard"], "defaultThinkingLevel": "high"},
         ]
-        payload = {"schemaVersion": 1, "defaultModel": "codex/gpt-5.6-sol", "models": catalog}
+        payload = {"schemaVersion": 1, "defaultModel": DEFAULT_MODEL, "models": catalog}
         print(json.dumps(payload) if args.json else "\n".join(item["id"] for item in catalog))
         return 0
     if args.command == "harness-prompt":
