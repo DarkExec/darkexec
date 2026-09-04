@@ -138,22 +138,26 @@ def fake_app_server(
     route_unresolved: bool = False,
     remove_routed_target: bool = False,
     observed_options: list[dict] | None = None,
+    disconnect_completed_turn: bool = False,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
-    server.listen(1)
+    server.listen(2)
     ready.set()
-    connection, _ = server.accept()
-    request = b""
-    while b"\r\n\r\n" not in request:
-        request += connection.recv(4096)
-    key_line = next(line for line in request.decode().split("\r\n") if line.lower().startswith("sec-websocket-key:"))
-    key = key_line.split(":", 1)[1].strip()
-    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-    connection.sendall((
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-    ).encode())
+    def accept_connection():
+        connection, _ = server.accept()
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += connection.recv(4096)
+        key_line = next(line for line in request.decode().split("\r\n") if line.lower().startswith("sec-websocket-key:"))
+        key = key_line.split(":", 1)[1].strip()
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        connection.sendall((
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode())
+        return connection
+    connection = accept_connection()
     threads, listed, histories, materialized, loaded, required_resume_paths, turns = (
         {}, {}, {}, set(), set(), {}, 0
     )
@@ -323,6 +327,11 @@ def fake_app_server(
                 text = "HARNESS_OK" if "harness" in prompt.lower() else (f"TARGET_OK:{prompt}" if thread.endswith("2") else "EXECUTIVE_OK")
             history["items"].append({"id": f"agent-{turn}", "type": "agentMessage", "text": text})
             history["status"] = "completed"
+            if disconnect_completed_turn:
+                disconnect_completed_turn = False
+                connection.close()
+                connection = accept_connection()
+                continue
             if prompt == "COMPLETE_WITHOUT_NOTIFICATION":
                 continue
             send_frame(connection, {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": {"type": "agentMessage", "text": text}}})
@@ -390,6 +399,30 @@ def main() -> None:
         os.environ["DARKEXEC_DOCTRINE_REFRESH"] = ""
         runtime = runpy.run_path(str(ROOT / "bin/darkexec"))
         refresh_doctrine = runtime["refresh_harness_doctrine"]
+        recovered_thread = "00000000-0000-4000-8000-000000000002"
+        recovery_socket, recovery_ready = root / "transport-recovery.sock", threading.Event()
+        recovery_server = threading.Thread(
+            target=fake_app_server,
+            args=(recovery_socket, recovery_ready, True, None, {
+                recovered_thread: {"cwd": str(root), "turns": []},
+            }),
+            kwargs={"disconnect_completed_turn": True},
+            daemon=True,
+        )
+        recovery_server.start(); assert recovery_ready.wait(timeout=2)
+        app_server_globals = runtime["AppServer"].__init__.__globals__
+        original_app_server_socket = app_server_globals["APP_SERVER_SOCKET"]
+        app_server_globals["APP_SERVER_SOCKET"] = recovery_socket
+        try:
+            with runtime["AppServer"]() as app:
+                recovered_turn = app.run_turn(recovered_thread, "RECOVER_AFTER_DISCONNECT")
+                recovered_listing = app.require_listed_thread(recovered_thread, root)
+        finally:
+            app_server_globals["APP_SERVER_SOCKET"] = original_app_server_socket
+        assert recovered_turn["ok"] and recovered_turn["transportRecovered"], recovered_turn
+        assert recovered_turn["resultText"] == "TARGET_OK:RECOVER_AFTER_DISCONNECT", recovered_turn
+        assert recovered_listing["id"] == recovered_thread, recovered_listing
+        recovery_server.join(timeout=2); assert not recovery_server.is_alive()
         fake_agy = root / "agy"
         agy_argv = root / "agy-argv.json"
         fake_agy.write_text(
@@ -2471,7 +2504,7 @@ def main() -> None:
         "manual-harness-suppression",
             "schedule-failure-immediate-closeout", "same-session-trailing-closeout",
         "per-call-closeout-usage", "cold-task-resume",
-        "persisted-rollout-path-resume", "debounce-status",
+        "persisted-rollout-path-resume", "post-start-transport-recovery", "debounce-status",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",
         "append-only-harness-episode", "manual-deferred-episode-identity",
