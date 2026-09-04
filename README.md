@@ -236,6 +236,19 @@ darkexec identity --json
 
 The alpha does not yet provide an automated uninstaller. Preserve any receipts you need, then remove only the documented DarkExec-managed symlinks and release paths.
 
+## Development delivery
+
+Develop in an isolated worktree based on fetched `origin/main`, review the candidate diff, run `./scripts/validate.sh`, and push before creating the pull request. Use authenticated `gh` with `--repo DarkExec/darkexec`; pass Markdown descriptions through `--body-file` so their contents remain literal. Before merging, compare the PR's `headRefOid` with the reviewed candidate commit.
+
+Run the merge from outside every Git checkout so GitHub CLI cannot attempt a local checkout of `main` already held by the canonical worktree:
+
+```bash
+(cd /tmp && gh pr merge EXACT_PR --repo DarkExec/darkexec --squash)
+gh pr view EXACT_PR --repo DarkExec/darkexec --json state,headRefName,headRefOid,mergeCommit
+```
+
+Read back the remote state before retrying a failed merge command: GitHub may have merged successfully before local Git reported an error. After `MERGED`, fast-forward canonical `main` to `origin/main`, run `./scripts/install.sh`, and verify `darkexec identity --json` names the synchronized commit. Then remove the clean task worktree and delete its local and remote branches only after checking their tips equal the PR's reviewed `headRefOid` and its `mergeCommit` is reachable from canonical `main`. Keep local cleanup separate from the merge command; preserve unrelated worktrees and branches. Revert and reinstall a known revision to roll back.
+
 ## Repository map
 
 | Path | Owns |

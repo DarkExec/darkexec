@@ -16,7 +16,7 @@ Start with one route. Add another only for a distinct unresolved decision.
 1. Inspect the routed implementation, closest tests, and current repository state before broader documentation or history.
 2. Name what local evidence leaves unresolved, then choose one context route below; continue without more documentation when no decision remains open.
 3. Make the smallest runtime-owned change, run the cheapest focused falsifier, then advance to the full contract suite and installed identity proof required by the claim.
-4. For an authorized change, finish commit, publication, merge, canonical synchronization, installation, identity readback, cleanup, and concise handoff unless the user limits delivery or a real external gate blocks it.
+4. For an authorized change, follow [development delivery](README.md#development-delivery) before publication; finish merge, canonical synchronization, installation, identity readback, cleanup, and concise handoff unless the user limits delivery or a real external gate blocks it.
 
 ## Context routing
 
