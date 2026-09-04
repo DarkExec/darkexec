@@ -3576,7 +3576,14 @@ def debounce_status(args) -> int:
         result = {"status": "absent", "threadId": args.thread}
     else:
         state = load_receipt(path)
-        if state.get("status") == "manual_harness_seen" and not state.get("harnessResult"):
+        repairable_started_failure = (
+            state.get("status") == "failed"
+            and state.get("harnessTurnId")
+            and str(state.get("error") or "").startswith("debounced closeout failed:")
+        )
+        if (
+            state.get("status") == "manual_harness_seen" or repairable_started_failure
+        ) and not state.get("harnessResult"):
             try:
                 target = Path(state["targetPath"])
                 with AppServer() as app:
@@ -3584,18 +3591,44 @@ def debounce_status(args) -> int:
                     status, reason, harness_turn_id, harness_result = inspect_closeout(
                         thread, state["productTurnId"]
                     )
-                if status == "manual_harness_seen" and harness_result:
+                observed = thread_turn(thread, harness_turn_id)
+                recorded_harness_turn_id = state.get("harnessTurnId")
+                if (
+                    status == "manual_harness_seen"
+                    and harness_result
+                    and observed.get("status") == "completed"
+                    and (
+                        not recorded_harness_turn_id
+                        or harness_turn_id == recorded_harness_turn_id
+                    )
+                ):
                     lock = path.with_suffix(".lock").open("a+")
                     try:
                         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                         latest = load_receipt(path)
                         if (
-                            latest.get("status") == "manual_harness_seen"
+                            (
+                                latest.get("status") == "manual_harness_seen"
+                                or (
+                                    latest.get("status") == "failed"
+                                    and str(latest.get("error") or "").startswith(
+                                        "debounced closeout failed:"
+                                    )
+                                )
+                            )
                             and not latest.get("harnessResult")
+                            and latest.get("generation") == state.get("generation")
+                            and (
+                                not latest.get("harnessTurnId")
+                                or latest.get("harnessTurnId") == harness_turn_id
+                            )
                         ):
                             latest.update({
-                                "reason": reason, "harnessTurnId": harness_turn_id,
-                                "harnessResult": harness_result, "updatedAt": now(),
+                                "status": "manual_harness_seen", "reason": reason,
+                                "harnessStatus": "completed",
+                                "harnessTurnId": harness_turn_id,
+                                "harnessResult": harness_result, "error": None,
+                                "timerUnit": None, "updatedAt": now(),
                             })
                             atomic_write(path, latest)
                         state = latest

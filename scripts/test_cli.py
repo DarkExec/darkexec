@@ -2178,7 +2178,9 @@ def main() -> None:
             / f"{hashlib.sha256(timer_thread.encode()).hexdigest()}.json"
         )
         manual_state = json.loads(manual_state_path.read_text())
-        manual_state["harnessTurnId"] = None
+        manual_state["status"] = "failed"
+        manual_state["harnessStatus"] = "failed"
+        manual_state["error"] = "debounced closeout failed: [Errno 32] Broken pipe"
         manual_state["harnessResult"] = None
         manual_state_path.write_text(json.dumps(manual_state))
         repair_socket, repair_ready = root / "repair.sock", threading.Event()
@@ -2197,8 +2199,10 @@ def main() -> None:
         )
         repaired_result = json.loads(repaired.stdout)
         assert repaired.returncode == 0, repaired.stderr
+        assert repaired_result["status"] == "manual_harness_seen", repaired_result
         assert repaired_result["harnessTurnId"] == "manual-harness", repaired_result
         assert repaired_result["harnessResult"] == "SECOND HARNESS CLOSEOUT", repaired_result
+        assert repaired_result["error"] is None, repaired_result
         repair_server.join(timeout=2)
         assert not repair_server.is_alive()
         fallback_socket, fallback_ready = root / "fallback.sock", threading.Event()
@@ -2505,6 +2509,7 @@ def main() -> None:
             "schedule-failure-immediate-closeout", "same-session-trailing-closeout",
         "per-call-closeout-usage", "cold-task-resume",
         "persisted-rollout-path-resume", "post-start-transport-recovery", "debounce-status",
+        "failed-started-closeout-reconciliation",
         "debounce-pause-resume", "debounce-cancel", "debounce-now",
         "unbounded-turn-wait", "lost-completion-reconciliation",
         "append-only-harness-episode", "manual-deferred-episode-identity",
