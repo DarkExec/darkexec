@@ -1895,6 +1895,15 @@ def execution_options(args, *, new_task: bool = False) -> dict:
     return options
 
 
+def skipped_harness() -> dict:
+    """Explicitly disabled automatic work is terminal, with known zero usage."""
+    return {
+        "status": "skipped", "reason": "disabled_by_caller",
+        "usage": {key: 0 for key in ("input", "cacheRead", "output", "reasoningOutput", "total")},
+        "modelCallCount": 0,
+    }
+
+
 def dispatch(args) -> int:
     target = Path(args.target).resolve()
     if not target.is_dir():
@@ -1924,7 +1933,7 @@ def dispatch(args) -> int:
         request_material += b"\0" + json.dumps(options, sort_keys=True).encode()
     request_sha = hashlib.sha256(request_material).hexdigest()
     harness_mode = "read-only" if args.read_only_harness else "standard"
-    initial_harness_mode = "debounce" if args.defer_initial_harness else "immediate"
+    initial_harness_mode = "skipped" if args.skip_initial_harness else ("debounce" if args.defer_initial_harness else "immediate")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = path.with_suffix(".lock").open("a+")
     try:
@@ -2068,7 +2077,8 @@ def dispatch(args) -> int:
                 if not target_result["ok"]:
                     receipt["error"] = target_result["error"]
                     save(path, receipt, "failed")
-                elif args.defer_initial_harness:
+                elif args.skip_initial_harness or args.defer_initial_harness:
+                    receipt["target"]["harness"] = skipped_harness() if args.skip_initial_harness else {"status": "deferred"}
                     save(path, receipt, "completed")
                 else:
                     doctrine_refresh = None if args.read_only_harness else refresh_harness_doctrine()
@@ -2134,8 +2144,8 @@ def dispatch(args) -> int:
                     print(json.dumps(receipt) if args.json else render_status(receipt))
                     return 1
 
-                if args.defer_initial_harness:
-                    receipt["target"]["harness"] = {"status": "deferred"}
+                if args.skip_initial_harness or args.defer_initial_harness:
+                    receipt["target"]["harness"] = skipped_harness() if args.skip_initial_harness else {"status": "deferred"}
                     save(path, receipt, "completed")
                 else:
                     doctrine_refresh = (
@@ -2170,7 +2180,7 @@ def dispatch(args) -> int:
         receipt["error"] = f"Native Codex App transport failed: {exc}"
         save(path, receipt, "failed")
     harness = (receipt.get("target") or {}).get("harness") or {"status": "not_started"}
-    if not (args.defer_initial_harness and harness.get("status") == "deferred"):
+    if not args.skip_initial_harness and not (args.defer_initial_harness and harness.get("status") == "deferred"):
         episode_path, episode_error = emit_harness_episode(
             lifecycle="immediate",
             target_path=receipt.get("targetPath") or str(target),
@@ -4132,7 +4142,9 @@ def main() -> int:
     launch.add_argument("--prompt-stdin", action="store_true", required=True)
     launch.add_argument("--input-json")
     launch.add_argument("--read-only-harness", action="store_true")
-    launch.add_argument("--defer-initial-harness", action="store_true")
+    initial_harness = launch.add_mutually_exclusive_group()
+    initial_harness.add_argument("--defer-initial-harness", action="store_true")
+    initial_harness.add_argument("--skip-initial-harness", action="store_true", help="Complete dispatch without an automatic harness turn or deferred harness obligation")
     launch.add_argument("--resolve-target", action="store_true")
     launch.add_argument("--json", action="store_true")
     run = sub.add_parser("run")
