@@ -989,6 +989,37 @@ def main() -> None:
         )
         assert mode_conflict.returncode != 0
         assert "different harness mode" in mode_conflict.stderr, mode_conflict.stderr
+        skipped_socket, skipped_ready, skipped_inputs = root / "skipped.sock", threading.Event(), []
+        skipped_server = threading.Thread(
+            target=fake_app_server,
+            args=(skipped_socket, skipped_ready, True, None, {}, skipped_inputs), daemon=True,
+        )
+        skipped_server.start(); assert skipped_ready.wait(timeout=2)
+        skipped_command = [
+            str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
+            "--job-id", "incident-skipped-harness", "--prompt-stdin", "--skip-initial-harness", "--json",
+        ]
+        skipped = subprocess.run(
+            skipped_command, input="Report a client network failure and stop.", capture_output=True, text=True,
+            env={**env, "DARKEXEC_APP_SERVER_SOCKET": str(skipped_socket)}, check=False,
+        )
+        skipped_result = json.loads(skipped.stdout)
+        assert skipped.returncode == 0 and skipped_result["status"] == "completed", skipped_result
+        assert skipped_result["initialHarnessMode"] == "skipped", skipped_result
+        assert skipped_result["target"]["harness"]["status"] == "skipped", skipped_result
+        assert skipped_result["target"]["harness"]["usage"]["total"] == 0, skipped_result
+        assert skipped_result["target"]["harness"]["modelCallCount"] == 0, skipped_result
+        assert "harnessEpisodePath" not in skipped_result, skipped_result
+        assert len(skipped_inputs) == 3, skipped_inputs  # executive opening, incident, executive closeout
+        assert skipped_inputs[1][0]["text"] == "Report a client network failure and stop.", skipped_inputs
+        assert "Same-task harness: skipped" in skipped_inputs[2][0]["text"], skipped_inputs
+        skipped_server.join(timeout=2); assert not skipped_server.is_alive()
+        repeated_skip = subprocess.run(skipped_command, input="Report a client network failure and stop.", capture_output=True, text=True, env=env)
+        assert repeated_skip.returncode == 0 and json.loads(repeated_skip.stdout) == skipped_result
+        changed_skip = subprocess.run([x for x in skipped_command if x != "--skip-initial-harness"], input="Report a client network failure and stop.", capture_output=True, text=True, env=env)
+        assert changed_skip.returncode != 0 and "different harness mode" in changed_skip.stderr
+        conflicting_skip = subprocess.run([*skipped_command, "--defer-initial-harness"], input="unused", capture_output=True, text=True, env=env)
+        assert conflicting_skip.returncode != 0 and "not allowed" in conflicting_skip.stderr
         routed_config = root / "routed-config.toml"
         routed_config.write_text(
             f'[projects."{workspace}"]\ntrust_level = "trusted"\n'
