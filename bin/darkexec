@@ -47,6 +47,9 @@ HARNESS_PROMPT_PATH = Path(os.environ.get(
 EFFICIENCY_PROMPT_PATH = Path(os.environ.get(
     "DARKEXEC_EFFICIENCY_PROMPT_PATH", "/var/lib/darkexec/config/efficiency-prompt.txt"
 ))
+EXECUTION_DEFAULTS_PATH = Path(os.environ.get(
+    "DARKEXEC_EXECUTION_DEFAULTS_PATH", "/var/lib/darkexec/config/execution-defaults.json"
+))
 HARNESS_PROJECT_PROMPT_ROOT = Path(os.environ.get(
     "DARKEXEC_HARNESS_PROJECT_PROMPT_ROOT", "/var/lib/darkexec/config/harness-prompts"
 ))
@@ -62,15 +65,18 @@ APP_SERVER_SOCKET = Path(os.environ.get("DARKEXEC_APP_SERVER_SOCKET",
 ANTIGRAVITY = os.environ.get("DARKEXEC_ANTIGRAVITY", "/root/.local/bin/agy")
 ANTIGRAVITY_REMOTE_SERVICE = "/exa.language_server_pb.LanguageServerService/"
 DEFAULT_MODEL = "codex/gpt-6-astra"
+DEFAULT_EXECUTION_OPTIONS = {
+    "model": DEFAULT_MODEL, "thinkingLevel": "medium", "speed": "standard",
+}
 MODEL_CATALOG = {
-    "codex/gpt-6-astra": {"provider": "codex", "native": "gpt-6-astra"},
-    "codex/gpt-5.6-sol": {"provider": "codex", "native": "gpt-5.6-sol"},
-    "codex/gpt-5.6-terra": {"provider": "codex", "native": "gpt-5.6-terra"},
-    "codex/gpt-5.6-luna": {"provider": "codex", "native": "gpt-5.6-luna"},
-    "codex/gpt-5.5": {"provider": "codex", "native": "gpt-5.5"},
-    "codex/gpt-5.4": {"provider": "codex", "native": "gpt-5.4"},
-    "codex/gpt-5.3-codex": {"provider": "codex", "native": "gpt-5.3-codex"},
-    "antigravity/gemini-3.8-flash": {"provider": "antigravity", "native": "gemini-3.8-flash"},
+    "codex/gpt-6-astra": {"provider": "codex", "native": "gpt-6-astra", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
+    "codex/gpt-5.6-sol": {"provider": "codex", "native": "gpt-5.6-sol", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
+    "codex/gpt-5.6-terra": {"provider": "codex", "native": "gpt-5.6-terra", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
+    "codex/gpt-5.6-luna": {"provider": "codex", "native": "gpt-5.6-luna", "thinkingLevels": ("low", "medium", "high", "xhigh", "max"), "speeds": ("standard", "fast")},
+    "codex/gpt-5.5": {"provider": "codex", "native": "gpt-5.5", "thinkingLevels": ("low", "medium", "high", "xhigh"), "speeds": ("standard", "fast")},
+    "codex/gpt-5.4": {"provider": "codex", "native": "gpt-5.4", "thinkingLevels": ("low", "medium", "high", "xhigh"), "speeds": ("standard", "fast")},
+    "codex/gpt-5.3-codex": {"provider": "codex", "native": "gpt-5.3-codex", "thinkingLevels": ("low", "medium", "high", "xhigh"), "speeds": ("standard",)},
+    "antigravity/gemini-3.8-flash": {"provider": "antigravity", "native": "gemini-3.8-flash", "thinkingLevels": ("low", "medium", "high"), "speeds": ("standard",)},
 }
 DEFAULT_HARNESS_PROMPT = (
     "Let's do a harness pass where we take a look at this session and turn trial and error into fast, "
@@ -246,6 +252,61 @@ def atomic_write(path: Path, payload: dict) -> None:
         temporary = Path(handle.name)
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+
+
+def validate_execution_defaults(value: dict) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("execution defaults must be an object")
+    options = {
+        "model": value.get("model"),
+        "thinkingLevel": value.get("thinkingLevel"),
+        "speed": value.get("speed"),
+    }
+    if set(value) != set(options):
+        raise ValueError("execution defaults must contain only model, thinkingLevel, and speed")
+    capability = MODEL_CATALOG.get(options["model"])
+    if capability is None:
+        raise ValueError("execution defaults contain an unknown model")
+    thinking_levels = capability.get("thinkingLevels", ())
+    speeds = capability.get("speeds", ())
+    if options["thinkingLevel"] not in thinking_levels:
+        raise ValueError("execution defaults contain an unsupported thinking level")
+    if options["speed"] not in speeds:
+        raise ValueError("execution defaults contain an unsupported speed")
+    return options
+
+
+def execution_defaults() -> dict:
+    if not EXECUTION_DEFAULTS_PATH.exists():
+        return dict(DEFAULT_EXECUTION_OPTIONS)
+    try:
+        value = json.loads(EXECUTION_DEFAULTS_PATH.read_text())
+        return validate_execution_defaults(value)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"invalid execution defaults: {exc}") from exc
+
+
+def execution_defaults_setting(args) -> int:
+    if args.set:
+        try:
+            options = validate_execution_defaults({
+                "model": args.model,
+                "thinkingLevel": args.thinking_level,
+                "speed": args.speed,
+            })
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        atomic_write(EXECUTION_DEFAULTS_PATH, options)
+    try:
+        options = execution_defaults()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    result = {
+        "schemaVersion": 1, **options,
+        "source": "configured" if EXECUTION_DEFAULTS_PATH.exists() else "default",
+    }
+    print(json.dumps(result) if args.json else f'{options["model"]} {options["thinkingLevel"]} {options["speed"]}')
+    return 0
 
 
 def canonical_json(payload: dict) -> str:
@@ -1439,7 +1500,11 @@ def provider_session_path(thread_id: str) -> Path:
 
 
 def selected_model(args) -> tuple[str, dict]:
-    model = getattr(args, "model", None) or DEFAULT_MODEL
+    try:
+        default_model = execution_defaults()["model"]
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    model = getattr(args, "model", None) or default_model
     if model not in MODEL_CATALOG:
         raise SystemExit(f"unknown model: {model}")
     return model, MODEL_CATALOG[model]
@@ -1881,10 +1946,14 @@ def set_execution_options(args) -> int:
 
 
 def execution_options(args, *, new_task: bool = False) -> dict:
-    """New tasks use our model default; continuations inherit omitted settings."""
+    """New tasks use host defaults; continuations inherit omitted settings."""
     options = {}
-    effort = getattr(args, "thinking_level", None)
-    speed = getattr(args, "speed", None)
+    try:
+        defaults = execution_defaults() if new_task else {}
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    effort = getattr(args, "thinking_level", None) or defaults.get("thinkingLevel")
+    speed = getattr(args, "speed", None) or defaults.get("speed")
     model, capability = selected_model(args)
     if capability["provider"] == "codex" and (new_task or getattr(args, "model", None)):
         options["model"] = capability["native"]
@@ -2044,7 +2113,7 @@ def dispatch(args) -> int:
                 def provider_started(started: dict) -> None:
                     receipt["target"] = {
                         **started, "listedCwd": str(target), "model": model,
-                        "nativeModel": f"{model_capability['native']}-{getattr(args, 'thinking_level', None) or 'medium'}",
+                        "nativeModel": f"{model_capability['native']}-{options.get('effort') or 'medium'}",
                         "harness": {"status": "deferred" if args.defer_initial_harness else "not_started"},
                     }
                     save(path, receipt, "target_running")
@@ -2053,14 +2122,14 @@ def dispatch(args) -> int:
                     prompt,
                 )
                 target_result = antigravity_turn(
-                    target, provider_prompt, model, getattr(args, "thinking_level", None),
+                    target, provider_prompt, model, options.get("effort"),
                     on_started=provider_started,
                 )
                 if not target_result.get("threadId"):
                     raise RuntimeError("Antigravity omitted its conversation identity")
                 save_provider_session(
                     target_result["threadId"], target, model,
-                    getattr(args, "thinking_level", None) or "medium",
+                    options.get("effort") or "medium",
                     target_result["usage"],
                 )
                 receipt["target"] = {
@@ -2084,14 +2153,14 @@ def dispatch(args) -> int:
                     doctrine_refresh = None if args.read_only_harness else refresh_harness_doctrine()
                     harness_prompt = READ_ONLY_HARNESS_PROMPT if args.read_only_harness else standard_harness_prompt(target)
                     harness = antigravity_turn(
-                        target, harness_prompt, model, getattr(args, "thinking_level", None),
+                        target, harness_prompt, model, options.get("effort"),
                         target_result["threadId"],
                     )
                     if not harness["remoteVisible"]:
                         harness["usage"] = usage_delta(harness["usage"], target_result["usage"])
                     save_provider_session(
                         target_result["threadId"], target, model,
-                        getattr(args, "thinking_level", None) or "medium",
+                        options.get("effort") or "medium",
                         usage_add(target_result["usage"], harness["usage"]),
                     )
                     receipt["target"]["harness"] = {
@@ -4251,6 +4320,12 @@ def main() -> int:
     efficiency_prompt_action.add_argument("--reset", action="store_true")
     efficiency_prompt_setting.add_argument("--target")
     efficiency_prompt_setting.add_argument("--json", action="store_true")
+    execution_defaults_parser = sub.add_parser("execution-defaults")
+    execution_defaults_parser.add_argument("--set", action="store_true")
+    execution_defaults_parser.add_argument("--model", choices=tuple(MODEL_CATALOG))
+    execution_defaults_parser.add_argument("--thinking-level", choices=("low", "medium", "high", "xhigh", "max", "ultra"))
+    execution_defaults_parser.add_argument("--speed", choices=("standard", "fast"))
+    execution_defaults_parser.add_argument("--json", action="store_true")
     global_resolve = sub.add_parser("resolve-global")
     global_resolve.add_argument("--job-id", required=True)
     global_resolve.add_argument("--candidates-json", required=True)
@@ -4323,7 +4398,11 @@ def main() -> int:
             {"id": "codex/gpt-5.3-codex", "provider": "codex", "label": "GPT-5.3 Codex", "description": "Legacy Codex model", "thinkingLevels": ["low", "medium", "high", "xhigh"], "speeds": ["standard"], "defaultThinkingLevel": "high"},
             {"id": "antigravity/gemini-3.8-flash", "provider": "antigravity", "label": "Gemini 3.8 Flash", "description": "Google subscription via Antigravity CLI", "thinkingLevels": ["low", "medium", "high"], "speeds": ["standard"], "defaultThinkingLevel": "high"},
         ]
-        payload = {"schemaVersion": 1, "defaultModel": DEFAULT_MODEL, "models": catalog}
+        try:
+            default_model = execution_defaults()["model"]
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        payload = {"schemaVersion": 1, "defaultModel": default_model, "models": catalog}
         print(json.dumps(payload) if args.json else "\n".join(item["id"] for item in catalog))
         return 0
     if args.command == "harness-prompt":
@@ -4336,6 +4415,8 @@ def main() -> int:
             args, EFFICIENCY_PROMPT_PATH, EFFICIENCY_PROJECT_PROMPT_ROOT,
             DEFAULT_EFFICIENCY_PROMPT, "efficiency",
         )
+    if args.command == "execution-defaults":
+        return execution_defaults_setting(args)
     if args.command == "update":
         return update_install(args)
     path = find_receipt_path(args.job_id, args.thread)

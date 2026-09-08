@@ -573,6 +573,7 @@ def main() -> None:
         refresh_doctrine.__globals__["DOCTRINE_REFRESH"] = ""
         prompt_path = root / "config" / "harness-prompt.txt"
         efficiency_prompt_path = root / "config" / "efficiency-prompt.txt"
+        execution_defaults_path = root / "config" / "execution-defaults.json"
         harness_project_prompt_root = root / "config" / "harness-prompts"
         efficiency_project_prompt_root = root / "config" / "efficiency-prompts"
         prompt_project = root / "prompt-project"
@@ -585,7 +586,33 @@ def main() -> None:
             "DARKEXEC_EFFICIENCY_PROMPT_PATH": str(efficiency_prompt_path),
             "DARKEXEC_HARNESS_PROJECT_PROMPT_ROOT": str(harness_project_prompt_root),
             "DARKEXEC_EFFICIENCY_PROJECT_PROMPT_ROOT": str(efficiency_project_prompt_root),
+            "DARKEXEC_EXECUTION_DEFAULTS_PATH": str(execution_defaults_path),
             "DARKEXEC_CONFIG": str(prompt_config),
+        }
+        saved_execution_defaults = json.loads(subprocess.run(
+            [
+                str(ROOT / "bin/darkexec"), "execution-defaults", "--set",
+                "--model", "codex/gpt-5.6-sol", "--thinking-level", "medium",
+                "--speed", "standard", "--json",
+            ],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert saved_execution_defaults == {
+            "schemaVersion": 1, "model": "codex/gpt-5.6-sol",
+            "thinkingLevel": "medium", "speed": "standard", "source": "configured",
+        }, saved_execution_defaults
+        assert execution_defaults_path.stat().st_mode & 0o777 == 0o600
+        assert json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "execution-defaults", "--json"],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout) == saved_execution_defaults
+        runtime["execution_options"].__globals__["EXECUTION_DEFAULTS_PATH"] = execution_defaults_path
+        inherited_args = type("ExecutionArgs", (), {
+            "model": None, "thinking_level": None, "speed": None,
+        })()
+        assert runtime["execution_options"](inherited_args) == {}
+        assert runtime["execution_options"](inherited_args, new_task=True) == {
+            "model": "gpt-5.6-sol", "effort": "medium", "serviceTier": None,
         }
         default_prompt = json.loads(subprocess.run(
             [str(ROOT / "bin/darkexec"), "harness-prompt", "--json"],
@@ -820,6 +847,7 @@ def main() -> None:
             "DARKEXEC_CONTROL_ROOT": str(root / "controls"),
             "DARKEXEC_SESSION_ROOT": str(root / "sessions"),
             "DARKEXEC_HARNESS_EPISODE_ROOT": str(root / "harness-episodes"),
+            "DARKEXEC_EXECUTION_DEFAULTS_PATH": str(execution_defaults_path),
             "DARKEXEC_WORKSPACE": str(workspace), "DARKEXEC_CONFIG": str(config),
             "DARKEXEC_APP_SERVER_SOCKET": str(socket_path),
         }
@@ -835,7 +863,7 @@ def main() -> None:
         command = [
             str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
             "--job-id", "incident-1", "--prompt-stdin", "--read-only-harness", "--json",
-            "--thinking-level", "max", "--speed", "fast",
+            "--model", "codex/gpt-6-astra", "--thinking-level", "max", "--speed", "fast",
         ]
         first = subprocess.run(command, input="Natural request.", capture_output=True, text=True, env=env, check=False)
         assert first.returncode == 0, first.stderr or first.stdout
@@ -884,6 +912,25 @@ def main() -> None:
         )
         assert waited_status.returncode == 0
         assert json.loads(waited_status.stdout)["status"] == "completed", waited_status.stdout
+        defaults_socket = root / "defaults-app.sock"
+        defaults_ready = threading.Event()
+        defaults_server = threading.Thread(
+            target=fake_app_server, args=(defaults_socket, defaults_ready), daemon=True,
+        )
+        defaults_server.start()
+        assert defaults_ready.wait(timeout=2)
+        defaults_env = {**env, "DARKEXEC_APP_SERVER_SOCKET": str(defaults_socket)}
+        defaulted = subprocess.run([
+            str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
+            "--job-id", "defaults-1", "--prompt-stdin", "--skip-initial-harness", "--json",
+        ], input="Use saved defaults.", capture_output=True, text=True, env=defaults_env, check=False)
+        assert defaulted.returncode == 0, defaulted.stderr or defaulted.stdout
+        defaulted_result = json.loads(defaulted.stdout)
+        assert defaulted_result["model"] == "codex/gpt-5.6-sol", defaulted_result
+        assert defaulted_result["executionOptions"] == {
+            "model": "gpt-5.6-sol", "effort": "medium", "serviceTier": None,
+        }, defaulted_result
+        defaults_server.join(timeout=2); assert not defaults_server.is_alive()
         abandoned_job = "incident-abandoned"
         abandoned_path = root / "state" / f"{hashlib.sha256(abandoned_job.encode()).hexdigest()}.json"
         abandoned_path.write_text(json.dumps({
