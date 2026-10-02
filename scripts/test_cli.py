@@ -592,13 +592,13 @@ def main() -> None:
         saved_execution_defaults = json.loads(subprocess.run(
             [
                 str(ROOT / "bin/darkexec"), "execution-defaults", "--set",
-                "--model", "codex/gpt-6-sol", "--thinking-level", "high",
+                "--model", "codex/gpt-6.1-sol", "--thinking-level", "high",
                 "--speed", "standard", "--json",
             ],
             capture_output=True, text=True, env=prompt_env, check=True,
         ).stdout)
         assert saved_execution_defaults == {
-            "schemaVersion": 1, "model": "codex/gpt-6-sol",
+            "schemaVersion": 1, "model": "codex/gpt-6.1-sol",
             "thinkingLevel": "high", "speed": "standard", "source": "configured",
         }, saved_execution_defaults
         assert execution_defaults_path.stat().st_mode & 0o777 == 0o600
@@ -606,13 +606,20 @@ def main() -> None:
             [str(ROOT / "bin/darkexec"), "execution-defaults", "--json"],
             capture_output=True, text=True, env=prompt_env, check=True,
         ).stdout) == saved_execution_defaults
+        model_catalog = json.loads(subprocess.run(
+            [str(ROOT / "bin/darkexec"), "models", "--json"],
+            capture_output=True, text=True, env=prompt_env, check=True,
+        ).stdout)
+        assert model_catalog["defaultModel"] == "codex/gpt-6.1-sol", model_catalog
+        sol61 = next(model for model in model_catalog["models"] if model["id"] == "codex/gpt-6.1-sol")
+        assert "high" in sol61["thinkingLevels"] and sol61["defaultThinkingLevel"] == "low", sol61
         runtime["execution_options"].__globals__["EXECUTION_DEFAULTS_PATH"] = execution_defaults_path
         inherited_args = type("ExecutionArgs", (), {
             "model": None, "thinking_level": None, "speed": None,
         })()
         assert runtime["execution_options"](inherited_args) == {}
         assert runtime["execution_options"](inherited_args, new_task=True) == {
-            "model": "gpt-6-sol", "effort": "high", "serviceTier": None,
+            "model": "gpt-6.1-sol", "effort": "high", "serviceTier": None,
         }
         default_prompt = json.loads(subprocess.run(
             [str(ROOT / "bin/darkexec"), "harness-prompt", "--json"],
@@ -926,9 +933,9 @@ def main() -> None:
         ], input="Use saved defaults.", capture_output=True, text=True, env=defaults_env, check=False)
         assert defaulted.returncode == 0, defaulted.stderr or defaulted.stdout
         defaulted_result = json.loads(defaulted.stdout)
-        assert defaulted_result["model"] == "codex/gpt-6-sol", defaulted_result
+        assert defaulted_result["model"] == "codex/gpt-6.1-sol", defaulted_result
         assert defaulted_result["executionOptions"] == {
-            "model": "gpt-6-sol", "effort": "high", "serviceTier": None,
+            "model": "gpt-6.1-sol", "effort": "high", "serviceTier": None,
         }, defaulted_result
         defaults_server.join(timeout=2); assert not defaults_server.is_alive()
         abandoned_job = "incident-abandoned"

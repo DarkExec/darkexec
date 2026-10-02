@@ -70,6 +70,7 @@ DEFAULT_EXECUTION_OPTIONS = {
 }
 MODEL_CATALOG = {
     "codex/gpt-6-astra": {"provider": "codex", "native": "gpt-6-astra", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
+    "codex/gpt-6.1-sol": {"provider": "codex", "native": "gpt-6.1-sol", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
     "codex/gpt-6-sol": {"provider": "codex", "native": "gpt-6-sol", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
     "codex/gpt-5.6-sol": {"provider": "codex", "native": "gpt-5.6-sol", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
     "codex/gpt-5.6-terra": {"provider": "codex", "native": "gpt-5.6-terra", "thinkingLevels": ("low", "medium", "high", "xhigh", "max", "ultra"), "speeds": ("standard", "fast")},
@@ -4391,6 +4392,7 @@ def main() -> int:
     if args.command == "models":
         catalog = [
             {"id": "codex/gpt-6-astra", "provider": "codex", "label": "GPT-6 Astra", "description": "Complex reasoning and coding", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
+            {"id": "codex/gpt-6.1-sol", "provider": "codex", "label": "GPT-6.1 Sol", "description": "General coding and agent tasks", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "low"},
             {"id": "codex/gpt-6-sol", "provider": "codex", "label": "GPT-6 Sol", "description": "General coding and agent tasks", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
             {"id": "codex/gpt-5.6-sol", "provider": "codex", "label": "GPT-5.6 Sol", "description": "General coding and agent tasks", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "low"},
             {"id": "codex/gpt-5.6-terra", "provider": "codex", "label": "GPT-5.6 Terra", "description": "Balanced agentic coding model", "thinkingLevels": ["low", "medium", "high", "xhigh", "max", "ultra"], "speeds": ["standard", "fast"], "defaultThinkingLevel": "medium"},
