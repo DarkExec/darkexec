@@ -139,6 +139,7 @@ def fake_app_server(
     remove_routed_target: bool = False,
     observed_options: list[dict] | None = None,
     disconnect_completed_turn: bool = False,
+    defaults_config_path: Path | None = None,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -175,10 +176,18 @@ def fake_app_server(
     while True:
         message = receive_frame(connection)
         if message is None:
+            if defaults_config_path is not None and not threads:
+                connection.close()
+                connection = accept_connection()
+                continue
             break
         method = message.get("method")
         if method == "initialize":
             send_frame(connection, {"id": message["id"], "result": {"userAgent": "fake"}})
+        elif method == "model/list":
+            send_frame(connection, {"id": message["id"], "result": {"data": []}})
+        elif method == "config/read":
+            send_frame(connection, {"id": message["id"], "result": {"config": json.loads(defaults_config_path.read_text())}})
         elif method == "thread/start":
             cwd = message["params"]["cwd"]
             if cwd.endswith("darkexec"):
@@ -938,6 +947,63 @@ def main() -> None:
             "model": "gpt-6.1-sol", "effort": "high", "serviceTier": None,
         }, defaulted_result
         defaults_server.join(timeout=2); assert not defaults_server.is_alive()
+        cli_defaults_socket = root / "cli-defaults.sock"
+        cli_defaults_ready = threading.Event()
+        cli_defaults_config = root / "cli-defaults.json"
+        cli_defaults_config.write_text(json.dumps({
+            "model": "gpt-6.1-sol", "model_reasoning_effort": "high", "service_tier": "default",
+        }))
+        cli_defaults_options = []
+        cli_defaults_server = threading.Thread(target=fake_app_server, args=(cli_defaults_socket, cli_defaults_ready),
+            kwargs={"defaults_config_path": cli_defaults_config, "observed_options": cli_defaults_options}, daemon=True)
+        cli_defaults_server.start()
+        assert cli_defaults_ready.wait(timeout=2)
+        cli_defaults_env = {**env, "DARKEXEC_APP_SERVER_SOCKET": str(cli_defaults_socket),
+            "DARKEXEC_EXECUTION_DEFAULTS_PATH": str(root / "config" / "follow-codex.json")}
+        followed = subprocess.run([str(ROOT / "bin/darkexec"), "execution-defaults", "--use-codex-defaults", "--json"],
+            capture_output=True, text=True, env=cli_defaults_env, check=True)
+        assert json.loads(followed.stdout) == {
+            "schemaVersion": 1, "source": "codex", "model": "codex/gpt-6.1-sol", "thinkingLevel": "high", "speed": "standard",
+        }, followed.stdout
+        policy_path = Path(cli_defaults_env["DARKEXEC_EXECUTION_DEFAULTS_PATH"])
+        assert json.loads(policy_path.read_text()) == {"source": "codex"}
+        assert policy_path.stat().st_mode & 0o777 == 0o600
+        cli_defaults_config.write_text(json.dumps({
+            "model": "native-future-model", "model_reasoning_effort": "xhigh", "service_tier": "fast",
+        }))
+        changed = subprocess.run([str(ROOT / "bin/darkexec"), "execution-defaults", "--json"],
+            capture_output=True, text=True, env=cli_defaults_env, check=True)
+        assert json.loads(changed.stdout) == {
+            "schemaVersion": 1, "source": "codex", "model": "codex/native-future-model", "thinkingLevel": "xhigh", "speed": "fast",
+        }, changed.stdout
+        conflict = subprocess.run([str(ROOT / "bin/darkexec"), "execution-defaults", "--use-codex-defaults",
+            "--model", "codex/gpt-6.1-sol", "--json"], capture_output=True, text=True, env=cli_defaults_env)
+        assert conflict.returncode != 0 and "cannot be combined" in conflict.stderr, conflict.stderr
+        cli_defaults_config.write_text(json.dumps({"service_tier": "default"}))
+        failed_read = subprocess.run([str(ROOT / "bin/darkexec"), "execution-defaults", "--json"],
+            capture_output=True, text=True, env=cli_defaults_env)
+        assert failed_read.returncode != 0 and "unavailable" in failed_read.stderr, failed_read.stderr
+        assert cli_defaults_options == [], cli_defaults_options
+        cli_defaults_config.write_text(json.dumps({
+            "model": "native-future-model", "model_reasoning_effort": "xhigh", "service_tier": "fast",
+        }))
+        explicit_args = type("ExplicitArgs", (), {"model": "codex/gpt-6-astra", "thinking_level": "high", "speed": "standard"})()
+        assert runtime["execution_options"](explicit_args, new_task=True, defaults=json.loads(changed.stdout)) == {
+            "model": "gpt-6-astra", "effort": "high", "serviceTier": None,
+        }
+        future_dispatch = subprocess.run([str(ROOT / "bin/darkexec"), "dispatch", "--target", str(target),
+            "--job-id", "cli-defaults-1", "--prompt-stdin", "--skip-initial-harness", "--json"],
+            input="Follow the updated CLI defaults.", capture_output=True, text=True, env=cli_defaults_env, check=True)
+        future_result = json.loads(future_dispatch.stdout)
+        assert future_result["model"] == "codex/native-future-model", future_result
+        assert future_result["executionOptions"] == {
+            "model": "native-future-model", "effort": "xhigh", "serviceTier": "fast",
+        }, future_result
+        assert cli_defaults_options[1] == future_result["executionOptions"], cli_defaults_options
+        assert future_result["target"]["harness"]["status"] == "skipped", future_result
+        cli_defaults_server.join(timeout=2); assert not cli_defaults_server.is_alive()
+        # Continuing a conversation must not read or apply the new host default.
+        assert runtime["execution_options"](inherited_args) == {}
         abandoned_job = "incident-abandoned"
         abandoned_path = root / "state" / f"{hashlib.sha256(abandoned_job.encode()).hexdigest()}.json"
         abandoned_path.write_text(json.dumps({

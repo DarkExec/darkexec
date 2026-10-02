@@ -278,17 +278,52 @@ def validate_execution_defaults(value: dict) -> dict:
     return options
 
 
+def codex_execution_defaults() -> dict:
+    """Ask Codex to resolve its current on-disk configuration, without model work."""
+    with AppServer() as app:
+        config = app._request("config/read", {"includeLayers": False}).get("config")
+        if not isinstance(config, dict):
+            raise RuntimeError("Codex returned no effective configuration")
+        new_thread = (config.get("models") or {}).get("new_thread") or {}
+        model = new_thread.get("model") or config.get("model")
+        effort = new_thread.get("model_reasoning_effort") or config.get("model_reasoning_effort")
+        if not model or not effort:
+            models = app._request("model/list", {}).get("data") or []
+            selected = next((item for item in models if
+                (item.get("model") == model if model else item.get("isDefault"))), None)
+            if selected:
+                model = model or selected.get("model")
+                effort = effort or selected.get("defaultReasoningEffort")
+        if not isinstance(model, str) or not model.strip() or not isinstance(effort, str) or not effort.strip():
+            raise RuntimeError("Codex default model or thinking level is unavailable")
+        tier = new_thread.get("service_tier", config.get("service_tier"))
+        if tier not in (None, "default", "standard", "fast", "priority"):
+            raise RuntimeError("Codex default service tier is unsupported by DarkExec")
+        return {"model": f"codex/{model}", "thinkingLevel": effort,
+                "speed": "fast" if tier in ("fast", "priority") else "standard", "source": "codex"}
+
+
 def execution_defaults() -> dict:
     if not EXECUTION_DEFAULTS_PATH.exists():
         return dict(DEFAULT_EXECUTION_OPTIONS)
     try:
         value = json.loads(EXECUTION_DEFAULTS_PATH.read_text())
+        if value == {"source": "codex"}:
+            return codex_execution_defaults()
         return validate_execution_defaults(value)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(f"invalid execution defaults: {exc}") from exc
 
 
 def execution_defaults_setting(args) -> int:
+    if args.use_codex_defaults:
+        if any((args.model, args.thinking_level, args.speed)):
+            raise SystemExit("--use-codex-defaults cannot be combined with execution overrides")
+        try:
+            codex_execution_defaults()
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            raise SystemExit(f"cannot resolve Codex defaults: {exc}") from exc
+        atomic_write(EXECUTION_DEFAULTS_PATH, {"source": "codex"})
     if args.set:
         try:
             options = validate_execution_defaults({
@@ -305,7 +340,7 @@ def execution_defaults_setting(args) -> int:
         raise SystemExit(str(exc)) from exc
     result = {
         "schemaVersion": 1, **options,
-        "source": "configured" if EXECUTION_DEFAULTS_PATH.exists() else "default",
+        "source": options.get("source") or ("configured" if EXECUTION_DEFAULTS_PATH.exists() else "default"),
     }
     print(json.dumps(result) if args.json else f'{options["model"]} {options["thinkingLevel"]} {options["speed"]}')
     return 0
@@ -1501,12 +1536,16 @@ def provider_session_path(thread_id: str) -> Path:
     return SESSION_ROOT / "providers" / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.json"
 
 
-def selected_model(args) -> tuple[str, dict]:
+def selected_model(args, *, defaults: dict | None = None) -> tuple[str, dict]:
+    explicit = getattr(args, "model", None)
     try:
-        default_model = execution_defaults()["model"]
+        defaults = defaults if defaults is not None else ({} if explicit else execution_defaults())
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
-    model = getattr(args, "model", None) or default_model
+    model = explicit or defaults["model"]
+    if not explicit and defaults.get("source") == "codex":
+        # Codex owns its native model catalog; future defaults need no Runtime update.
+        return model, {"provider": "codex", "native": model.removeprefix("codex/")}
     if model not in MODEL_CATALOG:
         raise SystemExit(f"unknown model: {model}")
     return model, MODEL_CATALOG[model]
@@ -1947,18 +1986,19 @@ def set_execution_options(args) -> int:
     return 0
 
 
-def execution_options(args, *, new_task: bool = False) -> dict:
+def execution_options(args, *, new_task: bool = False, defaults: dict | None = None) -> dict:
     """New tasks use host defaults; continuations inherit omitted settings."""
     options = {}
     try:
-        defaults = execution_defaults() if new_task else {}
+        defaults = (defaults if defaults is not None else execution_defaults()) if new_task else {}
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
     effort = getattr(args, "thinking_level", None) or defaults.get("thinkingLevel")
     speed = getattr(args, "speed", None) or defaults.get("speed")
-    model, capability = selected_model(args)
-    if capability["provider"] == "codex" and (new_task or getattr(args, "model", None)):
-        options["model"] = capability["native"]
+    if new_task or getattr(args, "model", None):
+        _, capability = selected_model(args, defaults=defaults)
+        if capability["provider"] == "codex":
+            options["model"] = capability["native"]
     if effort is not None:
         options["effort"] = effort
     if speed is not None:
@@ -1998,8 +2038,12 @@ def dispatch(args) -> int:
         ).encode()
     if args.resolve_target:
         request_material += b"\0resolve-target"
-    model, model_capability = selected_model(args)
-    options = execution_options(args, new_task=True)
+    try:
+        defaults = execution_defaults()
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        raise SystemExit(str(exc)) from exc
+    model, model_capability = selected_model(args, defaults=defaults)
+    options = execution_options(args, new_task=True, defaults=defaults)
     if options:
         request_material += b"\0" + json.dumps(options, sort_keys=True).encode()
     request_sha = hashlib.sha256(request_material).hexdigest()
@@ -4323,7 +4367,9 @@ def main() -> int:
     efficiency_prompt_setting.add_argument("--target")
     efficiency_prompt_setting.add_argument("--json", action="store_true")
     execution_defaults_parser = sub.add_parser("execution-defaults")
-    execution_defaults_parser.add_argument("--set", action="store_true")
+    execution_defaults_action = execution_defaults_parser.add_mutually_exclusive_group()
+    execution_defaults_action.add_argument("--set", action="store_true")
+    execution_defaults_action.add_argument("--use-codex-defaults", action="store_true")
     execution_defaults_parser.add_argument("--model", choices=tuple(MODEL_CATALOG))
     execution_defaults_parser.add_argument("--thinking-level", choices=("low", "medium", "high", "xhigh", "max", "ultra"))
     execution_defaults_parser.add_argument("--speed", choices=("standard", "fast"))
